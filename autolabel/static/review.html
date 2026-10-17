@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>姿态标注</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230E1113'/%3E%3Cg fill='none' stroke='%23F5A524' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M16 12v8M16 14l-5 3M16 14l5 3M16 20l-4 6M16 20l4 6'/%3E%3C/g%3E%3Ccircle cx='16' cy='8' r='3.2' fill='%23F5A524'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+<script>
+/* 首屏先把主题与字号定好，免得先黑后白闪一下；选择存在这台浏览器，四个页面共用 */
+(function () {
+  try {
+    var a = JSON.parse(localStorage.getItem("autolabel.appearance") || "{}") || {};
+    var pref = ["light", "dark"].indexOf(a.theme) >= 0 ? a.theme : "auto";
+    var light = pref === "light" ||
+      (pref === "auto" && window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
+    var r = document.documentElement;
+    r.dataset.theme = light ? "light" : "dark";
+    r.dataset.themePref = pref;
+    r.dataset.fs = ["0", "2", "3"].indexOf(String(a.fs)) >= 0 ? String(a.fs) : "1";
+  } catch (e) { /* 读不到就用默认：跟随系统 + 标准字号 */ }
+})();
+</script>
+</head>
+<body data-page="pose">
+
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+  <symbol id="ic-mark" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 9v7M12 11l-4.2 2.6M12 11l4.2 2.6M12 16l-3.4 5M12 16l3.4 5"/></g><circle cx="12" cy="6" r="2.6" fill="currentColor"/></symbol>
+  <symbol id="ic-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></symbol>
+  <symbol id="ic-dots" viewBox="0 0 16 16"><circle cx="3.4" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="8" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="12.6" cy="8" r=".9" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="ic-upload" viewBox="0 0 16 16"><path d="M8 11V2.6M8 2.6 4.8 5.8M8 2.6l3.2 3.2M2.6 10v2.4a1 1 0 0 0 1 1h8.8a1 1 0 0 0 1-1V10"/></symbol>
+  <symbol id="ic-layers" viewBox="0 0 16 16"><path d="M8 1.8 1.6 5 8 8.2 14.4 5 8 1.8ZM1.6 8.4 8 11.6l6.4-3.2M1.6 11.4 8 14.6l6.4-3.2"/></symbol>
+  <symbol id="ic-boxes" viewBox="0 0 16 16"><rect x="2" y="3.2" width="12" height="9.6" rx="1.4"/><path d="M5.6 10.4 7.4 7.6l1.8 2.2 1.4-2 1.4 2.6"/></symbol>
+  <symbol id="ic-cube" viewBox="0 0 16 16"><path d="M8 1.8 14 5v6l-6 3.2L2 11V5l6-3.2ZM2 5l6 3.2L14 5M8 8.2v6"/></symbol>
+  <symbol id="ic-key" viewBox="0 0 16 16"><rect x="1.6" y="4" width="12.8" height="8" rx="1.4"/><path d="M4.2 6.6h.01M6.6 6.6h.01M9 6.6h.01M11.4 6.6h.01M4.2 9.4h7.6"/></symbol>
+  <symbol id="ic-target" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2.4M8 12.8v2.4M.8 8h2.4M12.8 8h2.4"/></symbol>
+  <symbol id="ic-undo" viewBox="0 0 16 16"><path d="M3 7.4h6.4a3.2 3.2 0 0 1 0 6.4H5.6M3 7.4l2.8-2.8M3 7.4l2.8 2.8"/></symbol>
+  <symbol id="ic-check" viewBox="0 0 16 16"><path d="m3.2 8.4 3.2 3.2 6.4-7.2"/></symbol>
+  <symbol id="ic-cross" viewBox="0 0 16 16"><path d="M3.6 3.6l8.8 8.8M12.4 3.6l-8.8 8.8"/></symbol>
+</svg>
+
+<header>
+  <a class="brand" id="nav-portal" href="/"><svg class="mark"><use href="#ic-mark"/></svg>自动标注<span id="ds-name" class="muted"></span></a>
+  <nav id="nav-modules"></nav>
+  <span class="capsule" id="queue-capsule" title="焦点队列：模型自己觉得没把握的帧">
+    <svg class="ic" style="width:13px;height:13px"><use href="#ic-target"/></svg>
+    <span class="name" id="capsule-set">载入中…</span>
+    <span class="num" id="capsule-count"></span>
+    <button id="btn-flagged" title="跳到下一张待确认（F）">跳转</button>
+  </span>
+  <div class="controls">
+    <div class="wrap-rel">
+      <button class="searchbtn" id="btn-palette" title="命令面板">
+        <svg class="ic" style="width:13px;height:13px"><use href="#ic-search"/></svg>
+        搜帧或命令<span class="kbd">⌘K</span>
+      </button>
+    </div>
+    <button class="btn primary" id="btn-upload" title="导入图片 / 目录 / 视频（W）">
+      <svg class="ic"><use href="#ic-upload"/></svg>导入素材
+    </button>
+    <div class="wrap-rel">
+      <button class="iconbtn" id="btn-more" title="筛选、显示与导出" aria-haspopup="true" aria-expanded="false">
+        <svg class="ic"><use href="#ic-dots"/></svg>
+      </button>
+      <div class="menu" id="more-menu" hidden>
+        <div class="menu-label">队列</div>
+        <label class="menu-field">筛选
+          <select id="filter">
+            <option value="pending" selected>待复核</option>
+            <option value="flagged">仅带标记</option>
+            <option value="edited">已修改</option>
+            <option value="approved">已接受</option>
+            <option value="rejected">已驳回</option>
+            <option value="all">全部</option>
+          </select>
+        </label>
+        <label class="menu-field">排序
+          <select id="sort">
+            <option value="priority">按优先级</option>
+            <option value="name">按文件名</option>
+          </select>
+        </label>
+        <label class="menu-field"><span>显示忽略点</span><input type="checkbox" id="show-hidden" checked></label>
+        <label class="menu-field"><span>显示框</span><input type="checkbox" id="show-box" checked></label>
+        <button class="menu-item" id="btn-batches"><svg class="ic"><use href="#ic-layers"/></svg>批次管理<span class="kbd k">B</span></button>
+        <button class="menu-item hidden" id="batch-chip" title="当前按批次筛选，点击取消"></button>
+        <div class="menu-sep"></div>
+        <div class="menu-label">导出</div>
+        <a class="menu-item" href="/api/coords?format=csv" download title="导出宽表 CSV（一行一个人）">坐标 CSV</a>
+        <a class="menu-item" href="/api/coords?format=jsonl" download title="导出 JSONL（一行一张图）">坐标 JSONL</a>
+        <button class="menu-item" id="btn-export-yolo"
+          title="导出 YOLO 标准训练集：images/{train,val} + labels/{train,val} + data.yaml，可直接 yolo pose train（已驳回的默认剔除）">
+          YOLO 训练集</button>
+        <div class="menu-sep"></div>
+        <div id="appearance-ctl"></div>
+      </div>
+    </div>
+  </div>
+</header>
+<div class="progress" id="progress-track"><div id="progress-bar" class="bar"></div></div>
+
+<div id="export-note" class="export-note bar muted small hidden"></div>
+
+<div id="job-strip" class="hidden">
+  <span id="job-strip-text"></span>
+  <button id="strip-clear-jobs" class="danger">清除任务</button>
+</div>
+
+<main>
+  <div id="rail">
+    <button class="iconbtn on" id="rail-queue" title="焦点队列"><svg class="ic"><use href="#ic-target"/></svg></button>
+    <button class="iconbtn" id="rail-upload" title="导入素材（W）"><svg class="ic"><use href="#ic-upload"/></svg></button>
+    <button class="iconbtn" id="rail-batches" title="批次管理（B）"><svg class="ic"><use href="#ic-layers"/></svg></button>
+    <span class="sep"></span>
+    <a class="iconbtn" href="/objects" title="提示词标注（O）"><svg class="ic"><use href="#ic-boxes"/></svg></a>
+    <a class="iconbtn" href="/models" title="模型管理（M）"><svg class="ic"><use href="#ic-cube"/></svg></a>
+    <span class="sep"></span>
+    <button class="iconbtn" id="rail-help" title="快捷键速查（?）"><svg class="ic"><use href="#ic-key"/></svg></button>
+  </div>
+
+  <div id="queue-col">
+    <div class="queue-head">焦点队列<span class="n" id="queue-count"></span></div>
+    <div id="filmstrip"></div>
+  </div>
+
+  <section id="stage">
+    <canvas id="canvas"></canvas>
+    <div id="empty-state" class="hidden">当前筛选条件下没有图片，试试切换筛选。</div>
+    <div id="loading" class="hidden">加载中…</div>
+    <div id="toast" class="hidden"></div>
+    <div id="hud">
+      <span class="segs" id="hud-segs" title="当前帧关键点的可见性构成"></span>
+      <span class="chip bad" id="hud-flag" title="这一帧需要人工确认的点">0 处待确认</span>
+      <span class="pos" id="hud-pos">第 <b>0</b> / 0</span>
+    </div>
+    <div id="undo-bar">
+      <span class="dot"></span><span id="undo-label">已接受</span>
+      <button id="btn-undo-bar">撤销 U</button><span class="cd" id="undo-cd">5s</span>
+    </div>
+  </section>
+
+  <aside id="panel">
+    <div id="panel-scroll">
+      <div class="panel-block">
+        <div class="panel-title">当前帧</div>
+        <div id="meta" class="mono small"></div>
+        <div id="flags"></div>
+      </div>
+      <div class="panel-block">
+        <div class="panel-title">待办清单<span class="n" id="todo-count"></span></div>
+        <div id="todo"></div>
+        <div class="foot-note" id="todo-note">编号与画布上的编号一一对应，<span class="kbd">J</span><span class="kbd">K</span> 逐条处理，处理完这一帧就能接受。</div>
+      </div>
+      <div class="panel-block">
+        <div class="panel-title">目标列表<span class="n" id="obj-count"></span></div>
+        <div id="objects"></div>
+      </div>
+    </div>
+    <div class="panel-block actions">
+      <div class="panel-title">动作<span class="act" id="btn-focus">聚焦模式 V</span></div>
+      <div class="btn-row">
+        <button id="btn-approve" class="primary">接受 Q</button>
+        <button id="btn-reject" class="danger">驳回 E</button>
+      </div>
+      <div class="btn-row">
+        <button id="btn-add">新增目标（拖框）</button>
+        <button id="btn-undo">撤销 U</button>
+      </div>
+      <div class="btn-row">
+        <button id="btn-prev">← 上一张</button>
+        <button id="btn-next">下一张 →</button>
+      </div>
+      <div class="kbd-help">
+        <div><span>J / K</span><span>待办下一条 / 上一条</span></div>
+        <div><span>0 / 1 / 2</span><span>忽略 / 遮挡 / 可见</span></div>
+        <div><span>Alt+方向键</span><span>像素级微调</span></div>
+        <div><span>V</span><span>聚焦模式（隐去上下文）</span></div>
+        <div><span>⌘K / ?</span><span>命令面板 / 全部快捷键</span></div>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<footer>
+  <div id="save-state" class="muted">就绪</div>
+  <div id="progress-text" class="muted small"></div>
+  <div id="hint" class="muted small"></div>
+</footer>
+
+<div id="palette-modal" class="modal hidden">
+  <div class="modal-card">
+    <input type="text" id="palette-input" placeholder="输入动作、文件名或筛选条件…" spellcheck="false" autocomplete="off">
+    <div id="palette-list"></div>
+    <div class="palette-hint"><span>↑↓ 选择</span><span>Enter 执行</span><span>Esc 关闭</span></div>
+  </div>
+</div>
+
+<div id="help-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title">快捷键<span class="muted small"> · 数字键仍是可见性，改不了的肌肉记忆都保留</span></div>
+    <div class="help-grid">
+      <div class="panel-title">复核</div>
+      <div><span>Q</span><span>接受当前帧</span></div>
+      <div><span>E</span><span>驳回当前帧</span></div>
+      <div><span>U</span><span>撤销上一次修改</span></div>
+      <div><span>F</span><span>跳到下一张待确认</span></div>
+      <div><span>J / K</span><span>待办下一条 / 上一条</span></div>
+      <div><span>↑ / ↓</span><span>队列内上下移动</span></div>
+      <div><span>A / D</span><span>上一张 / 下一张</span></div>
+      <div class="panel-title">画布</div>
+      <div><span>V</span><span>聚焦模式</span></div>
+      <div><span>Z</span><span>适应窗口</span></div>
+      <div><span>0 / 1 / 2</span><span>忽略 / 遮挡 / 可见</span></div>
+      <div><span>X</span><span>删除选中目标</span></div>
+      <div><span>[ / ]</span><span>切换选中目标</span></div>
+      <div><span>滚轮 / 空格</span><span>缩放 / 平移</span></div>
+      <div class="panel-title">界面</div>
+      <div><span>⌘K</span><span>命令面板</span></div>
+      <div><span>?</span><span>本速查表</span></div>
+        <div><span>⌥T</span><span>白天 / 夜晚</span></div>
+        <div><span>⌥= / ⌥-</span><span>字号放大 / 缩小</span></div>
+      <div><span>B</span><span>批次管理</span></div>
+      <div><span>W</span><span>导入素材</span></div>
+      <div><span>O</span><span>提示词标注页</span></div>
+      <div><span>M</span><span>模型管理页</span></div>
+    </div>
+    <div class="btn-row"><button id="help-close">关闭</button></div>
+  </div>
+</div>
+
+<div id="upload-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title">导入素材<span class="muted small"> · 支持视频、图片、整个图片目录</span></div>
+    <div id="up-drop">把文件拖到这里，或用下面的按钮选择<br>
+      <span class="muted small">视频会先抽帧（默认每 2 秒 1 帧）再标注；图片和目录直接入库</span>
+    </div>
+    <div class="pick-row">
+      <label class="btn"><input type="file" id="file-images" multiple accept="image/*" hidden> 选择图片</label>
+      <label class="btn"><input type="file" id="file-dir" webkitdirectory multiple hidden> 选择图片目录</label>
+      <label class="btn"><input type="file" id="file-video" accept="video/*" hidden> 选择视频</label>
+      <button class="btn" id="up-pool" title="素材池里已有的图直接加进姿态库，不重新上传、不复制文件">从素材池添加</button>
+    </div>
+    <div class="muted small">素材池是两个库共用的 <span class="mono">images/</span>：提示词标注传过的图，姿态标注可以直接引用同一份文件。</div>
+    <div class="param-row">
+      <label class="muted small">模型
+        <select id="up-model">
+          <option value="yolo11n-pose.pt" selected>yolo11n-pose（快）</option>
+          <option value="yolo11s-pose.pt">yolo11s-pose（更准）</option>
+          <option value="yolo11m-pose.pt">yolo11m-pose（最准）</option>
+        </select>
+      </label>
+      <label class="muted small">视频抽帧
+        <select id="up-fps">
+          <option value="0.5" selected>每 2 秒 1 帧</option>
+          <option value="1">每秒 1 帧</option>
+          <option value="2">每秒 2 帧</option>
+        </select>
+      </label>
+      <label class="muted small">最多帧数 <input type="number" id="up-max-frames" value="300" min="1" max="5000"></label>
+      <label class="muted small"><input type="checkbox" id="up-label" checked> 入库后自动标注</label>
+      <label class="muted small" title="默认按画面相似度丢弃近重复帧；动作很快、差异很小的视频可以勾上">
+        <input type="checkbox" id="up-keep-similar"> 保留近重复帧
+      </label>
+    </div>
+    <div id="up-model-desc" class="model-desc muted small"></div>
+    <div class="muted small" id="up-model-note">模型下拉框分两组：姿态权重快且稳，优先用；多模态大模型逐图询问、明显更慢，条目来自「模型管理」（按 <span class="mono">M</span> 配置）</div>
+    <div class="vlm-row">
+      <label class="muted small grow">批次名（选填）
+        <input type="text" id="up-batch-name" placeholder="例如：10 月球场采集" spellcheck="false">
+      </label>
+    </div>
+    <div id="up-files" class="muted small">尚未选择文件</div>
+    <div class="btn-row">
+      <button id="up-start" class="primary">开始上传并标注</button>
+      <button id="up-clear-jobs" class="danger" disabled title="取消排队中和正在标注的任务">清除任务</button>
+      <button id="up-clear">清空</button>
+      <button id="up-close">关闭</button>
+    </div>
+    <div class="progress"><div id="up-bar" class="bar"></div></div>
+    <div id="up-log" class="mono"></div>
+  </div>
+</div>
+
+<div id="confirm-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title" id="confirm-title">确认操作</div>
+    <div id="confirm-body" class="muted"></div>
+    <div class="btn-row">
+      <button id="confirm-ok" class="danger">确定</button>
+      <button id="confirm-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="batch-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title">批次管理<span class="muted small"> · 按每次上传/导入任务分组，可整批删除已标注的数据与记录</span></div>
+    <div id="batch-tools">
+      <label class="muted small"><input type="checkbox" id="batch-all"> 全选</label>
+      <span id="batch-note" class="muted small"></span>
+      <span class="spacer"></span>
+      <button id="batch-refresh">刷新</button>
+      <button id="batch-delete" class="danger" disabled>删除所选</button>
+      <button id="batch-close">关闭</button>
+    </div>
+    <div id="batch-list"></div>
+    <div class="muted small">删除会一并清掉图片、标签、QC 叠加图与复核历史；快照留在
+      <span class="mono">.autolabel/deleted/</span>（含标签原文）便于人工找回。正在标注的批次需先「清除任务」；服务中断遗留的「标注中」批次可直接删。</div>
+  </div>
+</div>
+
+<script src="/common.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

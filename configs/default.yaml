@@ -1,0 +1,23 @@
+# 自动标注默认参数：python3 -m autolabel label <dataset> --config configs/default.yaml
+# 命令行参数优先级高于本文件。
+
+model: yolo11n-pose.pt        # 权重名（自动下载到 models/）或本地路径
+extra_models: []              # 例：[yolo11s-pose.pt] 开启多模型共识，分歧样本会被标记
+device: auto                  # auto 会优先用 Apple Silicon 的 MPS
+imgsz: 640                    # 主体偏小（框高中位数 < 200px）时提到 960/1280
+conf: 0.25
+iou: 0.45
+max_det: 300
+half: false                   # MPS 上 fp16 未必更快，先按 qc 报告再决定
+flip_tta: true                # 水平翻转融合，关键点更稳，耗时约翻倍
+
+# 关键点可见性：v=0 忽略 / v=1 遮挡 / v=2 可见
+# 注意 ultralytics 训练时 v!=0 都会参与监督，想排除就降为 0
+visibility_policy: threshold  # threshold | all_visible | binary
+visible_conf: 0.35            # >= 该值记为 v=2
+occluded_conf: 0.15           # >= 该值记为 v=1，否则 v=0
+
+box_mode: expand              # expand=用关键点撑开框（推荐）| model=保留检测框 | keypoints=只按关键点
+bbox_margin: 0.06
+ensemble_iou: 0.3
+max_side: 1600                # 导入/推理时的最长边上限

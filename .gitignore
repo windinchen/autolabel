@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
+
+# 权重与运行产物
+models/*.pt
+models/*.onnx
+models/*.engine
+models/*.mlpackage
+datasets/
+runs/
+exports/
+*.log
+
+# 模型登记表（本机状态：备注、默认值、本地登记、下载记录）
+configs/models.json
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*~
+
+# 打包产物
+build/
+dist/
+*.egg-info/

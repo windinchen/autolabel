@@ -1,0 +1,314 @@
+# 人体骨骼自动标注系统
+
+> 用 YOLO-pose 批量生成人体骨骼关键点标签，人工只在浏览器里改模型错的那几个点。
+> 附带一条独立的**提示词标注**链路：一句中文描述，让多模态大模型逐张图找物品并出检测框。
+
+给一堆图片（或一段视频），用现成的姿态模型批量生成人体骨骼关键点标签，人工只需在浏览器里**修正少数可疑帧**，最后导出两样东西：可直接 `yolo pose train` 的数据集，以及带像素/归一化坐标的 CSV / JSONL 文件。
+
+设计目标不是"全自动"，而是把人工工作量从"逐张从零画 17 个点"降到"只改模型错的那几个点"。
+
+第二条链路是**提示词标注**：用一句中文描述（"桌上或手里拿着的塑料水瓶，含纸杯、保温杯"）让多模态大模型逐张图找物品，产出检测框，复核时删掉标错的、补上没找到的，导出 `yolo detect train` 数据集。详见 `demo_docs/09-提示词标注.md`。
+
+两条链路是**两个独立的标注库**：各自一套索引、批次表、标签目录、原件与撤销快照，删图/复核/撤销互不影响；只有 `images/` 素材池共用一份——同一帧只落盘一次，两个库各持引用，素材要等两边都不要了才真删。命令行用 `--lib pose|objects` 选库，界面上每个模块有自己的上传口和「从素材池添加」。老数据集用 `autolabel migrate <数据集>` 一键拆分（幂等）。
+
+完整文档见 `demo_docs/`（文档索引：`demo_docs/README.md`），改代码请同步更新那边。
+
+## 工作流程
+
+```
+图片 / 视频
+   │  import（规范化 RGB、展开 EXIF 旋转、限最长边、去重）
+   ▼
+datasets/<名称>/images
+   │  label（YOLO-pose 推理 + 翻转融合 + 可见性判定 + QC 打标）
+   ▼
+labels/*.txt（YOLO pose 格式）+ .autolabel/index.json
+   │  qc（报告 + 复核优先级清单 + 骨架叠加图）
+   ▼
+review（浏览器拖拽修正，接受/驳回，自动落盘、可撤销）
+   │  export（train/val 划分 + data.yaml + 可选 COCO JSON）
+   │  coords（CSV / 长表 CSV / JSONL 坐标文件，含像素与归一化两套坐标）
+   ▼
+yolo pose train
+
+（并行链路）同一批 images
+   │  fields（定义要标什么物品 + 描述提示词）
+   │  prompt（多模态大模型逐张找目标 → prompt_labels/*.txt，5 列 detection）
+   ▼
+提示词标注页删错框 / 补画漏框 → prompt --export
+   ▼
+yolo detect train
+```
+
+## 环境
+
+已在本机验证：macOS（Apple M3 Ultra）+ Python 3.9.6 + `torch 2.8.0` + `ultralytics 8.4.24`，推理走 Apple Silicon 的 MPS，无需 CUDA。
+
+```bash
+python3 -m pip install -r requirements.txt   # 已有 torch/ultralytics 可跳过
+python3 -m pytest tests -q                    # 289 项测试，约 40 秒
+# 其中 5 项端到端用例需要 models/yolo11n-pose.pt 与 models/bus.jpg，缺权重时会自动跳过（`-rs` 可看到原因）
+```
+
+## 5 分钟上手
+
+### 一条命令跑完
+
+```bash
+# 视频 + 批量图片混合提交：入库 → 自动标注 → QC 报告 → 坐标文件
+python3 -m autolabel auto datasets/myset 录像.mp4 ~/Pictures/人像 --fps 0.5
+# 坐标产物：datasets/myset/coords/<时间戳>/coords.csv、coords.jsonl 等
+python3 -m autolabel review datasets/myset      # 需要人工修正时再打开
+```
+
+`auto` 按扩展名自动分流：`.mp4/.mov/.mkv/...` 走抽帧，其余按图片目录导入；标注、去重、断点续跑参数与分步命令一致。
+
+### 分步执行
+
+```bash
+D=datasets/demo
+python3 -m autolabel init    $D --name 演示集
+python3 -m autolabel import  $D models/bus.jpg models/zidane.jpg
+python3 -m autolabel label   $D --model yolo11n-pose.pt --render-qc 4
+python3 -m autolabel qc      $D --render 10
+python3 -m autolabel review  $D          # 自动打开 http://127.0.0.1:8765
+python3 -m autolabel export  $D --val-ratio 0.2 --coco
+```
+
+训练：
+
+```bash
+yolo pose train data=$D/exports/<时间戳>/data.yaml model=yolo11s-pose.pt epochs=100 imgsz=640
+```
+
+实测吞吐（M3 Ultra / MPS / 1920x1280 输入，含解码与预处理）：
+
+| 配置 | 速度 |
+| --- | --- |
+| `yolo11n-pose` imgsz=640 | 17 ms/张（约 60 张/秒） |
+| `yolo11n-pose` imgsz=960 | 17 ms/张（约 58 张/秒） |
+| 开启 `--flip`（默认开） | 34 ms/张（约 30 张/秒，约 10 万张/小时） |
+
+## 标签格式与可见性语义
+
+`labels/<图片名>.txt`，每行一个人，全部数值按图片宽高归一化：
+
+```
+class_id cx cy w h  x1 y1 v1  x2 y2 v2 ... x17 y17 v17
+```
+
+关键点顺序为 COCO-17：`nose, left_eye, right_eye, left_ear, right_ear, left_shoulder, right_shoulder, left_elbow, right_elbow, left_wrist, right_wrist, left_hip, right_hip, left_knee, right_knee, left_ankle, right_ankle`。
+
+`v` 的取值是本系统最容易踩坑的地方：
+
+| v | 含义 | ultralytics 训练行为 |
+| --- | --- | --- |
+| 0 | 未标注 / 忽略 | **不参与**监督（`kpt_mask = v != 0`） |
+| 1 | 遮挡但位置可推断 | **参与**监督，权重与 v=2 相同 |
+| 2 | 清晰可见 | 参与监督 |
+
+所以"想让某个点不产生监督"必须写 `v=0`，写 `v=1` 等于照样教模型。默认策略 `threshold` 下：关键点置信度 ≥ `--visible-conf` 记 2，≥ `--occluded-conf` 记 1，其余记 0。想要"只训高置信点"，把两个阈值设成一样即可退化为二值。
+
+无人图会写出**空标签文件**，这是 YOLO 的背景图约定，能当负样本压误检；导出时由 `--max-empty-ratio` 控制比例，默认上限 15%。
+
+## 界面（一套壳 · 四个页面）
+
+`review` 启动的是纯标准库 HTTP 服务 + 原生 Canvas 前端，无构建步骤、不联网。一个服务四个页面，共用同一个数据集目录；老数据集不用先手动迁移也能直接打开（启动时自动补齐缺失的库索引）。四个页面共用**同一套壳**：左侧竖排导航条（52px）+ 顶栏（品牌 · 模块切换 · `⌘K` 搜索 · 一个主按钮 · `⋯` 溢出菜单），`⌘K` 命令面板与 `?` 速查表在四页都能开，**外观**（白天 / 夜晚 · 字号）也在同一处。
+
+| 地址 | 模块 | 内容 |
+| --- | --- | --- |
+| `/` | 工作台 | **“下一步”行动流**（按「先能跑起来、再挑毛病」排序，最多三条，每条带直达按钮：先去复核 / 先去标注 / 去下载权重 / 去导出）、五格概览数字（图片文件 / 姿态库 / 提示词库 / 等你复核 / 导入批次）、两个标注库入口（各带「导入图片 / 视频」）、两套坐标下载 + 两库各自的 YOLO 训练集导出（各带「上次导出」路径与复制按钮）、两库批次统一管理与逐张删除、启动对账提示条。「重新读取磁盘」在 `⋯` 菜单里，快捷键 `R` |
+| `/pose` | 姿态标注 | 人体骨骼的自动标注与人工复核（`/review` 为改名前的老地址），CSV / JSONL / YOLO 训练集三个导出在顶栏 `⋯` 菜单里，也能按 `⌘K` 搜「导出」 |
+| `/objects` | 提示词标注 | 字段管理、批量提示词标注、删错框与补画漏框、检测框坐标与训练集导出 |
+| `/models` | 模型管理 | 模型目录、姿态权重文件、多模态大模型配置（从复核页弹层迁出为独立页，快捷键 `M` 直达） |
+
+骨骼写姿态库（`labels/` + `.autolabel/index.json`），物品框写提示词库（`prompt_labels/` + `.autolabel/objects/index.json`），两套标签、两套批次、两套导出互不覆盖，素材池 `images/` 共用。
+
+### 姿态标注页
+
+
+- 拖动关键点、`Alt+方向键` 像素级微调、`0/1/2` 切换可见性、`X` 删除误检、拖框新增目标
+- **待办清单**是复核主线：把这一帧真正值得动手的关键点（贴边、被标遮挡、置信度 <0.4）按「先修错的、再看可疑的」排好，编号 1…9 同时画在画布上，`J` / `K` 逐条跳，清单清空就能 `Q` 接受；`V` 聚焦模式把非选中目标淡去
+- `Q` 接受 / `E` 驳回并自动翻页，画布下方弹 **5 秒撤销条**（点 `撤销 U` 或按 `U` 反悔）；`F` 跳到下一张待确认
+- 左侧**竖排焦点队列**一帧一行（缩略图 + 文件名 + `待复核 · 3 项标记`，带标记的有红点），`↑` `↓` 在队列内移动；顶栏胶囊显示 `待确认 N` 并给 `跳转`
+- 画布左下角 HUD：关键点可见性色块 + `N 处待确认` / `无需修改` + `第 N / M`；右侧面板上半可滚（帧信息 → 待办清单 → 目标列表，**目标列表只展开当前选中那个**），下半固定放动作按钮
+- `⌘K` 命令面板（四页通用：动作、筛选、按文件名搜帧）、`?` 打开本页快捷键速查
+- **外观**：白天 / 夜晚两套主题 + 四档字号（小 / 标准 / 大 / 特大），四个页面通用，选择记在本机浏览器（`autolabel.appearance`），刷新与重启都保持；默认「跟随系统」跟 macOS 浅深色自动走。三个入口：顶栏 `⋯` → **外观**、`⌘K` 搜「外观」、快捷键 `⌥T`（切昼夜）/ `⌥=` / `⌥-`（字号）。白天是单独调过的一整套色值（暖纸白底 + 压深的强调色），不是把背景涂白；画布上的框、骨骼、标签底色也一起换主题，压在照片上的深色 HUD 两种主题都保持深
+- 改动防抖 600ms 自动写回标签；首次修改前把自动标注原件备份到 `.autolabel/originals/`，保留最近 10 个历史快照，`U` 可逐级撤销
+- 关键点被拖出框外时 bbox 会自动撑开（`heal_bbox`），避免"点在线段外、框却没包住"的训练噪声
+- 右上角 **导入素材**：拖拽或选择视频、图片、整个图片目录，后台自动抽帧 + 标注 + QC + 生成坐标文件，进度实时显示；导出三件套（**坐标 CSV / 坐标 JSONL / YOLO 训练集**）在顶栏 `⋯` 菜单，导出过一次后顶栏下方常驻「上次导出」路径，带 **在访达中显示 / 复制路径 / 复制训练命令**
+- **清除任务**：上传弹层与任务进度条上各一个按钮，确认后可删掉排队中的任务（连带清理上传临时文件）、取消正在标注的任务（标完当前图即停，已标好的保留并刷新坐标文件）
+- **批次管理**（主页底部）：每次导入/上传自动记为一个批次并写进所属库的批次表，主页把**两个库的批次放在一起管**——按模块筛选与汇总，每行同时显示骨骼进度与检测框进度（走跨库视图，与展开的逐张清单一致），`看文件` 展开到逐张图片并**单张删除**（勾选可批量删），整批删除一并在行首勾选完成。删除分两种力度：默认**从本库移除**（素材与对面库的标注都不动），勾「连素材文件一起删」才两个库一起摘并删 `images/` 里的素材；删除前自动快照到 `.autolabel/deleted/`，坐标与 QC 随之重算，被删空的批次记录自动移除。姿态页仍保留老弹层（快捷键 `B`，只列姿态库批次），含「只看这批」
+- **提示词标注页**（`/objects`，快捷键 `O` 直达，详见 `demo_docs/09-提示词标注.md`）：右上角 **导入素材**（快捷键 `W`）是本库独立上传口，入库后直接出检测框、不跑 YOLO-pose；弹层里的 **从素材池添加** 直接领用姿态库已传过的同一份素材（不重传、不复制文件）；画布上空白处拖动**补画**模型漏掉的目标（字段取「绘制字段」下拉框）、框内拖动移动、拖角点改大小、`X` 删标错的框、框列表里直接**改字段**（画错类不用重画）、`U` 撤销（第一次画完也能撤销回空白，`Z` 是适应窗口）。壳层与姿态标注页同一套：竖排焦点队列、画布 HUD 与 5 秒撤销条、`⋯` 菜单里的筛选与三个导出、`⌘K` 命令面板与 `?` 速查表；数字键在两页含义不同（这页 `0` 删框、`1` 字段管理）。「字段管理」新建字段（英文名 + 中文显示名 + 描述提示词），「批量提示词标注」选字段与多模态配置后走任务队列，可与姿态任务一样「清除任务」。
+- **启动对账**：启动时先按库自动 `migrate`（老布局升级；纯姿态数据集这种「没有提示词条目可搬」的老目录也会顺手补一本空的 `.autolabel/objects/index.json`，否则复核服务会因缺索引起不来），再逐库对账——导入/标注中途被打断时（重启服务、Ctrl+C、断电），已落盘但没进索引的图片会补回它自己库的索引并挂到那个批次上，无人认领的"标注中"批次判定为**已中断**，工作台顶部写清补回多少张；某库还在标注时另一个库不会抢走它的孤儿素材，`--keep-files` 保留的文件不会被误当成孤儿。
+- **模型管理**（独立页 `/models`，快捷键 `M`，详见 `demo_docs/08-模型管理.md`）：**模型目录**列出 13 档可下载模型（YOLO11 / YOLOv8 / YOLO26 各档的中文说明、参数规模、mAP、预计体积、关键点集、适合场景），带中文备注说明与「设为默认」，行内直接下载并留完整下载记录（URL、镜像、SHA256 是否一致、字节数、耗时）；**权重文件**区块管就绪状态、半截残留与勾选删除（不误删正被任务占用的）；**多模态大模型**区块配置本地（Ollama / LM Studio / vLLM / OpenAI 兼容）或云端（OpenAI、阿里云 DashScope 等）服务，保存前一键连通性验证。API Key 明文单独存 `~/.autolabel/secrets.json`，配置文件里只有引用名、界面永远显示掩码。配好的多模态配置会出现在上传弹层的模型下拉框里，选中即用大模型标骨骼（命令行 `--vlm <配置名>`），结果打 `vlm_labeled` 标记进人工复核清单
+
+上传细节：文件先落到 `.autolabel/uploads/`（任务成功后清理），单文件默认上限 1024 MB，可用 `review --max-upload-mb` 调整；后台同一时刻只跑一个标注任务，任务进行期间接受/驳回按钮会暂时锁住，完成后列表自动刷新；点 **清除任务** 可中途取消。命令行导入用 `--batch-name "十月聚会"` 自定义批次名，方便日后整批管理。
+
+状态字段：`unreviewed`（未复核）→ `edited`（人工改过）/ `approved`（接受）/ `rejected`（驳回），界面上统一显示中文（两个库共用 `common.js` 里的一份词表），导出默认排除 `rejected`，加 `--only-approved` 只导出确认过的样本。界面筛选默认「待复核」= 未复核 **+ 已修改**，改过但没接受的帧不会从队列里消失。
+
+界面风格：石墨底 + 骨白正文 + 琥珀单一强调色（玉绿=接受、珊瑚红=待确认、蓝=选中），4px 间距阶、圆角只用 2/4/7/胶囊、动效 120/200/500ms 三段并支持 `prefers-reduced-motion`；图标一套 16px 网格 1.5 描边，检测框只画四角括号。细节与选型过程见 `demo_docs/10-UI交互重构方案.md`。
+
+## 质量控制
+
+`qc` 产出三份东西：`qc/report.md`（人看的）、`qc/stats.json`（机器读的）、`qc/flags.csv`（复核清单）。
+
+打标的维度：
+
+- 图片级：`no_person`、`crowded`、`low_resolution`、`likely_blurred`（拉普拉斯方差）
+- 人体级：`few_keypoints`、`tiny_box`、`odd_aspect`、`keypoints_outside_box`、`edge_clipped`、`limb_length_mismatch`（左右肢体长度对称性检查，专抓左右互换和断链）
+- 模型级：开启 `--extra-models` 后的 `model_disagreement`、`only_secondary_model`
+
+报告里的**框高度分位数**直接决定 `--imgsz` 该开多大：p10 只有 100px 的话，640 的输入会把小人的关键点下采样抹平，此时应提到 960/1280 或裁掉过小的目标。
+
+## 参数建议
+
+| 场景 | 建议 |
+| --- | --- |
+| 先粗跑一遍看看质量 | `--model yolo11n-pose.pt --limit 200` |
+| 远景/小人多 | `--imgsz 960`，并按报告剔除 `tiny_box` |
+| 关键点精度优先 | 保持默认 `--flip`（翻转融合），或换 `--model yolo11s-pose.pt` |
+| 想减少误检 | `--extra-models yolo11s-pose.pt`，两模型 IoU 不匹配的样本会被标出来 |
+| 只要高置信标签 | `--visibility-policy binary --visible-conf 0.5` |
+| 追求极限吞吐 | `--no-flip --half`（MPS 上 fp16 收益有限，先测） |
+| YOLO 漏检、想让大模型再标一遍 | 先在「模型管理」配好本地/云端多模态模型，再 `--vlm <配置名>`（约 25~40 秒/张，结果全进人工复核清单） |
+
+`label` 带断点续跑：参数指纹写进索引，中断后重跑只补未标注的；改了 `--imgsz`/`--conf` 等参数会自动判定过期并重标，已 `approved` 的图不会被覆盖。
+
+## 视频导入
+
+```bash
+python3 -m autolabel video $D 录像.mp4 --fps 0.5 --max-frames 600     # 每 2 秒 1 帧
+python3 -m autolabel video $D 录像.mp4 --scene 0.3                    # 按镜头切点抽帧
+```
+
+不想敲命令就在复核界面右上角点 **导入素材** 选视频，抽帧密度、最多帧数、模型都在弹层里选，传完自动出坐标。
+
+抽帧默认 `--dedupe perceptual`（dHash 汉明距离 ≤ 5 视为近似重复），静态机位的视频通常能砍掉 60% 以上的冗余帧。每帧在索引里带 `time_sec` 与源视频路径，复核时能回溯到原视频时间点。
+
+## 训练集导出（YOLO 标准格式）
+
+坐标文件给人看，训练用的是另一份目录产物：`images/{train,val}` + `labels/{train,val}` + `data.yaml` + `manifest.json`。界面入口在两个模块页右上角「YOLO 训练集」（与「坐标 CSV / 坐标 JSONL」并排）以及工作台导出行的「导出 YOLO 训练集」；产物是目录，浏览器没法直接下载，点完由后端落盘并在提示里给出路径。
+
+```bash
+python3 -m autolabel export $D --val-ratio 0.2 --coco --coords   # 姿态：可直接 yolo pose train
+python3 -m autolabel prompt $D --export                          # 提示词：检测框数据集
+yolo pose train data=$D/exports/<时间戳>/data.yaml model=yolo11s-pose.pt epochs=100 imgsz=640
+```
+
+默认剔除 `rejected`、按 2:1 切 train/val 且至少留 1 张验证图；接口是 `POST /api/export`（`scope=reviewed|approved|all`），没有骨骼标签时直接返回人话提示而不是空目录。
+标签没改动时重复点导出会直接复用最近一份（提示「标签没有变化，已复用上次导出」），不会堆重复目录。产物路径不会只闪一次：模块页顶栏下面与门户导出行常驻「上次导出（时间）路径 · N 训练 / M 验证」，附 **在访达中显示**、**复制路径** 与 **复制训练命令**（来自 `GET /api/dataset` 的 `exports_recent`，扫 `exports/` 取最近 8 份）；导出成功后后端还会调系统文件管理器自动打开一次目录（`POST /api/export/reveal`，只认 `exports/` 下的路径）。细节见 `demo_docs/03-坐标文件说明.md`。
+
+## 坐标文件导出
+
+```bash
+python3 -m autolabel coords $D                    # 宽表 + 长表 + JSONL，默认全给
+python3 -m autolabel coords $D --formats jsonl    # 只要 JSONL
+python3 -m autolabel coords $D --only-approved    # 只要人工确认过的样本
+python3 -m autolabel export $D --coords           # 导出训练集时顺带生成（多一列 split）
+```
+
+默认落在 `datasets/<名称>/coords/<时间戳>/`；`export --coords` 时落在导出目录的 `coords/` 子目录。
+
+| 文件 | 粒度 | 用途 |
+| --- | --- | --- |
+| `coords.csv` | 一行一个人 | 22 个固定列 + 每关键点 3 列（`kp01_nose_x/_y/_v` …），Excel / pandas 直接读 |
+| `coords_long.csv` | 一行一个关键点 | 透视表、按关键点做统计 |
+| `coords.jsonl` | 一行一张图 | 程序读取，嵌套 bbox 与 17 个关键点 |
+| `meta.json` | 一份 | 关键点名称、骨架连线、字段含义、本次筛选条件 |
+| `summary.json` | 一份 | 图片数 / 人数 / 关键点数 / 状态分布 |
+
+字段要点：
+
+- 坐标给两套：`bbox_x1..y2`、`kpXX_*_x/_y` 为像素值；`bbox_cx/cy/w/h`、`x_norm/y_norm` 为归一化值，与 YOLO 标签完全一致。
+- `v` 的语义与标签一致：`0` 未标注（不参与训练监督）、`1` 遮挡、`2` 可见。
+- 视频帧额外带 `video`、`time_sec`、`frame_index`，坐标可回溯到原视频时间点。
+- `person_flags` / `image_flags` 是 QC 标记，用 `|` 分隔，便于先筛掉可疑行再训练。
+- 默认排除 `rejected`；`--include-all` 连驳回的一起导出，`--include-unlabeled` 让缺标签的图也占一行（`objects` 为空）。
+
+```python
+import pandas as pd
+
+df = pd.read_csv("datasets/demo/coords/<时间戳>/coords.csv")
+boxes = df[["image", "person_index", "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2"]]
+risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的人
+```
+
+## 目录结构
+
+```
+自动标注/
+├── autolabel/
+│   ├── cli.py            命令行入口与参数
+│   ├── backends.py       YOLO-pose 推理、翻转融合、多模型共识、可见性判定
+│   ├── models.py         模型目录/统一清单/备注/默认值/本地登记/下载记录 + 多模态配置与连通性验证
+│   ├── secrets.py        API Key 集中存放（~/.autolabel/secrets.json），配置里只留引用名
+│   ├── vlm.py            多模态大模型标注后端（提示词、残缺 JSON 解析成骨骼）
+│   ├── pipeline.py       批量标注、断点续跑、QC 打标
+│   ├── yolo_pose.py      标签格式读写、几何变换、格式校验、合理性检查
+│   ├── dataset.py        目录布局、索引、导入与去重
+│   ├── batches.py        批次登记表（导入/上传分批、整批删除）、启动对账
+│   ├── fields.py         提示词标注字段登记表（.autolabel/fields.json，class_id 永不复用）
+│   ├── prompt.py         提示词标注（拼提示词、回复解析、质量标记、坐标与 detection 数据集导出）
+│   ├── library.py        两个标注库的底座（库名/路径/素材池引用与认领/老布局迁移）
+│   ├── review.py         四个页面的 HTTP 服务与标签落盘（姿态 + 检测框两套）
+│   ├── upload.py         上传与后台标注任务队列
+│   ├── qc.py             统计、优先级排序、报告与叠加图
+│   ├── export.py         train/val 划分、data.yaml、COCO JSON
+│   ├── coords.py         CSV / 长表 / JSONL 坐标文件导出
+│   ├── video.py          ffmpeg 抽帧
+│   ├── image_utils.py    读图、dHash、骨架绘制
+│   └── static/           前端：portal 工作台 / app 姿态标注 / objects 提示词标注 / models 模型管理 / common 共用件
+├── tests/                289 项测试（含端到端与回归）
+├── configs/default.yaml  参数模板
+├── configs/vlm.json      多模态大模型配置（不含明文 Key，建议不入库）
+├── configs/models.json   模型登记表（备注/默认值/本地登记/下载记录，本机状态，不入库）
+└── models/               权重与测试图
+```
+
+数据集侧（`datasets/<名称>/`）：`images/` 共享素材池（两库共用，同一帧只落盘一次）、`labels/` 姿态库标签、`prompt_labels/` 提示词库检测框标签、`qc/` 报告与叠加图、`coords/` 坐标文件、`exports/` 导出结果（`*-detect/` 是提示词标注的训练集）；`.autolabel/` 放姿态库索引与批次表、提示词库整套（`objects/index.json`、`objects/batches.json`、`objects/originals/`、`objects/history/`）、字段登记表（`fields.json`）、删除快照（`deleted/`），以及网页上传的临时文件（`uploads/`，任务成功后清理）。完整布局见 `demo_docs/06-架构与数据格式.md`。
+
+## 命令速查
+
+| 命令 | 作用 |
+| --- | --- |
+| `init` | 建数据集骨架 |
+| `import` | 导入图片（规范化 + 去重，`--lib pose\|objects` 选库，命中素材池则复用） |
+| `video` | 视频抽帧导入（同样支持 `--lib`） |
+| `pool` | 看共享素材池被哪几个库引用、把池里的图认领进某个库（`--add` / `--lib`） |
+| `migrate` | 把老数据集拆成姿态库 + 提示词库（幂等） |
+| `auto` | 一条命令：导入/抽帧 → 标注 → QC → 坐标导出 |
+| `label` | 批量自动标注 |
+| `qc` | 报告 / 复核清单 / 叠加图 |
+| `review` | 浏览器复核修正（含素材上传、坐标下载） |
+| `export` | 导出训练数据集 |
+| `coords` | 导出坐标文件（宽表 CSV / 长表 CSV / JSONL） |
+| `validate` | 校验标签格式、关键点数量、孤儿标签 |
+| `status` | 数据集概览 |
+| `reset` | 退回复核状态（`--keep-approved` 保留已接受的） |
+| `fields` | 管理提示词标注的字段：`--add 字段名=描述提示词`、`--set-label 字段名=显示名`、`--delete 字段名`（`--drop-boxes` 连带删框） |
+| `prompt` | 提示词标注：`--vlm` 选多模态配置、`--fields` 选字段、`--limit` 试跑、`--overwrite` 重标、`--status` 看进度、`--coords` / `--export` 出坐标与训练集 |
+| `batches` | 按批次查看两个库的已标注数据（`--lib all\|pose\|objects`），`--delete <批次ID>` 整批删除图片与记录，`--delete-images images/a.jpg --mode lib\|purge` 按张删（`--keep-files` 只删记录，`--force` 强删中断遗留的批次） |
+| `models` | 模型管理：`--browse` 浏览可下载目录与中文说明、`--info` 看详情、`--download-weight` 补下、`--note ID=说明` 写备注、`--default` 设默认、`--register` / `--forget` 登记或注销本地模型、`--dataset` 判兼容性、`--delete-weight --yes` 删除、`--add-vlm` / `--test-vlm` / `--default-vlm` / `--delete-vlm` 管多模态配置 |
+
+## 常见问题
+
+**首次选 `yolo11s/m-pose` 会卡住吗？** 不会，但得先下：`models --browse` 看目录、`models --download-weight yolo11s-pose.pt` 或界面行内「下载」都行。权重默认经 `https://gh-proxy.com/` 镜像下载（`AUTOLABEL_WEIGHTS_MIRROR` 可换，留空即直连），支持断点续传；界面下拉框实时显示`已就绪 / 未下载 / 权重不完整`，未下载的位置灰（一个都没下载时放开第一条，点了自动先下），下载记录里连 SHA256 是否一致都留了底，加载失败还会自动重下一遍。
+
+**多模态大模型怎么接？** 界面 `M` 打开「模型管理」或 `autolabel models` 配置本地/云端服务（带连通性验证，可按服务算力调「回复上限 / 送图最长边 / 强制 JSON 模式」），然后在导入素材的模型下拉框里选它，或命令行 `--vlm <配置名>`，就改用大模型标骨骼；配置存 `configs/vlm.json`，Key 明文只在本机 `~/.autolabel/secrets.json`、界面只显示掩码。约 25~40 秒/张、精度不如 YOLO-pose，结果一律进人工复核清单，详见 `demo_docs/07-常见问题.md`。
+
+**模型备注、默认值存在哪？** `configs/models.json`（本机状态，没存 Key，删了只丢备注与下载记录）。已下载的模型可以在界面行内输入框或 `models --note ID=说明` 里写备注，比如「只在内网机器下」「显存吃紧别用」。换机器拷 `configs/vlm.json` + `configs/models.json` + `~/.autolabel/secrets.json` 三份即可，详见 `demo_docs/08-模型管理.md`。
+
+**网页上传和命令行导入怎么选？** 补几段视频、几十张图用网页最省事；几十万张的批量导入或要精细控制去重与参数时用 `import` / `video` / `auto`，两条路走的是同一套流水线。
+
+**坐标怎么导出成文件？** `python3 -m autolabel coords <数据集>`，一次生成宽表 CSV（一行一个人）、长表 CSV（一行一个关键点）和 JSONL（一行一张图），详见「坐标文件导出」。
+
+**导出的 symlink 能训练吗？** 能，ultralytics 正常跟随软链。要搬去别的机器就用 `export --mode copy`。
+
+**复核过一遍后 index 里的 score 为什么没变？** YOLO 标签本身不存模型置信度，人工改点后无法反推分数，系统沿用历史分值；如果误判成低置信，看 `qc report` 里的标记而不是 score。
+
+**关键点左右反了怎么办？** 复核界面里选中目标后逐个按 `0/1/2` 纠正，或直接拖动到正确位置；`limb_length_mismatch` 标记专门用于提前暴露这类问题。
+
+**想换成自定义骨架（比如只有 9 个点）？** 当前实现固定 COCO-17（`yolo_pose.py` 的 `COCO17_KEYPOINTS` / `COCO17_FLIP_IDX` / `COCO17_SKELETON` 是唯一事实来源），改这三个常量并同步 `init --num-keypoints` 即可，`export` 会自动写入对应的 `kpt_shape` 与 `flip_idx`。
+
+**MPS 报错或结果异常？** 加 `--device cpu` 复核一遍；A/B 对拍时可用 `--no-flip` 排除融合带来的差异。

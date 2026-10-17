@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>自动标注 · 工作台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230E1113'/%3E%3Cg fill='none' stroke='%23F5A524' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M16 12v8M16 14l-5 3M16 14l5 3M16 20l-4 6M16 20l4 6'/%3E%3C/g%3E%3Ccircle cx='16' cy='8' r='3.2' fill='%23F5A524'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+<script>
+/* 首屏先把主题与字号定好，免得先黑后白闪一下；选择存在这台浏览器，四个页面共用 */
+(function () {
+  try {
+    var a = JSON.parse(localStorage.getItem("autolabel.appearance") || "{}") || {};
+    var pref = ["light", "dark"].indexOf(a.theme) >= 0 ? a.theme : "auto";
+    var light = pref === "light" ||
+      (pref === "auto" && window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
+    var r = document.documentElement;
+    r.dataset.theme = light ? "light" : "dark";
+    r.dataset.themePref = pref;
+    r.dataset.fs = ["0", "2", "3"].indexOf(String(a.fs)) >= 0 ? String(a.fs) : "1";
+  } catch (e) { /* 读不到就用默认：跟随系统 + 标准字号 */ }
+})();
+</script>
+</head>
+<body data-page="portal">
+
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+  <symbol id="ic-mark" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 9v7M12 11l-4.2 2.6M12 11l4.2 2.6M12 16l-3.4 5M12 16l3.4 5"/></g><circle cx="12" cy="6" r="2.6" fill="currentColor"/></symbol>
+  <symbol id="ic-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></symbol>
+  <symbol id="ic-dots" viewBox="0 0 16 16"><circle cx="3.4" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="8" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="12.6" cy="8" r=".9" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="ic-upload" viewBox="0 0 16 16"><path d="M8 11V2.6M8 2.6 4.8 5.8M8 2.6l3.2 3.2M2.6 10v2.4a1 1 0 0 0 1 1h8.8a1 1 0 0 0 1-1V10"/></symbol>
+  <symbol id="ic-layers" viewBox="0 0 16 16"><path d="M8 1.8 1.6 5 8 8.2 14.4 5 8 1.8ZM1.6 8.4 8 11.6l6.4-3.2M1.6 11.4 8 14.6l6.4-3.2"/></symbol>
+  <symbol id="ic-boxes" viewBox="0 0 16 16"><rect x="2" y="3.2" width="12" height="9.6" rx="1.4"/><path d="M5.6 10.4 7.4 7.6l1.8 2.2 1.4-2 1.4 2.6"/></symbol>
+  <symbol id="ic-cube" viewBox="0 0 16 16"><path d="M8 1.8 14 5v6l-6 3.2L2 11V5l6-3.2ZM2 5l6 3.2L14 5M8 8.2v6"/></symbol>
+  <symbol id="ic-key" viewBox="0 0 16 16"><rect x="1.6" y="4" width="12.8" height="8" rx="1.4"/><path d="M4.2 6.6h.01M6.6 6.6h.01M9 6.6h.01M11.4 6.6h.01M4.2 9.4h7.6"/></symbol>
+  <symbol id="ic-target" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2.4M8 12.8v2.4M.8 8h2.4M12.8 8h2.4"/></symbol>
+  <symbol id="ic-export" viewBox="0 0 16 16"><path d="M8 10.4V2M8 2 5 4.8M8 2l3 2.8M2.6 9.4v3a1.2 1.2 0 0 0 1.2 1.2h8.4a1.2 1.2 0 0 0 1.2-1.2v-3"/></symbol>
+  <symbol id="ic-check" viewBox="0 0 16 16"><path d="m3.2 8.4 3.2 3.2 6.4-7.2"/></symbol>
+</svg>
+
+<header>
+  <a class="brand" id="nav-portal" href="/"><svg class="mark"><use href="#ic-mark"/></svg>工作台<span id="ds-name" class="muted"></span></a>
+  <nav id="nav-modules"></nav>
+  <div class="controls">
+    <div class="wrap-rel">
+      <button class="searchbtn" id="btn-palette" title="命令面板">
+        <svg class="ic" style="width:13px;height:13px"><use href="#ic-search"/></svg>
+        搜动作或页面<span class="kbd">⌘K</span>
+      </button>
+    </div>
+    <a class="btn primary" id="btn-import" href="/pose?upload=1" title="导入图片 / 目录 / 视频">
+      <svg class="ic"><use href="#ic-upload"/></svg>导入素材
+    </a>
+    <div class="wrap-rel">
+      <button class="iconbtn" id="btn-more" title="数据集信息与导出" aria-haspopup="true" aria-expanded="false">
+        <svg class="ic"><use href="#ic-dots"/></svg>
+      </button>
+      <div class="menu" id="more-menu" hidden>
+        <div class="menu-label">数据集</div>
+        <div class="menu-field muted small" id="portal-note"></div>
+        <div class="menu-sep"></div>
+        <div class="menu-label">跳到</div>
+        <button class="menu-item" id="jump-export"><svg class="ic"><use href="#ic-export"/></svg>导出训练用文件</button>
+        <button class="menu-item" id="jump-batches"><svg class="ic"><use href="#ic-layers"/></svg>批次管理</button>
+        <div class="menu-sep"></div>
+        <button class="menu-item" id="portal-refresh"><svg class="ic"><use href="#ic-check"/></svg>重新读取磁盘<span class="kbd k">R</span></button>
+        <div class="menu-sep"></div>
+        <div id="appearance-ctl"></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="shell-row">
+  <div id="rail">
+    <a class="iconbtn on" href="/" title="工作台"><svg class="ic"><use href="#ic-target"/></svg></a>
+    <a class="iconbtn" href="/pose?upload=1" title="导入素材"><svg class="ic"><use href="#ic-upload"/></svg></a>
+    <button class="iconbtn" id="rail-batches" title="批次管理"><svg class="ic"><use href="#ic-layers"/></svg></button>
+    <span class="sep"></span>
+    <a class="iconbtn" href="/pose" title="姿态标注"><svg class="ic"><use href="#ic-target"/></svg></a>
+    <a class="iconbtn" href="/objects" title="提示词标注"><svg class="ic"><use href="#ic-boxes"/></svg></a>
+    <a class="iconbtn" href="/models" title="模型管理"><svg class="ic"><use href="#ic-cube"/></svg></a>
+    <span class="sep"></span>
+    <button class="iconbtn" id="rail-help" title="本页操作说明（?）"><svg class="ic"><use href="#ic-key"/></svg></button>
+  </div>
+
+  <main class="page-main">
+    <div class="page-body">
+      <div id="recovery-note" class="notice hidden"></div>
+
+      <div class="model-section">
+        <div class="model-section-head">
+          <span class="panel-title">下一步</span>
+          <span class="spacer"></span>
+          <span class="muted small">按「先能跑起来、再挑毛病」的顺序排，点右边按钮直接过去</span>
+        </div>
+        <div id="next-actions" class="flow"></div>
+      </div>
+
+      <div id="portal-stats" class="stat-strip"></div>
+
+      <div class="model-section">
+        <div class="model-section-head">
+          <span class="panel-title">两个标注库</span>
+          <span class="spacer"></span>
+          <span class="muted small">各自记一本清单和标好的结果，图片存在同一个 <span class="mono">images/</span> 文件夹里不占双份</span>
+        </div>
+        <div id="module-cards" class="module-grid"></div>
+      </div>
+
+      <div class="model-section" id="sec-export">
+        <div class="model-section-head">
+          <span class="panel-title">导出训练用文件</span>
+          <span class="spacer"></span>
+          <span class="muted small">按现在磁盘上标好的结果现算，含手工改过的内容</span>
+        </div>
+        <div id="export-rows"></div>
+      </div>
+
+      <div class="model-section" id="sec-batches">
+        <div class="model-section-head">
+          <span class="panel-title">批次管理</span>
+          <span class="spacer"></span>
+          <label class="muted small">模块
+            <select id="batch-module">
+              <option value="all" selected>全部模块</option>
+              <option value="pose">姿态标注</option>
+              <option value="objects">提示词标注</option>
+            </select>
+          </label>
+          <span id="batch-count" class="muted small"></span>
+        </div>
+        <div id="batch-summary" class="muted small"></div>
+        <div id="portal-batches"></div>
+        <div class="btn-row">
+          <button id="batch-delete" class="danger" disabled>删除所选批次</button>
+          <button id="file-delete" class="danger" disabled>删除所选图片</button>
+          <label class="muted small" title="不勾=只把图从当前库移除，图片文件和另一个库的标注都留着">
+            <input type="checkbox" id="purge-files"> 连图片文件一起删（两个库都移除）
+          </label>
+        </div>
+        <div class="muted small">每次导入算一批，点「看文件」展开就能逐张勾着删。默认只把图从它所在的那个库摘掉，
+          <span class="mono">images/</span> 里的原图和另一个库已经标好的结果都不动；
+          勾上「连图片文件一起删」才会两个库一起摘掉并删文件。删掉的东西在
+          <span class="mono">.autolabel/deleted/</span> 留有快照，误删能捞回来。</div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<div id="palette-modal" class="modal hidden">
+  <div class="modal-card">
+    <input type="text" id="palette-input" placeholder="输入想做的事，比如「导出」「去复核」「刷新」…" spellcheck="false" autocomplete="off">
+    <div id="palette-list"></div>
+    <div class="palette-hint"><span>↑↓ 选择</span><span>Enter 执行</span><span>Esc 关闭</span></div>
+  </div>
+</div>
+
+<div id="help-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title">工作台怎么用<span class="muted small"> · 这里只是总览，改图要去两个标注库</span></div>
+    <div class="help-grid">
+      <div class="panel-title">页面</div>
+      <div><span>共 4 个页面</span><span>工作台总览、姿态标注、提示词标注、模型管理</span></div>
+      <div><span>左侧竖条</span><span>随时在四个页面之间跳</span></div>
+      <div class="panel-title">快捷</div>
+      <div><span>⌘K</span><span>命令面板：导出、刷新、跳页面都能搜</span></div>
+        <div><span>⌥T</span><span>白天 / 夜晚</span></div>
+        <div><span>⌥= / ⌥-</span><span>字号放大 / 缩小</span></div>
+      <div><span>?</span><span>本说明</span></div>
+      <div><span>R</span><span>重新读取磁盘上的文件</span></div>
+      <div><span>Esc</span><span>关闭弹层</span></div>
+    </div>
+    <div class="btn-row"><button id="help-close">关闭</button></div>
+  </div>
+</div>
+
+<div id="confirm-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title" id="confirm-title">确认操作</div>
+    <div id="confirm-body" class="muted"></div>
+    <div class="btn-row">
+      <button id="confirm-ok" class="danger">确定</button>
+      <button id="confirm-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<script src="/common.js"></script>
+<script src="/portal.js"></script>
+</body>
+</html>

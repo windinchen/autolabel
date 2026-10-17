@@ -1,0 +1,56 @@
+{
+  "profiles": [
+    {
+      "id": "vlm_d1ae2e09",
+      "name": "omlx",
+      "provider": "custom",
+      "kind": "local",
+      "base_url": "http://127.0.0.1:7979/v1",
+      "model": "Qwen3-VL-8B-Instruct-bf16",
+      "timeout": 60,
+      "max_tokens": 4096,
+      "image_limit": 1024,
+      "json_mode": false,
+      "remark": "",
+      "key_ref": "vlm:vlm_d1ae2e09",
+      "last_test": {
+        "ok": true,
+        "message": "连接正常，可见 3 个模型：Qwen3.8-Flash-Next-Uncensored-oQ6e-mtp、GLM-5.3-Flash-UNCENSORED-oQ4e-mtp、Qwen3-VL-8B-Instruct-bf16",
+        "latency_ms": 5,
+        "models": [
+          "Qwen3.8-Flash-Next-Uncensored-oQ6e-mtp",
+          "GLM-5.3-Flash-UNCENSORED-oQ4e-mtp",
+          "Qwen3-VL-8B-Instruct-bf16"
+        ],
+        "checked_at": "2026-10-17 09:03:42"
+      }
+    },
+    {
+      "id": "vlm_6b46d0b9",
+      "name": "omlx",
+      "provider": "custom",
+      "kind": "local",
+      "base_url": "http://127.0.0.1:7979/v1",
+      "model": "Qwen3.8-Flash-Next-Uncensored-oQ6e-mtp",
+      "timeout": 60,
+      "max_tokens": 4096,
+      "image_limit": 1024,
+      "json_mode": false,
+      "remark": "",
+      "key_ref": "vlm:vlm_6b46d0b9",
+      "last_test": {
+        "ok": true,
+        "message": "连接正常，可见 3 个模型：Qwen3.8-Flash-Next-Uncensored-oQ6e-mtp、GLM-5.3-Flash-UNCENSORED-oQ4e-mtp、Qwen3-VL-8B-Instruct-bf16",
+        "latency_ms": 19,
+        "models": [
+          "Qwen3.8-Flash-Next-Uncensored-oQ6e-mtp",
+          "GLM-5.3-Flash-UNCENSORED-oQ4e-mtp",
+          "Qwen3-VL-8B-Instruct-bf16"
+        ],
+        "checked_at": "2026-10-17 19:01:15"
+      }
+    }
+  ],
+  "default": "vlm_6b46d0b9",
+  "updated_at": "2026-10-17 19:01:15"
+}

@@ -1,0 +1,230 @@
+"""批量自动标注流水线：读图 -> 推理 -> QC 打分 -> 写 YOLO pose 标签。"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+from typing import Callable, Dict, List, Optional
+
+import numpy as np
+
+from .backends import BackendSettings, build_backend
+from .dataset import (
+    STATUS_APPROVED,
+    STATUS_UNREVIEWED,
+    label_path_for,
+    load_index,
+    now_str,
+    resolve_image,
+)
+from .image_utils import load_rgb
+from .yolo_pose import Person, person_sanity_flags, write_label_file
+
+
+def settings_signature(settings: BackendSettings) -> str:
+    """用于断点续跑的参数指纹：参数变了就重标。"""
+    payload = json.dumps(settings.to_dict(), sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def blur_score(image: np.ndarray) -> float:
+    """拉普拉斯方差清晰度：值越小越糊。"""
+    gray = image.mean(axis=2) if image.ndim == 3 else image
+    if gray.shape[0] < 3 or gray.shape[1] < 3:
+        return float("inf")
+    kernel = np.array([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=np.float32)
+    padded = np.pad(gray.astype(np.float32), 1, mode="edge")
+    laplacian = np.zeros_like(gray, dtype=np.float32)
+    for i in range(3):
+        for j in range(3):
+            laplacian += kernel[i, j] * padded[i:i + gray.shape[0], j:j + gray.shape[1]]
+    return float(laplacian.var())
+
+
+def image_level_flags(
+    height: int,
+    width: int,
+    persons: List[Person],
+    min_side_warn: int = 320,
+    crowd_threshold: int = 8,
+    blurred: bool = False,
+) -> List[str]:
+    """图片级 QC 标记（只需宽高，复核服务无需重新解码图片）。"""
+    flags: List[str] = []
+    if not persons:
+        flags.append("no_person")
+    if len(persons) >= crowd_threshold:
+        flags.append("crowded")
+    if min(width, height) < min_side_warn:
+        flags.append("low_resolution")
+    if blurred:
+        flags.append("likely_blurred")
+    for person in persons:
+        flags.extend(f"obj:{f}" for f in person.flags)
+    return sorted(set(flags))
+
+
+def label_dataset(
+    root: str,
+    settings: BackendSettings,
+    only_missing: bool = True,
+    limit: Optional[int] = None,
+    render_qc: int = 0,
+    dry_run: bool = False,
+    verbose: bool = True,
+    progress: Optional["Callable[[int, int], None]"] = None,
+    should_stop: Optional["Callable[[], bool]"] = None,
+) -> dict:
+    """对数据集内图片批量推理并写标签。
+
+    :param only_missing: 跳过参数指纹一致且标签已存在的图片（断点续跑）
+    :param render_qc: 额外渲染前 N 张带骨架叠加图的 QC 预览
+    :param progress: 每完成一张回调 (已完成, 总数)，供上传界面的进度条使用
+    :param should_stop: 每张前检查，返回 True 就停下来（用于界面「清除任务」）
+    """
+    idx = load_index(root)
+    # 逐图改动先攒在这里，落盘前与磁盘上的索引合并：复核界面在标注期间也能写索引，
+    # 直接整体覆盖会把用户在标注过程中点的“接受/驳回”抹掉。
+    updates: Dict[str, dict] = {}
+
+    def flush() -> None:
+        try:
+            target = load_index(root)
+        except Exception:  # noqa: BLE001 磁盘索引不可用时退回内存副本
+            target = idx
+        for rel, fields in updates.items():
+            target.upsert(rel, **fields)
+        target.save()
+
+    signature = settings_signature(settings)
+    previous = idx.data.get("settings", {})
+    if previous.get("signature") != signature:
+        # 参数变化后，之前的自动标签视为过期（人工已复核的保留）
+        stale = [k for k, v in idx.items.items()
+                 if v.get("status") not in (STATUS_APPROVED,) and v.get("label_signature") != signature]
+        if stale and only_missing and verbose:
+            print(f"[info] 标注参数已变化，{len(stale)} 张需要重标")
+    only_missing = only_missing and previous.get("signature") == signature
+
+    ensemble = build_backend(settings)
+    if not dry_run:
+        ensemble.load()
+
+    targets = [(rel, item) for rel, item in idx.ordered_items()
+               if not (only_missing and _already_labeled(root, rel, item, signature))]
+    if limit:
+        targets = targets[:limit]
+
+    stats = {"total": len(targets), "labeled": 0, "people": 0, "empty": 0,
+             "flagged": 0, "failed": 0, "skipped_reviewed": 0, "cancelled": 0}
+    if not targets:
+        print("[info] 没有需要标注的图片（全部已完成，可用 --force 强制重标）")
+        return stats
+
+    start = time.time()
+    for n, (rel, item) in enumerate(targets, start=1):
+        if should_stop and should_stop():
+            stats["cancelled"] = len(targets) - n + 1
+            break
+        abs_path = resolve_image(root, rel)
+        try:
+            image = load_rgb(abs_path, max_side=settings.max_side)
+        except Exception as exc:  # noqa: BLE001
+            stats["failed"] += 1
+            print(f"[warn] 读取失败 {rel}: {type(exc).__name__}: {exc}")
+            continue
+        h, w = image.shape[:2]
+        if dry_run:
+            persons: List[Person] = []
+        else:
+            try:
+                persons = ensemble.infer(image)
+            except Exception as exc:  # noqa: BLE001 单张推理失败不该中断整批
+                stats["failed"] += 1
+                print(f"[warn] 推理失败 {rel}: {type(exc).__name__}: {exc}")
+                continue
+            for person in persons:
+                person.flags = sorted(set(person.flags) | set(
+                    person_sanity_flags(person, w, h)))
+        flags = [f for f in image_level_flags(
+            h, w, persons, blurred=blur_score(image) < 40.0) if not f.startswith("obj:")]
+        if not dry_run:
+            write_label_file(label_path_for(root, rel), persons)
+        reviewable = item.get("status") in (None, STATUS_UNREVIEWED, "edited")
+        fields = dict(
+            width=w, height=h,
+            objects=len(persons),
+            score=round(float(np.mean([p.score for p in persons])), 4) if persons else 0.0,
+            visible_ratio=round(_visible_ratio(persons), 3),
+            flags=[f for f in flags if not f.startswith("obj:")],
+            object_flags=sorted({f for p in persons for f in p.flags}),
+            label_signature=None if dry_run else signature,
+            labeled_at=now_str(),
+            labeled_by=getattr(ensemble, "source_tag", "") or f"yolo:{settings.model}",
+            status=STATUS_UNREVIEWED if reviewable else item.get("status"),
+        )
+        if fields["status"] != STATUS_UNREVIEWED:
+            stats["skipped_reviewed"] += 1
+        idx.upsert(rel, **fields)
+        updates.setdefault(rel, {}).update(fields)
+        stats["labeled"] += 1
+        stats["people"] += len(persons)
+        stats["empty"] += int(not persons)
+        stats["flagged"] += int(bool(flags) or bool(fields["object_flags"]))
+        if render_qc and n <= render_qc and not dry_run:
+            _render_qc_image(root, rel, image, persons)
+        if verbose and (n % 20 == 0 or n == len(targets)):
+            rate = n / max(time.time() - start, 1e-6)
+            eta = (len(targets) - n) / max(rate, 1e-6)
+            print(f"[{n}/{len(targets)}] {rate:.1f} img/s  ETA {eta:.0f}s  人数累计 {stats['people']}")
+        if progress:
+            progress(n, len(targets))
+        if n % 25 == 0:
+            flush()
+
+    def finish() -> None:
+        try:
+            target = load_index(root)
+        except Exception:  # noqa: BLE001
+            target = idx
+        for rel, fields in updates.items():
+            target.upsert(rel, **fields)
+        target.data["settings"] = {"signature": signature, **settings.to_dict(),
+                                   "keypoint_names": ensemble.display_names}
+        target.data["kpt_shape"] = [len(ensemble.display_names), 3]
+        target.data["last_labeled_at"] = now_str()
+        target.save()
+
+    finish()
+    stats["elapsed_sec"] = round(time.time() - start, 1)
+    stats["img_per_sec"] = round(stats["labeled"] / max(stats["elapsed_sec"], 1e-6), 2)
+    return stats
+
+
+def _already_labeled(root: str, rel: str, item: dict, signature: str) -> bool:
+    return (item.get("label_signature") == signature
+            and item.get("objects") is not None
+            and os.path.exists(label_path_for(root, rel)))
+
+
+def _visible_ratio(persons: List[Person]) -> float:
+    total = visible = 0
+    for p in persons:
+        total += len(p.keypoints)
+        visible += sum(1 for k in p.keypoints if k.v != 0)
+    return visible / total if total else 0.0
+
+
+def _render_qc_image(root: str, rel: str, image: np.ndarray, persons: List[Person]) -> None:
+    import cv2
+
+    from .image_utils import draw_poses
+    from .yolo_pose import COCO17_SKELETON
+
+    bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+    canvas = draw_poses(bgr, persons, COCO17_SKELETON)
+    out = os.path.join(os.path.abspath(root), "qc", "overlays", os.path.splitext(rel)[0] + ".jpg")
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    cv2.imwrite(out, canvas, [cv2.IMWRITE_JPEG_QUALITY, 90])

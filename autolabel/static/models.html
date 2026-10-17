@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>模型管理</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23141a22'/%3E%3Cg fill='none' stroke='%2343b581' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M16 12v8M16 14l-5 3M16 14l5 3M16 20l-4 6M16 20l4 6'/%3E%3C/g%3E%3Ccircle cx='16' cy='8' r='3.2' fill='%2343b581'/%3E%3C/svg%3E">
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='2' y='2' width='5' height='5' rx='1' fill='%234ade80'/%3E%3Crect x='9' y='2' width='5' height='5' rx='1' fill='%233fb950' opacity='.6'/%3E%3Crect x='2' y='9' width='5' height='5' rx='1' fill='%233fb950' opacity='.6'/%3E%3Crect x='9' y='9' width='5' height='5' rx='1' fill='%234ade80'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+<script>
+/* 首屏先把主题与字号定好，免得先黑后白闪一下；选择存在这台浏览器，四个页面共用 */
+(function () {
+  try {
+    var a = JSON.parse(localStorage.getItem("autolabel.appearance") || "{}") || {};
+    var pref = ["light", "dark"].indexOf(a.theme) >= 0 ? a.theme : "auto";
+    var light = pref === "light" ||
+      (pref === "auto" && window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
+    var r = document.documentElement;
+    r.dataset.theme = light ? "light" : "dark";
+    r.dataset.themePref = pref;
+    r.dataset.fs = ["0", "2", "3"].indexOf(String(a.fs)) >= 0 ? String(a.fs) : "1";
+  } catch (e) { /* 读不到就用默认：跟随系统 + 标准字号 */ }
+})();
+</script>
+</head>
+<body data-page="models">
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+  <symbol id="ic-mark" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 9v7M12 11l-4.2 2.6M12 11l4.2 2.6M12 16l-3.4 5M12 16l3.4 5"/></g><circle cx="12" cy="6" r="2.6" fill="currentColor"/></symbol>
+  <symbol id="ic-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></symbol>
+  <symbol id="ic-dots" viewBox="0 0 16 16"><circle cx="3.4" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="8" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="12.6" cy="8" r=".9" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="ic-upload" viewBox="0 0 16 16"><path d="M8 11V2.6M8 2.6 4.8 5.8M8 2.6l3.2 3.2M2.6 10v2.4a1 1 0 0 0 1 1h8.8a1 1 0 0 0 1-1V10"/></symbol>
+  <symbol id="ic-layers" viewBox="0 0 16 16"><path d="M8 1.8 1.6 5 8 8.2 14.4 5 8 1.8ZM1.6 8.4 8 11.6l6.4-3.2M1.6 11.4 8 14.6l6.4-3.2"/></symbol>
+  <symbol id="ic-boxes" viewBox="0 0 16 16"><rect x="2" y="3.2" width="12" height="9.6" rx="1.4"/><path d="M5.6 10.4 7.4 7.6l1.8 2.2 1.4-2 1.4 2.6"/></symbol>
+  <symbol id="ic-cube" viewBox="0 0 16 16"><path d="M8 1.8 14 5v6l-6 3.2L2 11V5l6-3.2ZM2 5l6 3.2L14 5M8 8.2v6"/></symbol>
+  <symbol id="ic-key" viewBox="0 0 16 16"><rect x="1.6" y="4" width="12.8" height="8" rx="1.4"/><path d="M4.2 6.6h.01M6.6 6.6h.01M9 6.6h.01M11.4 6.6h.01M4.2 9.4h7.6"/></symbol>
+  <symbol id="ic-target" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2.4M8 12.8v2.4M.8 8h2.4M12.8 8h2.4"/></symbol>
+  <symbol id="ic-check" viewBox="0 0 16 16"><path d="m3.2 8.4 3.2 3.2 6.4-7.2"/></symbol>
+</svg>
+
+<header>
+  <a class="brand" id="nav-portal" href="/"><svg class="mark"><use href="#ic-mark"/></svg>模型管理</a>
+  <nav id="nav-modules"></nav>
+  <div class="controls">
+    <div class="wrap-rel">
+      <button class="searchbtn" id="btn-palette" title="命令面板">
+        <svg class="ic" style="width:13px;height:13px"><use href="#ic-search"/></svg>
+        搜模型或命令<span class="kbd">⌘K</span>
+      </button>
+    </div>
+    <a class="btn primary" id="btn-import" href="/pose?upload=1" title="导入图片 / 目录 / 视频">
+      <svg class="ic"><use href="#ic-upload"/></svg>导入素材
+    </a>
+    <div class="wrap-rel">
+      <button class="iconbtn" id="btn-more" title="当前默认与刷新" aria-haspopup="true" aria-expanded="false">
+        <svg class="ic"><use href="#ic-dots"/></svg>
+      </button>
+      <div class="menu" id="more-menu" hidden>
+        <div class="menu-label">当前默认</div>
+        <div class="menu-field muted small" id="model-default-note"></div>
+        <div class="menu-sep"></div>
+        <div class="menu-label">跳到</div>
+        <a class="menu-item" href="/"><svg class="ic"><use href="#ic-layers"/></svg>工作台总览</a>
+        <a class="menu-item" href="/pose"><svg class="ic"><use href="#ic-target"/></svg>姿态标注<span class="kbd k">P</span></a>
+        <a class="menu-item" href="/objects"><svg class="ic"><use href="#ic-boxes"/></svg>提示词标注<span class="kbd k">O</span></a>
+        <div class="menu-sep"></div>
+        <button class="menu-item" id="model-refresh"><svg class="ic"><use href="#ic-check"/></svg>重新读取权重<span class="kbd k">R</span></button>
+        <div class="menu-sep"></div>
+        <div id="appearance-ctl"></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="shell-row">
+  <div id="rail">
+    <a class="iconbtn" href="/" title="工作台"><svg class="ic"><use href="#ic-layers"/></svg></a>
+    <a class="iconbtn" href="/pose?upload=1" title="导入素材"><svg class="ic"><use href="#ic-upload"/></svg></a>
+    <span class="sep"></span>
+    <a class="iconbtn" href="/pose" title="姿态标注"><svg class="ic"><use href="#ic-target"/></svg></a>
+    <a class="iconbtn" href="/objects" title="提示词标注"><svg class="ic"><use href="#ic-boxes"/></svg></a>
+    <a class="iconbtn on" href="/models" title="模型管理"><svg class="ic"><use href="#ic-cube"/></svg></a>
+    <span class="sep"></span>
+    <button class="iconbtn" id="rail-help" title="本页操作说明（?）"><svg class="ic"><use href="#ic-key"/></svg></button>
+  </div>
+
+<main class="page-main">
+  <div class="page-body">
+    <div class="model-section">
+      <div class="model-section-head">
+        <span class="panel-title">模型目录<span class="muted small"> · 先看中文说明，再决定下载哪个</span></span>
+        <span class="spacer"></span>
+        <label class="muted small">能力
+          <select id="model-filter">
+            <option value="">全部</option>
+            <option value="pose">姿态估计</option>
+            <option value="vlm">多模态大模型</option>
+            <option value="custom_task">自定义任务</option>
+          </select>
+        </label>
+        <span id="model-catalog-note" class="muted small"></span>
+      </div>
+      <div id="model-catalog"></div>
+      <div class="model-tools">
+        <input type="text" id="model-reg-path" placeholder="本地权重路径，如 ~/models/my-pose.pt" spellcheck="false">
+        <input type="text" id="model-reg-name" placeholder="中文名（选填）" spellcheck="false">
+        <input type="text" id="model-reg-note" placeholder="备注说明（选填）" spellcheck="false">
+        <button id="model-register">登记本地模型</button>
+      </div>
+      <div class="muted small">目录内容可在 <span class="mono">configs/models.json</span> 的
+        <span class="mono" id="model-config-path">catalog</span> 里增删改；备注说明也写在这份登记表里，不动模型文件。
+        API Key 单独存在 <span class="mono" id="model-secrets-path">~/.autolabel/secrets.json</span>，界面上只显示掩码。
+        未下载的模型在「姿态标注」「提示词标注」里是灰的，必须先在这里下载（或首次用时自动经镜像下载）。</div>
+    </div>
+
+    <div class="model-section">
+      <div class="model-section-head">
+        <span class="panel-title">姿态权重（YOLO-pose）</span>
+        <span class="spacer"></span>
+        <span id="model-weight-note" class="muted small"></span>
+      </div>
+      <div id="model-weights"></div>
+      <div class="model-tools">
+        <label class="muted small"><input type="checkbox" id="model-all"> 全选</label>
+        <input type="text" id="model-new-name" placeholder="其它权重文件名，如 yolo11l-pose.pt" spellcheck="false">
+        <button id="model-download-new">下载</button>
+        <button id="model-del-weight" class="danger" disabled>删除所选</button>
+      </div>
+      <div class="muted small">删除后下次标注会自动经镜像重新下载；正在标注的权重不能删。自定义权重把
+        <span class="mono">.pt</span> 放进 <span class="mono">models/</span> 目录即可出现在这里（当前 <span class="mono" id="model-dir"></span>）。</div>
+    </div>
+
+    <div class="model-section">
+      <div class="model-section-head">
+        <span class="panel-title">多模态大模型（本地 / 云端）</span>
+        <span class="spacer"></span>
+        <span class="muted small">本地 Ollama / LM Studio / vLLM，或云端 OpenAI 兼容端点</span>
+      </div>
+      <div id="vlm-list"></div>
+      <div id="vlm-form">
+        <div class="vlm-row">
+          <label class="muted small">预设 <select id="vlm-provider"></select></label>
+          <label class="muted small">名称 <input type="text" id="vlm-name" placeholder="本地 Ollama"></label>
+          <label class="muted small">类型 <select id="vlm-kind">
+            <option value="local">本地服务</option><option value="cloud">云端 API</option>
+          </select></label>
+          <label class="muted small" title="标注时单张可能要 20~40 秒，实际等待不会低于 60 秒">
+            超时(秒) <input type="number" id="vlm-timeout" value="60" min="1" max="300">
+          </label>
+          <input type="hidden" id="vlm-id">
+        </div>
+        <div class="vlm-row">
+          <label class="muted small grow">服务地址 <input type="text" id="vlm-base" placeholder="http://localhost:11434/v1" spellcheck="false"></label>
+          <label class="muted small grow">模型名 <input type="text" id="vlm-model" placeholder="qwen2.5vl:7b" spellcheck="false"></label>
+        </div>
+        <div class="vlm-row">
+          <label class="muted small grow">API Key <input type="password" id="vlm-key" autocomplete="new-password" placeholder="本地留空；云端填 sk-…"></label>
+          <label class="muted small grow">备注 <input type="text" id="vlm-remark" placeholder="选填，例如用途/显存占用"></label>
+        </div>
+        <div class="vlm-row">
+          <label class="muted small" title="一次回复允许的 token 上限，标注一帧人要用的 token 不少">
+            回复上限 <input type="number" id="vlm-max-tokens" value="4096" min="64" max="32768">
+          </label>
+          <label class="muted small" title="送图前压缩到的最长边像素，越小越快、小人越容易漏">
+            送图最长边 <input type="number" id="vlm-image-limit" value="1024" min="256" max="4096">
+          </label>
+          <label class="muted small" title="要求服务端按 JSON 返回；部分本地服务不认这个参数，默认关">
+            <input type="checkbox" id="vlm-json-mode"> 强制 JSON 模式
+          </label>
+        </div>
+        <div class="btn-row">
+          <button id="vlm-save-test" class="primary">保存并测试</button>
+          <button id="vlm-save">仅保存</button>
+          <button id="vlm-reset">新建 / 清空</button>
+        </div>
+        <div id="vlm-log" class="mono"></div>
+      </div>
+      <div class="muted small">API Key 只写入不回显（回显为掩码，留空表示不修改）。保存后在「姿态标注」的导入素材、
+        或「提示词标注」的批量标注里选这条配置：前者用大模型逐图标骨骼（实测本地 8B 级约 20~40 秒/张，结果会打
+        <span class="mono">vlm_labeled</span> 标记进人工复核清单），后者按字段描述找物品出检测框。</div>
+    </div>
+  </div>
+</main>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<div id="palette-modal" class="modal hidden">
+  <div class="modal-card">
+    <input type="text" id="palette-input" placeholder="输入想做的事，比如「下载」「设为默认」「去复核」…" spellcheck="false" autocomplete="off">
+    <div id="palette-list"></div>
+    <div class="palette-hint"><span>↑↓ 选择</span><span>Enter 执行</span><span>Esc 关闭</span></div>
+  </div>
+</div>
+
+<div id="help-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title">模型管理怎么用<span class="muted small"> · 没下载的模型在标注页是灰的，先在这里下载或登记</span></div>
+    <div class="help-grid">
+      <div class="panel-title">这里管什么</div>
+      <div><span>模型目录</span><span>看中文说明再决定下哪个，点「下载」即可</span></div>
+      <div><span>姿态权重</span><span>删掉后下次标注会自动重新下载；正在用的不能删</span></div>
+      <div><span>多模态配置</span><span>本地 Ollama / LM Studio 或云端 API，填完可测连通</span></div>
+      <div class="panel-title">快捷</div>
+      <div><span>⌘K</span><span>命令面板：下载、设默认、跳页面都能搜</span></div>
+        <div><span>⌥T</span><span>白天 / 夜晚</span></div>
+        <div><span>⌥= / ⌥-</span><span>字号放大 / 缩小</span></div>
+      <div><span>?</span><span>本说明</span></div>
+      <div><span>R</span><span>重新读取磁盘上的权重</span></div>
+      <div><span>Esc</span><span>关闭弹层</span></div>
+    </div>
+    <div class="btn-row"><button id="help-close">关闭</button></div>
+  </div>
+</div>
+
+<div id="confirm-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title" id="confirm-title">确认操作</div>
+    <div id="confirm-body" class="muted"></div>
+    <div class="btn-row">
+      <button id="confirm-ok" class="danger">确定</button>
+      <button id="confirm-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<script src="/common.js"></script>
+<script src="/models.js"></script>
+</body>
+</html>
