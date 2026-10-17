@@ -46,7 +46,7 @@ yolo detect train
 
 ```bash
 python3 -m pip install -r requirements.txt   # 已有 torch/ultralytics 可跳过
-python3 -m pytest tests -q                    # 289 项测试，约 40 秒
+python3 -m pytest tests -q                    # 303 项测试，约 54 秒
 # 其中 5 项端到端用例需要 models/yolo11n-pose.pt 与 models/bus.jpg，缺权重时会自动跳过（`-rs` 可看到原因）
 ```
 
@@ -259,7 +259,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 │   ├── video.py          ffmpeg 抽帧
 │   ├── image_utils.py    读图、dHash、骨架绘制
 │   └── static/           前端：portal 工作台 / app 姿态标注 / objects 提示词标注 / models 模型管理 / common 共用件
-├── tests/                289 项测试（含端到端与回归）
+├── tests/                303 项测试（含端到端与回归）
 ├── configs/default.yaml  参数模板
 ├── configs/vlm.json      多模态大模型配置（不含明文 Key，建议不入库）
 ├── configs/models.json   模型登记表（备注/默认值/本地登记/下载记录，本机状态，不入库）
