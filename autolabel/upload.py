@@ -461,6 +461,12 @@ class JobStore:
 
         fields = {k: v for k, v in job.params.items()
                   if k in BackendSettings.__dataclass_fields__ and v is not None}
+        # 界面上的导入任务不带设备/半精度，这里补系统设置里的值：
+        # 「系统设置」选的算力要对界面生效，否则它只是个摆设。
+        from . import settings as system
+
+        for key, value in system.label_defaults().items():
+            fields.setdefault(key, value)
         if isinstance(fields.get("extra_models"), str):
             fields["extra_models"] = tuple(m.strip() for m in fields["extra_models"].split(",") if m.strip())
         settings = BackendSettings(**fields)

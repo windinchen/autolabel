@@ -53,20 +53,50 @@ class BackendSettings:
         return {k: (list(v) if isinstance(v, tuple) else v) for k, v in self.__dict__.items()}
 
 
-def resolve_device(device: str = "auto") -> str:
-    """自动选择推理设备。"""
-    if device != "auto":
-        return device
-    try:
-        import torch
+def _cuda_card_index(requested: str) -> Optional[int]:
+    """``"0"`` / ``"1"`` / ``"cuda:1"`` → 卡号；其它写法 → ``None``。"""
+    text = requested.split(":", 1)[1] if requested.startswith("cuda:") else requested
+    return int(text) if text.isdigit() else None
 
-        if torch.cuda.is_available():
-            return "0"
-        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            return "mps"
-    except Exception:  # noqa: BLE001
-        pass
-    return "cpu"
+
+def resolve_device(device: str = "auto") -> str:
+    """把参数里的设备落成这台机器实际能用的那一档。
+
+    早先"只要不是 auto 就原样返回"，于是在 Intel Mac 上写 ``--device mps``
+    会一路走到 ultralytics 里抛一句英文栈，新手根本不知道该改哪儿。现在先探测：
+    指定了编号就核对有没有这张卡，其余情况交给 :func:`autolabel.settings.resolve`
+    按系统设置降级，并且每次都用中文说明退到了哪一档——标注不会因为换设备失败，
+    只是快慢不同，所以降级跑下去比报错有用。
+    """
+    from . import settings as system
+
+    requested = str(device or "auto").strip().lower()
+    index = _cuda_card_index(requested)
+    if index is not None:
+        cards = system.detect().get("cuda", {}).get("names") or []
+        if index < len(cards):
+            return str(index)
+        print(f"[warn] 指定了第 {index} 张 NVIDIA 显卡，但这台机器只识别到 {len(cards)} 张，改用系统设置里的设备")
+        requested = ""
+    resolved, note = system.resolve(requested)
+    if note:
+        print(f"[warn] {note}")
+    return "0" if resolved == "cuda" else resolved
+
+
+def resolve_half(half: bool, device: str) -> bool:
+    """半精度只在 NVIDIA 显卡上真的更快：CPU 上 ultralytics 直接不支持。
+
+    这里先挡一层，是为了把话说明白（"半精度在 CPU 上不支持"），
+    而不是让用户在 ultralytics 的英文警告里自己猜为什么没提速。
+    """
+    if not half:
+        return False
+    text = str(device).strip().lower()
+    if text == "cuda" or text.isdigit():
+        return True
+    print(f"[warn] 半精度在 {device} 上没有加速（只有 NVIDIA 显卡支持），本次按普通精度跑")
+    return False
 
 
 def resolve_model_path(model: str, weights_dir: str = "models") -> str:
@@ -256,6 +286,7 @@ class PoseBackend:
         self.model_name = model_name or settings.model
         self._model = None
         self._device = resolve_device(settings.device)
+        self._half = resolve_half(settings.half, self._device)
         self.keypoint_names: Tuple[str, ...] = ()
         self.num_keypoints: int = 17
 
@@ -314,7 +345,7 @@ class PoseBackend:
             conf=self.settings.conf,
             iou=self.settings.iou,
             max_det=self.settings.max_det,
-            half=self.settings.half,
+            half=self._half,
             verbose=False,
         )
         persons: List[Person] = []

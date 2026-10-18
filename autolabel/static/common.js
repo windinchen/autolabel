@@ -109,7 +109,7 @@ function applyAppearance(options) {
     document.body.classList.add("theme-fading");
     setTimeout(() => document.body.classList.remove("theme-fading"), 260);
   }
-  renderAppearanceControls();
+  renderSettingsPanel();
   window.dispatchEvent(new CustomEvent("appearancechange",
     { detail: { theme: root.dataset.theme, scale: fontScale() } }));
 }
@@ -139,32 +139,190 @@ function stepFont(delta) {
   return FONT_CHOICES[i];
 }
 
-/** ⋯ 菜单里的分段选择器；没有 #appearance-ctl 的页面直接跳过。 */
-function renderAppearanceControls() {
-  const slot = $("appearance-ctl");
-  if (!slot) { return; }
-  slot.innerHTML = "";
-  const group = (text, choices, active, onPick, hint) => {
-    const label = document.createElement("div");
-    label.className = "menu-label";
-    label.textContent = text;
-    const row = document.createElement("div");
-    row.className = "menu-seg";
+// --------------------------------------------------------------------------- //
+// 系统设置：白天/夜晚、字号这些界面偏好，和「标注跑在哪块卡上」收进同一个面板。
+// 两半存的地方不一样是有意的：外观是"我这台电脑怎么看"，存浏览器 localStorage，
+// 切页首屏还有一段内联脚本先定主题防闪烁；推理算力决定标注算在哪，必须落到
+// 服务器那份 ~/.autolabel/settings.json，换台电脑打开同一个数据集才不会被偷偷改回去。
+// --------------------------------------------------------------------------- //
+const settingsState = { data: null, loading: false, saving: false };
+
+const settingsSaved = () => (settingsState.data || {}).saved || {};
+const settingsDevice = (value) => ((settingsState.data || {}).devices || {})[value] || {};
+const deviceLabel = (value) => ((settingsState.data || {}).choices || [])
+  .map((c) => c.value === value ? c.label : "").filter(Boolean)[0] || value || "—";
+
+function buildSettingsModal() {
+  const existed = $("settings-modal");
+  if (existed) { return existed; }
+  const wrap = document.createElement("div");
+  wrap.id = "settings-modal";
+  wrap.className = "modal hidden";
+  wrap.innerHTML = `
+<div class="modal-card">
+  <div class="modal-title">系统设置<span class="muted small"> · 界面外观存这台浏览器，推理算力存这台机器</span></div>
+  <div class="settings-grid">
+    <section>
+      <div class="panel-title">界面外观</div>
+      <div class="set-row"><span class="set-name">白天 / 夜晚</span></div>
+      <div class="seg" id="set-theme"></div>
+      <div class="set-row"><span class="set-name">字体大小</span></div>
+      <div class="seg" id="set-font"></div>
+      <div class="set-note muted small">点一下就生效，不用保存；只影响这个浏览器，不会写进数据集。</div>
+    </section>
+    <section>
+      <div class="panel-title">推理算力</div>
+      <div class="set-note muted small">标注跑在哪块卡上。选了这台机器没有的设备不会报错，跑的时候自动降级并说明原因。</div>
+      <div id="set-devices"></div>
+      <div class="set-row">
+        <span class="set-name">半精度加速<span class="muted small">只有 NVIDIA 显卡提速，CPU 上会自动按普通精度跑</span></span>
+        <button class="switch" id="set-half" type="button" role="switch" aria-checked="false"><span></span></button>
+      </div>
+      <div class="set-note muted small" id="set-status">读取中…</div>
+    </section>
+  </div>
+  <div class="set-note muted small">配置文件 <span class="mono" id="set-path">—</span> ·
+    命令行 <span class="mono">--device</span> / <span class="mono">--config</span> 里写明的值优先于这里</div>
+  <div class="btn-row"><button id="set-refresh">重新探测显卡</button><button id="set-close">关闭</button></div>
+</div>`;
+  document.body.appendChild(wrap);
+  $("set-close").onclick = () => openSettings(false);
+  $("set-refresh").onclick = () => loadSettings(true);
+  $("set-half").onclick = () => saveSettings({ half: !settingsSaved().half });
+  wrap.addEventListener("click", (e) => { if (e.target === wrap) { openSettings(false); } });
+  return wrap;
+}
+
+function setSettingsStatus(text, kind) {
+  const el = $("set-status");
+  if (!el) { return; }
+  el.textContent = text;
+  el.classList.toggle("warn", kind === "warn");
+  el.classList.toggle("ok", kind === "ok");
+}
+
+/** 分段选择器（外观 / 字号）与设备清单一并刷新；面板没建就直接跳过。 */
+function renderSettingsPanel() {
+  if (!$("settings-modal")) { return; }
+  const seg = (id, choices, active, pick) => {
+    const host = $(id);
+    if (!host) { return; }
+    host.innerHTML = "";
     choices.forEach((choice) => {
       const btn = document.createElement("button");
       btn.type = "button";
       btn.textContent = choice.label;
       btn.className = choice.value === active ? "on" : "";
-      btn.title = hint ? hint(choice) : choice.label;
-      btn.onclick = () => onPick(choice.value);
-      row.appendChild(btn);
+      btn.title = choice.value === "auto" ? "跟随系统的深色设置"
+        : (choice.hint || (choice.scale ? "字号 " + Math.round(choice.scale * 100) + "%" : choice.label));
+      btn.onclick = () => pick(choice.value);
+      host.appendChild(btn);
     });
-    slot.append(label, row);
   };
-  group("外观", THEME_CHOICES, appearance.theme, setThemePref,
-    (c) => c.value === "auto" ? "跟随系统的深色设置" : "切到" + c.label);
-  group("字号", FONT_CHOICES, appearance.fs, setFontStep,
-    (c) => "字号" + c.label + "（" + Math.round(c.scale * 100) + "%）");
+  seg("set-theme", THEME_CHOICES, appearance.theme, setThemePref);
+  seg("set-font", FONT_CHOICES, appearance.fs, setFontStep);
+  renderDeviceRows();
+  const half = $("set-half");
+  if (half) {
+    half.classList.toggle("on", Boolean(settingsSaved().half));
+    half.setAttribute("aria-checked", settingsSaved().half ? "true" : "false");
+  }
+  const path = $("set-path");
+  if (path) { path.textContent = (settingsState.data || {}).path || "—"; }
+}
+
+/** 设备清单：能用/不能用都说清楚，按不下去的绝不摆成能按的样子。 */
+function renderDeviceRows() {
+  const host = $("set-devices");
+  if (!host) { return; }
+  const data = settingsState.data || {};
+  const probed = Boolean(data.devices && Object.keys(data.devices).length);
+  const picked = settingsSaved().device;
+  const rows = (data.choices || []).map((choice) => {
+    const facts = settingsDevice(choice.value);
+    const row = document.createElement("button");
+    row.type = "button";
+    const unusable = probed && facts.available === false;
+    row.className = "dev-item" + (choice.value === picked ? " on" : "") + (unusable ? " off" : "");
+    row.title = choice.hint || choice.label;
+
+    const head = document.createElement("span");
+    head.className = "dev-head";
+    const name = document.createElement("span");
+    name.className = "dev-name";
+    name.textContent = choice.label;
+    const chip = document.createElement("span");
+    chip.className = "chip " + (choice.value === "auto" ? "" : unusable ? "bad" : "ok");
+    chip.textContent = choice.value === "auto" ? "推荐" : unusable ? "这台机器用不了" : "可用";
+    head.append(name, chip);
+
+    const note = document.createElement("span");
+    note.className = "dev-note";
+    const names = (facts.names || []).filter(Boolean);
+    note.textContent = unusable ? (facts.reason || "这台机器上没有")
+      : (names[0] || choice.hint || "");
+    row.append(head, note);
+    row.onclick = () => saveSettings({ device: choice.value });
+    return row;
+  });
+  host.innerHTML = "";
+  rows.forEach((row) => host.appendChild(row));
+}
+
+async function saveSettings(patch) {
+  if (settingsState.saving) { return; }
+  settingsState.saving = true;
+  setSettingsStatus("保存中…");
+  try {
+    const data = await postJson("/api/settings", patch);
+    settingsState.data = Object.assign({}, settingsState.data, { saved: data.saved, path: data.path });
+    renderSettingsPanel();
+    const saved = data.saved || {};
+    if (data.note) {
+      setSettingsStatus(data.note, "warn");
+      toast(data.note, true);
+    } else {
+      setSettingsStatus("已保存 · " + deviceLabel(saved.device)
+        + " · 半精度" + (saved.half ? "开" : "关"), "ok");
+    }
+  } catch (err) {
+    setSettingsStatus("保存失败：" + err.message, "warn");
+    toast("保存失败：" + err.message, true);
+  } finally {
+    settingsState.saving = false;
+  }
+}
+
+async function loadSettings(probe) {
+  if (settingsState.loading) { return; }
+  settingsState.loading = true;
+  setSettingsStatus(probe ? "正在探测这台机器的显卡…" : "读取中…");
+  try {
+    settingsState.data = await getJson("/api/settings" + (probe ? "?probe=1" : ""));
+    renderSettingsPanel();
+    const saved = settingsSaved();
+    const note = ((settingsState.data || {}).effective || {}).note || "";
+    setSettingsStatus("当前：" + deviceLabel(saved.device) + " · 半精度" + (saved.half ? "开" : "关")
+      + (note ? " · " + note : ""), note ? "warn" : "");
+  } catch (err) {
+    setSettingsStatus("读不到系统设置：" + err.message, "warn");
+  } finally {
+    settingsState.loading = false;
+  }
+}
+
+function openSettings(open) {
+  const modal = buildSettingsModal();
+  const on = open === undefined ? modal.classList.contains("hidden") : Boolean(open);
+  modal.classList.toggle("hidden", !on);
+  if (!on) { return; }
+  renderSettingsPanel();
+  loadSettings(true);
+}
+
+function initSettings() {
+  const btn = $("btn-settings");
+  if (btn) { btn.onclick = (e) => { e.stopPropagation(); openSettings(true); }; }
 }
 
 /** 四个页面都能用 ⌘K 搜到这些动作；由 registerShellCommands 自动带上。 */
@@ -177,6 +335,11 @@ function appearanceCommands() {
     { label: "字号放大一档", tag: "字号", key: "⌥=", run: () => said("字号「" + stepFont(1).label + "」") }
       ,
     { label: "字号缩小一档", tag: "字号", key: "⌥-", run: () => said("字号「" + stepFont(-1).label + "」") },
+    { label: "打开系统设置（外观 / 推理算力）", tag: "设置", key: "⌥S", run: () => openSettings(true) },
+    { label: "推理设备：改用 Apple 加速（MPS）", tag: "设置", run: () => saveSettings({ device: "mps" }) },
+    { label: "推理设备：改用 NVIDIA 显卡（CUDA）", tag: "设置", run: () => saveSettings({ device: "cuda" }) },
+    { label: "推理设备：改用纯 CPU", tag: "设置", run: () => saveSettings({ device: "cpu" }) },
+    { label: "推理设备：自动选择", tag: "设置", run: () => saveSettings({ device: "auto" }) },
     { label: "检查更新（比对 GitHub）", tag: "关于", run: () => checkForUpdates() },
     { label: "打开 GitHub 仓库", tag: "关于", run: () => openExternal((versionState.info || {}).repo_url) },
     { label: "打开开发者 GitHub 主页", tag: "关于",
@@ -329,6 +492,7 @@ function initNav() {
   bindConfirmBox();
   bindModalKeys();
   initVersionWidget();
+  initSettings();
 }
 
 // --------------------------------------------------------------------------- //
@@ -863,6 +1027,11 @@ function shellKeys(e) {
     if (e.key === "Escape" || e.key === "?") { openHelp(false); }
     return true;
   }
+  const settings = $("settings-modal");
+  if (settings && !settings.classList.contains("hidden")) {
+    if (e.key === "Escape") { openSettings(false); }
+    return true;   // 面板开着的时候别把 Q / E / R 这些页面快捷键漏到后面去
+  }
   if ($("more-menu") && !$("more-menu").hasAttribute("hidden") && e.key === "Escape") {
     openMenu(false);
     return true;
@@ -870,6 +1039,7 @@ function shellKeys(e) {
   if (e.altKey && !e.metaKey && !e.ctrlKey && !isTyping(e)) {
     const code = String(e.code || "");
     if (code === "KeyT") { e.preventDefault(); toggleTheme(); return true; }
+    if (code === "KeyS") { e.preventDefault(); openSettings(true); return true; }
     if (code === "Equal" || code === "NumpadAdd") { e.preventDefault(); stepFont(1); return true; }
     if (code === "Minus" || code === "NumpadSubtract") { e.preventDefault(); stepFont(-1); return true; }
   }

@@ -34,9 +34,14 @@ def _human_reviewed(item: dict) -> bool:
 
 
 def settings_signature(settings: BackendSettings) -> str:
-    """用于断点续跑的参数指纹：参数变了就重标。"""
-    payload = json.dumps(settings.to_dict(), sort_keys=True, ensure_ascii=False)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:12]
+    """用于断点续跑的参数指纹：参数变了就重标。
+
+    ``device`` 与 ``half`` 特意不算进指纹——它们只改快慢，不改标成什么样。
+    否则中途从 Apple 加速切到 CPU，几千张已标好的图会被判成"参数变了"重跑一遍。
+    """
+    payload = {k: v for k, v in settings.to_dict().items() if k not in ("device", "half")}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False)
+                          .encode("utf-8")).hexdigest()[:12]
 
 
 def blur_score(image: np.ndarray) -> float:

@@ -3,12 +3,14 @@
 
 model: yolo11n-pose.pt        # 权重名（自动下载到 models/）或本地路径
 extra_models: []              # 例：[yolo11s-pose.pt] 开启多模型共识，分歧样本会被标记
-device: auto                  # auto 会优先用 Apple Silicon 的 MPS
+device: auto                  # auto：有 N 卡用 CUDA，其次 Apple 加速（MPS），最后 CPU
+                              # 想固定成某块卡：这里写 cuda / mps / cpu，
+                              # 或者不改本文件而用界面 ⌥S「系统设置」/ autolabel settings（优先级更低）
 imgsz: 640                    # 主体偏小（框高中位数 < 200px）时提到 960/1280
 conf: 0.25
 iou: 0.45
 max_det: 300
-half: false                   # MPS 上 fp16 未必更快，先按 qc 报告再决定
+half: false                   # 半精度只有 NVIDIA 显卡提速；CPU / MPS 上会自动退回普通精度并说明
 flip_tta: true                # 水平翻转融合，关键点更稳，耗时约翻倍
 
 # 关键点可见性：v=0 忽略 / v=1 遮挡 / v=2 可见

@@ -102,25 +102,40 @@ ALL_PAGES = {"review.html": "app.js", "objects.html": "objects.js",
 
 
 def test_appearance_controls_are_wired_on_every_page():
-    """外观是全站设置：四页都得有首屏脚本、菜单控件位，速查表也得写上快捷键。"""
+    """外观是全站设置：四页都得有首屏脚本、系统设置入口，速查表也得写上快捷键。"""
     css = read("app.css")
     assert ':root[data-theme="light"]' in css, "没有白天主题变量块"
-    assert ".menu-seg" in css, "缺外观分段选择器样式"
+    assert ".seg button" in css, "缺分段选择器样式"
     for step in ('[data-fs="0"]', '[data-fs="2"]', '[data-fs="3"]'):
         assert step in css, f"缺字号档位 {step}"
     for page in ALL_PAGES:
         html = read(page)
-        assert 'id="appearance-ctl"' in html, f"{page} 的 ⋯ 菜单没有外观控件位"
+        assert 'id="btn-settings"' in html, f"{page} 的 ⋯ 菜单没有系统设置入口"
         assert "autolabel.appearance" in html, f"{page} 缺首屏外观脚本，切页会闪一下默认主题"
         assert "dataset.theme" in html and "dataset.fs" in html, f"{page} 首屏脚本没写 data-theme / data-fs"
-        for advertised in ("⌥T", "⌥=", "⌥-"):
+        for advertised in ("⌥T", "⌥=", "⌥-", "⌥S"):
             assert advertised in html, f"{page} 速查表没写 {advertised}"
     common = read("common.js")
     for api in ("function setThemePref", "function toggleTheme", "function stepFont",
-                "function renderAppearanceControls", "function canvasPalette"):
+                "function renderSettingsPanel", "function canvasPalette"):
         assert api in common, f"common.js 缺 {api}()"
     assert "appearanceCommands()" in read("common.js").split("function registerShellCommands")[1], \
         "外观动作没进命令面板，⌘K 搜不到"
+
+
+def test_appearance_settings_live_in_the_settings_panel_only():
+    """白天/夜晚与字号收进「系统设置」一处：菜单里不许再散落一份裸控件。
+
+    同一件事有两个入口，改天就会有一个忘了同步——界面偏好只留一个家。
+    """
+    common = read("common.js")
+    assert "appearance-ctl" not in common, "菜单内联的外观控件位还在，说明没收进系统设置"
+    for page in ALL_PAGES:
+        assert "appearance-ctl" not in read(page), f"{page} 还留着菜单内的外观控件位"
+    panel = common.split("function buildSettingsModal()", 1)[-1]
+    for control in ('id="set-theme"', 'id="set-font"', 'id="set-devices"', 'id="set-half"'):
+        assert control in panel, f"系统设置面板缺 {control}"
+    assert "initSettings()" in common.split("function initNav()", 1)[1], "系统设置入口没接线"
 
 
 def test_every_font_size_follows_the_scale():

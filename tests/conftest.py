@@ -22,6 +22,11 @@ def isolated_model_paths(tmp_path, monkeypatch):
     monkeypatch.setenv("AUTOLABEL_MODEL_CONFIG", str(tmp_path / "configs" / "models.json"))
     monkeypatch.setenv("AUTOLABEL_VLM_CONFIG", str(tmp_path / "configs" / "vlm.json"))
     monkeypatch.setenv("AUTOLABEL_SECRETS", str(tmp_path / "secrets.json"))
+    # 系统设置（推理设备/半精度）也一样挪走，否则测试会读到甚至改掉开发者真实的 ~/.autolabel/settings.json
+    monkeypatch.setenv("AUTOLABEL_SETTINGS", str(tmp_path / "settings.json"))
+    import autolabel.settings as system
+
+    system._probe_cache = None
 
 
 @pytest.fixture()

@@ -646,6 +646,28 @@ class ReviewStore:
 
         return versioning.status(force=force)
 
+    def settings_payload(self, probe: bool = False) -> dict:
+        """「系统设置」面板的数据：存着的算力选择 + 这台机器实际能用哪些。
+
+        探测要 import torch，比读一个 JSON 贵得多，所以只在打开面板时
+        （``probe=True``）做一次，进程内还有缓存；平时切页不重复探测。
+        """
+        from . import settings as system
+
+        return system.payload(probe=probe)
+
+    def save_settings(self, payload: dict) -> dict:
+        """存系统设置，并把「选了但用不了」当场说清楚，别等跑任务才发现。"""
+        from . import settings as system
+
+        saved = system.save({k: payload.get(k) for k in ("device", "half") if k in payload})
+        facts = system.detect().get(saved["device"], {})
+        note = ""
+        if saved["device"] not in ("auto", "cpu") and facts and not facts.get("available"):
+            reason = facts.get("reason") or "原因未知"
+            note = f"{facts.get('label', saved['device'])}现在用不了：{reason}，跑的时候会自动降级"
+        return {"ok": True, "saved": saved, "note": note, "path": system.path()}
+
     def no_pose_label_hint(self) -> str:
         """「整库没标注」和「这个范围里没带标签的帧」出路不同，别给同一句提示。
 
@@ -1012,6 +1034,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 # 顶栏的版本徽标；?refresh=1 是用户在「关于」里点了「检查更新」
                 refresh = parse_qs(parsed.query).get("refresh", ["0"])[0] in ("1", "true", "yes")
                 self._send_json(self.store.version_payload(force=refresh))
+            elif path == "/api/settings":
+                # ?probe=1 才去探测显卡：打开「系统设置」面板时带，平时切页不带
+                probe = parse_qs(parsed.query).get("probe", ["0"])[0] in ("1", "true", "yes")
+                self._send_json(self.store.settings_payload(probe=probe))
             elif path == "/api/coords":
                 from .coords import render_coords
 
@@ -1167,6 +1193,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     raise ValueError("没有指定要取消登记的模型")
                 self._send_json({"ok": True, **self.store.remove_local_model(model_id),
                                  "models": self.store.model_rows()})
+            elif parsed.path == "/api/settings":
+                self._send_json(self.store.save_settings(payload))
             else:
                 self._send_json({"error": "not found"}, status=404)
         except FileNotFoundError as exc:

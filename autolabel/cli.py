@@ -33,7 +33,11 @@ def _pad(text: object, width: int) -> str:
 
 
 def load_settings(args: argparse.Namespace) -> BackendSettings:
-    """命令行参数 > YAML 配置 > 内置默认。"""
+    """命令行参数 > YAML 配置 > 系统设置 > 内置默认。
+
+    系统设置（``autolabel settings`` / 界面「系统设置」）只兜底设备和半精度：
+    命令行或 YAML 里写明了就用写明的，不会被家目录里一个文件偷偷改掉。
+    """
     overrides: Dict = {}
     config = getattr(args, "config", None)
     if config and os.path.exists(config):
@@ -48,6 +52,10 @@ def load_settings(args: argparse.Namespace) -> BackendSettings:
             overrides[key] = value
     if overrides.get("extra_models") and isinstance(overrides["extra_models"], str):
         overrides["extra_models"] = tuple(m.strip() for m in overrides["extra_models"].split(",") if m.strip())
+    from . import settings as system
+
+    for key, value in system.label_defaults().items():
+        overrides.setdefault(key, value)
     return BackendSettings(**overrides)
 
 
@@ -209,6 +217,38 @@ def cmd_version(args: argparse.Namespace) -> int:
         print(f"     git add -A && git commit -m 'v{new}' && git tag v{new} && git push origin main v{new}")
         return 0
     print(versioning.describe(versioning.status(force=args.check)))
+    return 0
+
+
+def cmd_settings(args: argparse.Namespace) -> int:
+    from . import settings as system
+
+    patch: Dict = {}
+    if args.device:
+        patch["device"] = args.device
+    if args.half is not None:
+        patch["half"] = args.half
+    if args.reset:
+        patch = dict(system.DEFAULTS)
+    if patch:
+        try:
+            saved = system.save(patch)
+        except ValueError as exc:
+            print(f"[error] {exc}", file=sys.stderr)
+            return 1
+        print(f"[ok] 系统设置已存到 {system.path()}")
+        print(f"     推理设备 {system.DEVICE_LABELS[saved['device']]} · 半精度 {'开' if saved['half'] else '关'}")
+        print("     界面「系统设置」和命令行用的是同一份，改完即生效（正在跑的任务下次启动才算）")
+        if args.device and args.device != "auto":
+            facts = system.detect(force=True).get(args.device, {})
+            if facts and not facts.get("available"):
+                print(f"[warn] 这台机器现在用不了{facts.get('label', args.device)}："
+                      f"{facts.get('reason') or '原因未知'}，跑的时候会自动降级")
+        return 0
+    if args.json:
+        print(json.dumps(system.payload(probe=True), ensure_ascii=False, indent=2))
+        return 0
+    print(system.describe())
     return 0
 
 
@@ -1138,6 +1178,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bump", nargs="?", const="patch", choices=["patch", "minor", "major"],
                    help="升版本号并写回，默认 patch（+0.01）")
     p.set_defaults(func=cmd_version)
+
+    p = sub.add_parser("settings", help="看/改系统设置：推理设备（CUDA / Apple 加速 / CPU）、半精度")
+    p.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], help="推理用哪块算力")
+    half_group = p.add_mutually_exclusive_group()
+    half_group.add_argument("--half", action="store_true", default=None, help="开半精度（只有 NVIDIA 显卡提速）")
+    half_group.add_argument("--no-half", dest="half", action="store_false", help="关半精度")
+    p.add_argument("--reset", action="store_true", help="恢复默认（自动选择 + 关半精度）")
+    p.add_argument("--json", action="store_true", help="连探测结果一起打 JSON")
+    p.set_defaults(func=cmd_settings)
 
     p = sub.add_parser("export", help="导出 YOLO 训练数据集（train/val + data.yaml）")
     add_dataset(p)

@@ -35,7 +35,7 @@
   <symbol id="ic-key" viewBox="0 0 16 16"><rect x="1.6" y="4" width="12.8" height="8" rx="1.4"/><path d="M4.2 6.6h.01M6.6 6.6h.01M9 6.6h.01M11.4 6.6h.01M4.2 9.4h7.6"/></symbol>
   <symbol id="ic-target" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2.4M8 12.8v2.4M.8 8h2.4M12.8 8h2.4"/></symbol>
   <symbol id="ic-export" viewBox="0 0 16 16"><path d="M8 10.4V2M8 2 5 4.8M8 2l3 2.8M2.6 9.4v3a1.2 1.2 0 0 0 1.2 1.2h8.4a1.2 1.2 0 0 0 1.2-1.2v-3"/></symbol>
-  <symbol id="ic-check" viewBox="0 0 16 16"><path d="m3.2 8.4 3.2 3.2 6.4-7.2"/></symbol>  <symbol id="ic-refresh" viewBox="0 0 16 16"><path d="M13.4 8a5.4 5.4 0 1 1-1.6-3.8"/><path d="M12.2 1.4v2.9H9.3"/></symbol>
+  <symbol id="ic-check" viewBox="0 0 16 16"><path d="m3.2 8.4 3.2 3.2 6.4-7.2"/></symbol>  <symbol id="ic-refresh" viewBox="0 0 16 16"><path d="M13.4 8a5.4 5.4 0 1 1-1.6-3.8"/><path d="M12.2 1.4v2.9H9.3"/></symbol>  <symbol id="ic-gear" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.3"/><path d="M8 1.3v2.1M8 12.6v2.1M1.3 8h2.1M12.6 8h2.1M3.3 3.3l1.5 1.5M11.2 11.2l1.5 1.5M12.7 3.3l-1.5 1.5M4.8 11.2l-1.5 1.5"/></symbol>
 </svg>
 
 <header>
@@ -75,7 +75,7 @@
         <button class="menu-item" id="about-check"><svg class="ic"><use href="#ic-refresh"/></svg>检查更新</button>
         <div class="menu-field muted small" id="about-note"></div>
         <div class="menu-sep"></div>
-        <div id="appearance-ctl"></div>
+        <button class="menu-item" id="btn-settings"><svg class="ic"><use href="#ic-gear"/></svg>系统设置<span class="kbd k">⌥S</span></button>
       </div>
     </div>
   </div>
@@ -187,6 +187,7 @@
       <div><span>⌘K</span><span>命令面板：导出、刷新、跳页面都能搜</span></div>
         <div><span>⌥T</span><span>白天 / 夜晚</span></div>
         <div><span>⌥= / ⌥-</span><span>字号放大 / 缩小</span></div>
+        <div><span>⌥S</span><span>系统设置（外观 + 推理算力）</span></div>
       <div><span>?</span><span>本说明</span></div>
       <div><span>R</span><span>重新读取磁盘上的文件</span></div>
       <div><span>Esc</span><span>关闭弹层</span></div>
