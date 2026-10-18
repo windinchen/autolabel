@@ -15,6 +15,14 @@
 
 完整文档见 `demo_docs/`（文档索引：`demo_docs/README.md`），改代码请同步更新那边。
 
+<p align="center">
+  <img src="docs/screenshots/review-pose.png" width="820" alt="姿态标注页：中间是骨骼与关键点，左侧焦点队列，右侧待办清单与动作按钮">
+</p>
+
+<p align="center">
+  <sub>姿态标注页 —— 左边焦点队列、中间骨骼、右边「待办清单」按「先修错的、再看可疑的」排好，逐条 <code>J</code> / <code>K</code> 跳过去改</sub>
+</p>
+
 ## 工作流程
 
 ```
@@ -127,6 +135,23 @@ class_id cx cy w h  x1 y1 v1  x2 y2 v2 ... x17 y17 v17
 | `/models` | 模型管理 | 模型目录、姿态权重文件、多模态大模型配置（从复核页弹层迁出为独立页，快捷键 `M` 直达） |
 
 骨骼写姿态库（`labels/` + `.autolabel/index.json`），物品框写提示词库（`prompt_labels/` + `.autolabel/objects/index.json`），两套标签、两套批次、两套导出互不覆盖，素材池 `images/` 共用。
+
+<p align="center">
+  <img src="docs/screenshots/workbench.png" width="820" alt="工作台：下一步行动、五格概览、两个标注库入口、两库训练集导出">
+</p>
+
+<p align="center">
+  <sub>工作台（<code>/</code>）—— 顶部「下一步」按「先能跑起来、再挑毛病」排序，中间五格概览与两个标注库入口，底部两套导出</sub>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/models.png" width="404" alt="模型管理页：13 档可下载模型的中文说明与就绪状态，下面是权重文件与多模态配置">
+  <img src="docs/screenshots/settings.png" width="404" alt="系统设置面板：左半界面外观（昼夜 + 四档字号），右半推理算力（自动 / CUDA / MPS / CPU + 半精度）">
+</p>
+
+<p align="center">
+  <sub>左：模型管理（<code>/models</code>）· 右：<code>⌥S</code> 系统设置 —— 外观存这台浏览器，推理算力存这台机器</sub>
+</p>
 
 ### 姿态标注页
 
