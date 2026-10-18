@@ -772,7 +772,7 @@ def export_detection_dataset(
     可能不连续，而 YOLO 要求 ``names`` 的键从 0 连续递增。
     """
     from .export import (_place, content_fingerprint, find_reusable_export, rank_for_split,
-                         split_val_set, unique_export_dir)
+                         skipped_summary, split_val_set, unique_export_dir)
 
     records, meta = collect_object_records(root, exclude_status=exclude_status)
     used = sorted({obj["cls"] for rec in records for obj in rec["objects"]})
@@ -787,7 +787,9 @@ def export_detection_dataset(
     labeled = rank_for_split(labeled, seed, key=lambda rec: rec["image"])
     empty = rank_for_split(empty, seed, key=lambda rec: rec["image"])
     keep_empty = int(len(labeled) * max_empty_ratio / max(1e-6, 1 - max_empty_ratio)) if labeled else len(empty)
-    empty = empty[:max(0, keep_empty)]
+    keep_empty = max(0, keep_empty)
+    empty_dropped = empty[keep_empty:]
+    empty = empty[:keep_empty]
 
     selected = labeled + empty
     val_set = split_val_set([rec["image"] for rec in selected], val_ratio, seed)
@@ -814,7 +816,8 @@ def export_detection_dataset(
         os.makedirs(os.path.join(out_root, "images", split), exist_ok=True)
         os.makedirs(os.path.join(out_root, "labels", split), exist_ok=True)
 
-    counts = {"train": 0, "val": 0, "boxes": {"train": 0, "val": 0}, "empty": len(empty), "dropped": 0}
+    counts = {"train": 0, "val": 0, "boxes": {"train": 0, "val": 0}, "empty": len(empty),
+              "empty_dropped": len(empty_dropped), "dropped": 0}
     for rec in selected:
         split = "val" if rec["image"] in val_set else "train"
         from .export import export_stem
@@ -853,8 +856,16 @@ def export_detection_dataset(
         json.dump({"generated_at": now_str(), "source_dataset": meta["source_dataset"],
                    "fields": meta["fields"], "class_remap": {str(k): v for k, v in remap.items()},
                    "counts": counts, "filter": meta["filter"],
+                   "max_empty_ratio": max_empty_ratio,
+                   # 被比例上限压掉的空帧只在这里留痕，不然用户只看到张数变少
+                   "empty_dropped_images": [rec["image"] for rec in empty_dropped][:200],
                    "fingerprint": fingerprint}, fh, ensure_ascii=False, indent=2)
+    reasons = [(str(row.get("image") or ""), str(row.get("reason") or ""))
+               for row in (meta.get("skipped") or []) if isinstance(row, dict)]
+    reasons += [(rec["image"], f"背景图超出比例上限（上限 {max_empty_ratio:.0%}）")
+                for rec in empty_dropped]
     return {"out": out_root, "images": len(selected), "train": counts["train"], "val": counts["val"],
+            "skipped": len(reasons), "skipped_note": skipped_summary(reasons),
             "boxes": counts["boxes"], "classes": [
                 {"class_id": cls, "export_id": remap[cls],
                  "name": (names.get(cls) or {}).get("name") or f"class_{cls}"} for cls in used],

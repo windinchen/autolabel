@@ -8,6 +8,10 @@ from PIL import Image
 
 from autolabel.cli import main
 
+from _helpers import idx_names, write_label
+
+SAMPLE17 = "0 0.500000 0.500000 0.400000 0.600000 " + " ".join(["0.500000 0.500000 2"] * 17)
+
 
 def batches_of(root):
     path = os.path.join(root, ".autolabel", "batches.json")
@@ -48,6 +52,9 @@ def test_out_of_range_numbers_are_rejected_early(dataset, capsys, flag, value):
 
 def test_sane_numbers_still_pass(dataset, source_dir, capsys):
     """校验不能顺手把合法写法挡掉：0 秒起、0 表示不限制、边界值都要能过。"""
+    # 先给一张图写上有内容的标签：没标签时导出会如实报错（见 test_business_rules），
+    # 这条测试要验的是"参数合法"，不能被前置条件挡住。
+    write_label(dataset, sorted(idx_names(dataset))[0], [SAMPLE17])
     assert main(["export", dataset, "--val-ratio", "0.25", "--seed", "-3"]) == 0
     assert main(["qc", dataset, "--top", "5", "--render", "0"]) == 0
     assert main(["pool", dataset, "--limit", "0"]) == 0

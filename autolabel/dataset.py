@@ -42,6 +42,13 @@ STATUS_APPROVED = "approved"
 STATUS_REJECTED = "rejected"
 STATUS_EDITED = "edited"
 
+# 人工已经定论的两个状态：接受 = 确认要进训练集，驳回 = 明确不要。
+# 「等你复核」「优先队列」「导出默认范围」全以这条线为界——界面前后、命令行与
+# 网页必须是同一个口径，否则同一个词在三处给出三个数，用户不知道该信哪个。
+# 注意与 pipeline.HUMAN_STATUSES（approved+edited，"人工碰过就别覆盖"）区分：
+# 那条线保护成果，这条线判断还需不需要人再看一眼，用途不同不能混用。
+DEFINITIVE_STATUSES = (STATUS_APPROVED, STATUS_REJECTED)
+
 
 # --------------------------------------------------------------------------- #
 # 路径工具
@@ -138,6 +145,17 @@ class DatasetIndex:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(self.data, fh, ensure_ascii=False, indent=2, sort_keys=True)
         os.replace(tmp, path)
+
+
+def status_of(item: Optional[dict], lib: str = LIB_POSE) -> str:
+    """取一张图的复核状态：提示词库写在 ``prompt_status``，姿态库写在 ``status``。"""
+    key = "prompt_status" if normalize(lib) == LIB_OBJECTS else "status"
+    return str((item or {}).get(key) or STATUS_UNREVIEWED)
+
+
+def is_definitive(item: Optional[dict], lib: str = LIB_POSE) -> bool:
+    """人工点过「接受」或「驳回」= 已定论，这一帧不再占用「等你复核」。"""
+    return status_of(item, lib) in DEFINITIVE_STATUSES
 
 
 def now_str() -> str:

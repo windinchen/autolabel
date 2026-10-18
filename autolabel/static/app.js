@@ -36,6 +36,7 @@ async function boot() {
   state.ds = ds;
   if (state.ds.batches) batchState.list = poseBatches(state.ds.batches);
   renderModelOptions(state.ds.models);
+  setFlagPolicy(state.ds);
   setHeaderCount(state.ds);
   document.title = "姿态标注 · " + state.ds.name;
   rebuildList();
@@ -82,9 +83,11 @@ function setHeaderCount(ds) {
     + (spare ? `；素材池另有 ${spare} 张可直接「从素材池添加」` : "");
 }
 
-/** 模型自己标了警告、或整体置信度偏低，就算「需要人看一眼」。 */
+/** 模型自己标了警告、或整体置信度偏低，就算「需要人看一眼」。
+ * 「两个模型结论一致」是加分项，不算问题——它以前也被算进红点和「待确认 N 处」。 */
 function needsAttention(it) {
-  return Boolean((it.flags || []).length) || (it.score !== null && it.score !== undefined && it.score < LOWCONF);
+  return issueFlags(it).length > 0
+    || (it.score !== null && it.score !== undefined && it.score < flagPolicy.lowScore);
 }
 
 function rebuildList() {
@@ -153,10 +156,14 @@ function renderFilmstrip() {
   for (let i = from; i < to; i++) {
     const it = state.list[i];
     const div = document.createElement("div");
+    const issues = issueFlags(it);
+    const pluses = positiveFlags(it);
     div.className = "thumb" + (i === state.idx ? " active" : "")
-      + (it.flags.length ? " flagged" : "") + (it.status === "approved" ? " approved" : "")
+      + (issues.length ? " flagged" : "") + (it.status === "approved" ? " approved" : "")
       + (it.status === "rejected" ? " rejected" : "");
-    div.title = it.image + "\n优先级 " + it.priority + "\n" + it.flags.map(flagLabel).join("、");
+    div.title = it.image + "\n优先级 " + it.priority + "\n"
+      + (issues.length ? issues.map(flagLabel).join("、") : "没有要处理的标记")
+      + (pluses.length ? "\n加分项：" + pluses.map(flagLabel).join("、") : "");
     const img = document.createElement("img");
     img.src = "/thumb/" + encodeURIComponent(it.image);
     img.loading = "lazy";
@@ -170,9 +177,9 @@ function renderFilmstrip() {
     const st = document.createElement("span");
     st.className = "st";
     st.textContent = statusLabel(it.status);
-    if ((it.flags || []).length) {
+    if (issueFlags(it).length) {
       const em = document.createElement("em");
-      em.textContent = (it.flags || []).length + " 项标记";
+      em.textContent = issueFlags(it).length + " 项标记";
       st.appendChild(document.createTextNode(" · "));
       st.appendChild(em);
     } else if (it.objects) {
@@ -375,11 +382,20 @@ function renderPanel() {
   renderTodo();
   const flags = $("flags");
   flags.innerHTML = "";
-  (it.flags || []).forEach((f) => {
+  // 要处理的排前面，加分项排后面并染成绿色，免得把"两个模型一致"当成待办
+  const flagRows = issueFlags(it).map((f) => [f, false])
+    .concat(positiveFlags(it).map((f) => [f, true]));
+  if (!flagRows.length) {
     const div = document.createElement("div");
-    div.className = "flag";
+    div.className = "flag ok";
+    div.innerHTML = '<b>没有要处理的标记</b><span class="hint">这一帧可以直接 Q 接受</span>';
+    flags.appendChild(div);
+  }
+  flagRows.forEach(([f, plus]) => {
+    const div = document.createElement("div");
+    div.className = "flag" + (plus ? " ok" : "");
     div.innerHTML = `<b>${flagLabel(f)}</b><span class="hint">${(state.ds.flag_hints || {})[f] || "人工确认"}</span>`;
-    div.title = f;
+    div.title = f + (plus ? "（加分项，不占待办）" : "");
     flags.appendChild(div);
   });
   $("obj-count").textContent = ` · ${it.objects.length} 人`;
@@ -593,7 +609,7 @@ function onKeyDown(e) {
     case "q": case "Q": setStatus("approved"); break;
     case "e": case "E": setStatus("rejected"); break;
     case "f": case "F": jumpFlagged(1); break;
-    case "u": case "U": undo(); break;
+    case "u": case "U": if (!runPendingUndo()) undo(); break;
     case "x": case "X": deleteObject(); break;
     case "z": case "Z": fitView(); draw(); break;
     case "[": cycleObject(-1); break;
@@ -673,6 +689,8 @@ async function save(silent) {
 async function setStatus(status) {
   if (!state.item) return;
   if (state.dirty) await save(true);
+  const target = state.item.image;
+  const previous = state.item.status || "unreviewed";
   const res = await fetch("/api/status", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ image: state.item.image, status }),
@@ -685,9 +703,25 @@ async function setStatus(status) {
   if (dsItem) dsItem.status = status;
   const said = { approved: "已接受", rejected: "已驳回", edited: "已保存修改" }[status] || ("已更新 " + status);
   toast(said);
-  showUndoBar(`${said} · ${state.item.image.split("/").pop()}`);
+  showUndoBar(`${said} · ${target.split("/").pop()} · 点撤销退回「${statusLabel(previous)}」`,
+    () => revertStatus(target, previous));
   renderProgress(); renderFilmstrip();
   if (status !== "edited") selectIndex(state.idx + 1);
+}
+
+/** 把某一帧的状态改回去（撤销条用）：只回退状态，不动已经改好的坐标。 */
+async function revertStatus(image, previous) {
+  const res = await fetch("/api/status", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ image, status: previous }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { toast("撤销失败：" + (data.error || "后端没答应"), true); return; }
+  const row = state.ds.items.find((i) => i.image === image);
+  if (row) row.status = previous;
+  toast("已撤销，这一帧回到" + statusLabel(previous));
+  // 回到刚才那一帧，用户才看得见撤销生效了（筛选停在"待复核"时它会重新进队列）
+  await refreshDataset({ select: image });
 }
 
 async function undo() {
@@ -705,10 +739,11 @@ async function undo() {
 }
 
 function jumpFlagged(dir) {
+  // 与速查表写的一致：带 QC 标记**或整体置信度偏低**都算，正向标记不算
   for (let i = state.idx + dir; i >= 0 && i < state.list.length; i += dir) {
-    if (state.list[i].flags.length) { selectIndex(i); return; }
+    if (needsAttention(state.list[i])) { selectIndex(i); return; }
   }
-  toast("没有更多带标记的图片");
+  toast("没有更多待确认的图片了");
 }
 
 window.addEventListener("beforeunload", (e) => { if (state.dirty) { e.preventDefault(); e.returnValue = ""; } });
@@ -1052,11 +1087,12 @@ function renderModelOptions(models, vlm) {
 }
 
 async function refreshDataset(opts) {
-  const current = state.item ? state.item.image : null;
+  const current = (opts && opts.select) || (state.item ? state.item.image : null);
   const res = await fetch("/api/dataset");
   state.ds = await res.json();
   if (state.ds.batches) batchState.list = poseBatches(state.ds.batches);
   renderModelOptions(state.ds.models);
+  setFlagPolicy(state.ds);
   setHeaderCount(state.ds);
   rebuildList();
   if (!state.list.length) { state.item = null; draw(); return; }
@@ -1082,11 +1118,10 @@ async function exportYoloDataset(button) {
   try {
     const data = await postJson("/api/export", { val_ratio: 0.2 });
     const info = data.export || {};
-    const people = info.people || {};
     const opened = await revealExport(info.out, { quiet: true });
     const verb = info.reused ? "标签没有变化，已复用上次导出" : "YOLO 训练集已导出";
-    toast(`${verb}：${info.train} 训练 / ${info.val} 验证 · `
-      + `${(people.train || 0) + (people.val || 0)} 人 → ${info.out}` + openedSuffix(opened));
+    toast(`${verb}（${scopeLabel(info.scope || "reviewed")}）：${exportSummary(info, "pose")} `
+      + `→ ${info.out}` + openedSuffix(opened));
   } catch (err) {
     toast("导出失败：" + err.message, true);
   }
@@ -1498,7 +1533,7 @@ function initShell() {
   });
   $("btn-batches").addEventListener("click", () => openMenu(false));
   $("btn-focus").onclick = () => setFocus();
-  $("btn-undo-bar").onclick = undo;
+  $("btn-undo-bar").onclick = () => { if (!runPendingUndo()) undo(); };
   renderHudSegs();
 }
 

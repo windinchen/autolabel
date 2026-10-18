@@ -97,9 +97,9 @@ function setHeaderCount(ds) {
     + (spare ? `；素材池另有 ${spare} 张可直接「从素材池添加」` : "");
 }
 
-/** 带标记，或压根还没标过检测框，都算「需要人看一眼」。 */
+/** 带标记，或压根还没标过检测框，都算「需要人看一眼」（正向标记不算问题）。 */
 function needsAttention(it) {
-  return (it.prompt_flags || []).length > 0
+  return issueFlags(it, "prompt_flags").length > 0
     || it.prompt_objects === null || it.prompt_objects === undefined;
 }
 
@@ -113,6 +113,7 @@ async function refreshDataset(keepImage) {
     toast("数据集读取失败：" + err.message, true);
     return;
   }
+  setFlagPolicy(state.ds);
   setHeaderCount(state.ds);
   document.title = "提示词标注 · " + state.ds.name;
   renderFieldChoices();
@@ -181,7 +182,7 @@ function renderFilmstrip() {
   const from = Math.max(0, state.idx - 60), to = Math.min(state.list.length, state.idx + 60);
   for (let i = from; i < to; i++) {
     const it = state.list[i];
-    const flagged = (it.prompt_flags || []).length > 0;
+    const flagged = issueFlags(it, "prompt_flags").length > 0;
     const div = document.createElement("div");
     div.className = "thumb" + (i === state.idx ? " active" : "")
       + (flagged ? " flagged" : "")
@@ -203,9 +204,9 @@ function renderFilmstrip() {
     line.className = "st";
     line.textContent = statusLabel(it.prompt_status);
     const boxes = it.prompt_objects;
-    if ((it.prompt_flags || []).length) {
+    if (issueFlags(it, "prompt_flags").length) {
       const em = document.createElement("em");
-      em.textContent = (it.prompt_flags || []).length + " 项标记";
+      em.textContent = issueFlags(it, "prompt_flags").length + " 项标记";
       line.append(document.createTextNode(" · "), em);
     } else {
       line.textContent += " · " + (boxes === null || boxes === undefined ? "未标" : boxes + " 框");
@@ -541,18 +542,37 @@ async function setStatus(status) {
     toast("改状态失败：" + err.message, true);
     return;
   }
+  const target = state.item.image;
+  const previous = state.item.prompt_status || state.item.status || "unreviewed";
   state.item.status = status;
-  const meta = libItems().find((i) => i.image === state.item.image);
+  const meta = libItems().find((i) => i.image === target);
   if (meta) meta.prompt_status = status;
   const said = status === "approved" ? "已接受" : "已驳回";
   toast(said);
-  showUndoBar(`${said} · ${String(state.item.image).split("/").pop()}`);
+  // 撤销必须认准刚才那一帧：这一页接受后会重建队列并翻页，
+  // 直接调"撤销坐标修改"会把下一帧的框回滚掉，而接受 / 驳回照旧留着。
+  showUndoBar(`${said} · ${String(target).split("/").pop()} · 点撤销退回「${statusLabel(previous)}」`,
+    () => revertStatus(target, previous));
   if (currentFilter() !== "all") {
     const nextImage = state.list[state.idx + (status === "rejected" ? 0 : 1)];
     rebuildList(nextImage ? nextImage.image : null);
   } else {
     renderFilmstrip(); renderProgress(); renderFlags();
   }
+}
+
+/** 撤销条：把那一帧的复核状态改回去，已经画好的框不动。 */
+async function revertStatus(image, previous) {
+  try {
+    await postJson("/api/prompt/status", { image, status: previous });
+  } catch (err) {
+    toast("撤销失败：" + err.message, true);
+    return;
+  }
+  const row = (state.ds.object_items || []).find((i) => i.image === image);
+  if (row) row.prompt_status = previous;
+  toast("已撤销，这一帧回到" + statusLabel(previous));
+  await refreshDataset(image);
 }
 
 async function undoItem() {
@@ -593,10 +613,11 @@ function cycleBox(dir) {
 }
 
 function jumpFlagged(dir) {
+  // 与顶栏「待确认 N」同口径：带标记或还没标过框都算，正向标记不算
   for (let i = state.idx + dir; i >= 0 && i < state.list.length; i += dir) {
-    if ((state.list[i].prompt_flags || []).length) { selectIndex(i); return; }
+    if (needsAttention(state.list[i])) { selectIndex(i); return; }
   }
-  toast("没有更多带标记的图片");
+  toast("没有更多待确认的图片了");
 }
 
 function onKeyDown(e) {
@@ -631,7 +652,7 @@ function onKeyDown(e) {
     case "q": case "Q": setStatus("approved"); break;
     case "e": case "E": setStatus("rejected"); break;
     case "f": case "F": jumpFlagged(1); break;
-    case "u": case "U": undoItem(); break;
+    case "u": case "U": if (!runPendingUndo()) undoItem(); break;
     case "x": case "X": case "Delete": case "0": deleteBox(); break;
     case "z": case "Z": fitView(); draw(); break;
     case "[": cycleBox(-1); break;
@@ -1014,9 +1035,11 @@ async function exportDataset(trigger) {
     const boxesN = (boxes.train || 0) + (boxes.val || 0);
     const classes = (info.classes || []).map((c) => c.name).join("、") || "无";
     const opened = await revealExport(info.out, { quiet: true });
-    runLog(`已导出 ${info.train} 训练 / ${info.val} 验证 · ${boxesN} 框 · 类别 ${classes} · ${info.out}`);
+    runLog(`已导出 ${info.train} 训练 / ${info.val} 验证 · ${boxesN} 框 · 类别 ${classes} · ${info.out}`
+      + (info.skipped_note ? ` · 没收进来的 ${info.skipped_note}` : ""));
     const verb = info.reused ? "标签没有变化，已复用上次导出" : "YOLO 训练集已导出";
-    toast(`${verb}：${info.train} 训练 / ${info.val} 验证 → ${info.out}` + openedSuffix(opened));
+    toast(`${verb}（${scopeLabel(info.scope || "reviewed")}）：${exportSummary(info, "detect")} `
+      + `→ ${info.out}` + openedSuffix(opened));
   } catch (err) {
     runLog("导出失败：" + err.message, true);
     toast("导出失败：" + err.message, true);
@@ -1311,7 +1334,7 @@ function initShell() {
     onRun: () => openRun(true),
   });
   $("btn-fields").addEventListener("click", () => openMenu(false));
-  $("btn-undo-bar").onclick = undoItem;
+  $("btn-undo-bar").onclick = () => { if (!runPendingUndo()) undoItem(); };
 }
 
 /** 命令面板里的提示词标注动作。 */

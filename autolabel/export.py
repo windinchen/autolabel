@@ -13,6 +13,41 @@ from .dataset import label_path_for, load_index, now_str
 from .yolo_pose import COCO17_KEYPOINTS, COCO17_FLIP_IDX, COCO17_SKELETON, parse_label_file
 
 DEFAULT_EXCLUDE_STATUS = {"rejected"}
+MISSING_LABEL_REASON = "缺少标签"
+EMPTY_CAP_REASON = "背景图超出比例上限"
+
+
+def skipped_summary(skipped: Sequence[Tuple[str, str]]) -> str:
+    """把跳过原因压成一句中文：``（已驳回 3 张 · 背景图超出比例上限 12 张）``。"""
+    counts: Dict[str, int] = {}
+    for _rel, reason in skipped:
+        counts[reason] = counts.get(reason, 0) + 1
+    if not counts:
+        return ""
+    parts = [f"{reason} {num} 张" for reason, num in
+             sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+    return "（" + " · ".join(parts) + "）"
+
+
+def no_sample_hint(skipped: Sequence[Tuple[str, str]]) -> str:
+    """没有帧可导出时，只指真正能改的那个开关。
+
+    以前不分原因都提示「加 --include-all / 界面范围改成全部」，实测三行里只有一行
+    吃这一套：`export` 根本没有放行缺标签帧的开关（只有 `coords` 有
+    --include-unlabeled），背景图吃的又是 --max-empty-ratio。用户照着提示换了范围，
+    报错一个字不变，只会以为软件坏了。
+    """
+    reasons = [reason for _rel, reason in skipped]
+    advice = []
+    if any(reason.startswith("status=") for reason in reasons):
+        advice.append("想连被驳回的帧一起要，命令行加 --include-all，界面里把导出范围改成「全部帧」")
+    if MISSING_LABEL_REASON in reasons:
+        advice.append("没标注的帧进不了训练集，先跑一次自动标注（命令行 autolabel auto / annotate）")
+    if any(reason.startswith(EMPTY_CAP_REASON) for reason in reasons):
+        advice.append("背景图是被占比上限压掉的，命令行加 --max-empty-ratio 1 就全要")
+    if not advice:
+        return "：库里一张图都还没有，先导入图片或抽帧（命令行 autolabel import / auto）"
+    return "：" + "；".join(advice)
 
 
 def export_dataset(
@@ -46,7 +81,7 @@ def export_dataset(
             skipped.append((rel, f"status={status}"))
             continue
         if require_label and not os.path.exists(label):
-            skipped.append((rel, "缺少标签"))
+            skipped.append((rel, MISSING_LABEL_REASON))
             continue
         if os.path.exists(label) and os.path.getsize(label) == 0:
             empty.append((rel, item))
@@ -57,10 +92,19 @@ def export_dataset(
     populated = rank_for_split(populated, seed)
     empty = rank_for_split(empty, seed)
     keep_empty = int(len(populated) * max_empty_ratio / max(1e-6, 1 - max_empty_ratio)) if populated else len(empty)
-    empty = empty[:max(0, keep_empty)]
-    skipped.extend((rel, "背景图超出比例上限") for rel, _ in empty[max(0, keep_empty):])
+    keep_empty = max(0, keep_empty)
+    # 以前是先 empty = empty[:keep_empty] 再取 empty[keep_empty:] 记原因——切完再切，
+    # 尾巴永远是空的：1500 张背景图被压到 15% 之后，manifest 里一条记录都没有，
+    # 命令行也只报"跳过 1"，用户根本不知道少掉的那几百张去哪了。
+    dropped_empty = empty[keep_empty:]
+    empty = empty[:keep_empty]
+    cap = f"{EMPTY_CAP_REASON}（上限 {max_empty_ratio:.0%}）"
+    skipped.extend((rel, cap) for rel, _ in dropped_empty)
 
     selected = populated + empty
+    if not selected:
+        raise ValueError("没有符合条件的样本可导出" + skipped_summary(skipped)
+                         + no_sample_hint(skipped))
     val_set = split_val_set([rel for rel, _item in selected], val_ratio, seed)
     fingerprint = content_fingerprint(
         [(rel, _read_label(root, rel)) for rel, _item in selected],
@@ -82,12 +126,20 @@ def export_dataset(
         os.makedirs(os.path.join(out_root, "images", split), exist_ok=True)
         os.makedirs(os.path.join(out_root, "labels", split), exist_ok=True)
 
-    counts = {"train": 0, "val": 0, "people": {"train": 0, "val": 0}, "empty": len(empty)}
+    counts = {"train": 0, "val": 0, "people": {"train": 0, "val": 0}, "empty": len(empty),
+              "empty_dropped": len(dropped_empty)}
     coco_records: List[Tuple[str, dict, str, List]] = []
     for rel, item in selected:
-        split = "val" if rel in val_set else "train"
         src_img = os.path.join(os.path.abspath(root), "images", rel)
         src_lbl = label_path_for(root, rel)
+        try:
+            persons = parse_label_file(src_lbl) if os.path.exists(src_lbl) else []
+        except ValueError as exc:
+            # 一行坏标签不该毁掉整批导出（以前一张坏文件让两万张的导出直接失败，
+            # 而且报错在"文件已经拷了一半"之后）。跳过这一帧，原因照常写进 manifest。
+            skipped.append((rel, f"标签解析失败：{exc}"))
+            continue
+        split = "val" if rel in val_set else "train"
         split_unique = export_stem(rel)
         dst_img = os.path.join(out_root, "images", split, split_unique + ".jpg")
         dst_lbl = os.path.join(out_root, "labels", split, split_unique + ".txt")
@@ -95,9 +147,20 @@ def export_dataset(
         if os.path.exists(src_lbl):
             _place(src_lbl, dst_lbl, mode)
         counts[split] += 1
-        persons = parse_label_file(src_lbl) if os.path.exists(src_lbl) else []
         counts["people"][split] += len(persons)
         coco_records.append((split_unique, item, split, persons))
+
+    if counts["train"] + counts["val"] == 0:
+        # 坏标签改成只跳单帧之后，"每一帧都读不通"会导出了一个 0 张的训练集还报成功。
+        # 一帧都没落地就别留空目录（只在目录确实空着时删，免得抹掉用户自己指定的 --out）。
+        leftovers = [name for split in ("train", "val")
+                     for name in os.listdir(os.path.join(out_root, "images", split))]
+        if not leftovers:
+            shutil.rmtree(out_root, ignore_errors=True)
+        bad = [reason for _rel, reason in skipped if reason.startswith("标签解析失败")]
+        raise ValueError(f"选中的 {len(selected)} 帧标签全都读不通，一张都没导出"
+                         f"（{len(bad)} 帧读不通，例：{bad[0] if bad else '标签为空'}）"
+                         + "：按提示里的 文件:行号 修掉坏行，或先跑 autolabel validate 查格式")
 
     names = idx.class_names
     num_kpt = int(idx.data.get("kpt_shape", [17, 3])[0])
@@ -115,6 +178,7 @@ def export_dataset(
         "source_dataset": os.path.abspath(root),
         "seed": seed,
         "val_ratio": val_ratio,
+        "max_empty_ratio": max_empty_ratio,
         "mode": mode,
         "counts": counts,
         "skipped": [{"image": rel, "reason": reason} for rel, reason in skipped][:2000],
@@ -144,6 +208,7 @@ def export_dataset(
         json.dump(manifest, fh, ensure_ascii=False, indent=2)
 
     return {"out": out_root, **counts, "skipped": len(skipped),
+            "skipped_note": skipped_summary(skipped),
             "train_images": counts["train"], "val_images": counts["val"],
             "coords": coord_out}
 
@@ -280,6 +345,9 @@ def find_reusable_export(root: str, fingerprint: str, kind: str = "pose") -> Opt
                 "train": counts.get("train", 0), "val": counts.get("val", 0),
                 "people": counts.get("people") or {}, "empty": counts.get("empty", 0),
                 "skipped": len(meta.get("skipped") or []),
+                "skipped_note": skipped_summary(
+                    [(str(r.get("image") or ""), str(r.get("reason") or ""))
+                     for r in (meta.get("skipped") or []) if isinstance(r, dict)]),
                 "train_images": counts.get("train", 0), "val_images": counts.get("val", 0),
                 "coords": meta.get("coords"), "data_yaml": row["data_yaml"]}
     return None

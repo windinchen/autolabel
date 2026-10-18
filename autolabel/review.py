@@ -61,7 +61,8 @@ from .models import (
 )
 from .pipeline import image_level_flags
 from .thumbs import THUMB_CACHE_CONTROL, build_thumbnail, prune_thumbs
-from .qc import COCO17_SKELETON, FLAG_HINTS, dataset_stats, flagged_items, review_priority
+from .qc import COCO17_SKELETON, FLAG_HINTS, LOW_SCORE, POSITIVE_FLAGS, dataset_stats, review_counts, \
+    review_priority
 from .batches import (
     MODULE_NAMES,
     batch_file_rows,
@@ -242,6 +243,10 @@ class ReviewStore:
                 "prompt_score": item.get("prompt_score"),
                 "prompt_priority": prompt_priority(item),
             })
+        # 「等你复核」由后端一次算清：门户 / 命令行 / 两个复核页共用同一个口径。
+        # 以前门户 JS 自己数一遍，姿态库数"所有没定论的"、提示词库数"带标记的"，
+        # 同一个数字两套算法；正向标记（多模型结论一致）还被前端当成待确认。
+        review = review_counts(items, object_items)
         # 门户要一眼看清"池里有多少素材、每个库各引用了多少"
         pool_rows = pool_items(self.root)
         pool_stats = {
@@ -268,6 +273,10 @@ class ReviewStore:
             "stats": {k: stats[k] for k in ("images", "persons_total", "status_counts", "flag_counts",
                                             "box_height_px", "persons_per_image")},
             "flag_hints": FLAG_HINTS,
+            "review": review,
+            # 前端判断"这帧要不要人看"要用同一条线：正向标记清单 + 置信度阈值
+            "positive_flags": sorted(POSITIVE_FLAGS),
+            "low_score": LOW_SCORE,
             "models": list_weights(),
             "vlm": vlm_choices(),
             "model_rows": list_models(dataset_root=self.root),
@@ -611,23 +620,46 @@ class ReviewStore:
         table = {"reviewed": ("rejected",), "approved": ("rejected", "unreviewed"), "all": ()}
         if scope not in table:
             raise ValueError(f"未知的导出范围：{scope}（可选 reviewed / approved / all）")
+        # 参数先校验再查库存：用户填错 1.5 时，报告"验证集比例不能大于 1"才有用，
+        # 报"库里还没标签"会把真正写错的参数盖掉（实测踩过空库 + val_ratio=1.5）。
+        val_ratio = self._number(payload, "val_ratio", 0.2, 0.0, 1.0, "验证集比例")
+        seed = int(self._number(payload, "seed", 7, None, None, "随机种子", integer=True))
+        max_empty_ratio = self._number(payload, "max_empty_ratio", 0.15, 0.0, 1.0, "背景图比例上限")
+        mode = str(payload.get("mode") or "symlink")
         ready = self.pose_labelled_count(table[scope])
         if not ready:
-            raise ValueError("姿态库还没有可导出的骨骼标签：先跑一次自动标注，"
-                             "或在复核界面把几张图点成「接受」")
+            raise ValueError(self.no_pose_label_hint())
         result = export_dataset(
             self.root, out=str(payload.get("out") or "") or None,
-            val_ratio=float(payload.get("val_ratio") or 0.2),
-            seed=int(payload.get("seed") or 7),
-            exclude_status=table[scope],
-            max_empty_ratio=float(payload.get("max_empty_ratio") or 0.15),
-            mode=str(payload.get("mode") or "symlink"),
+            val_ratio=val_ratio, seed=seed, exclude_status=table[scope],
+            max_empty_ratio=max_empty_ratio, mode=mode,
             tag=str(payload.get("tag") or "") or None,
             coco=bool(payload.get("coco")),
             coords=bool(payload.get("coords")))
         result["scope"] = scope
         result["data_yaml"] = os.path.join(result["out"], "data.yaml")
         return result
+
+    def version_payload(self, force: bool = False) -> dict:
+        """顶栏版本徽标与更新提示的数据：全部出自 :mod:`autolabel.version`。"""
+        from . import version as versioning
+
+        return versioning.status(force=force)
+
+    def no_pose_label_hint(self) -> str:
+        """「整库没标注」和「这个范围里没带标签的帧」出路不同，别给同一句提示。
+
+        库里一张标签都没有时，让人「点成接受」是白指路——接受不会凭空长出骨骼；
+        反过来库里明明有标签、只是被范围滤空了，让人去跑标注同样是绕远路。
+        """
+        labelled = self.pose_labelled_count()
+        if not labelled:
+            if not load_index(self.root).items:
+                return "姿态库还没有图片：先导入图片或抽帧（命令行 autolabel import / auto）"
+            return ("姿态库还没有任何骨骼标签：先跑一次自动标注（命令行 autolabel auto / annotate，"
+                    "或在复核界面手动画一副骨骼再保存）")
+        return (f"这个导出范围里没有带骨骼标签的帧（库里共 {labelled} 张带标签）："
+                "换个导出范围，或先把带标签的帧点成「接受」")
 
     def pose_labelled_count(self, exclude_status: Sequence[str] = ()) -> int:
         """姿态库里真正带标签文件的图片数，用来在空库时直接说人话而不是导出个空目录。"""
@@ -641,16 +673,50 @@ class ReviewStore:
                 count += 1
         return count
 
+    @staticmethod
+    def _number(payload: dict, key: str, default: float, low: Optional[float], high: Optional[float],
+                name: str, integer: bool = False) -> float:
+        """界面传来的数字参数：0 是实义值，不能被 ``or`` 吞成默认值。
+
+        实测过 ``val_ratio=0``（整库当训练集）、``seed=0``、``max_empty_ratio=0``
+        （不要背景图）三种合法写法，以前统统被 ``payload.get(k) or 默认值`` 改回
+        默认值，界面上怎么调都不生效，而命令行同样的写法是生效的——两条路两套口径。
+        """
+        raw = payload.get(key, None)
+        if raw is None or raw == "":
+            raw = default
+        try:
+            value = int(raw) if integer else float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name}要填数字，现在是「{raw}」")
+        if integer and float(raw) != value:
+            raise ValueError(f"{name}要填整数，现在是「{raw}」")
+        if low is not None and value < low:
+            raise ValueError(f"{name}不能小于 {low}，现在是 {value}")
+        if high is not None and value > high:
+            raise ValueError(f"{name}不能大于 {high}，现在是 {value}")
+        return float(value)
+
     def export_detection(self, payload: dict) -> dict:
         """导出 YOLO detection 数据集（train/val + data.yaml）。"""
         from .prompt import export_detection_dataset
 
         payload = payload or {}
-        return export_detection_dataset(
+        scope = str(payload.get("scope") or "reviewed")
+        table = {"reviewed": ("rejected",), "approved": ("rejected", "unreviewed"), "all": ()}
+        if scope not in table:
+            raise ValueError(f"未知的导出范围：{scope}（可选 reviewed / approved / all）")
+        val_ratio = self._number(payload, "val_ratio", 0.2, 0.0, 1.0, "验证集比例")
+        seed = int(self._number(payload, "seed", 7, None, None, "随机种子", integer=True))
+        max_empty_ratio = self._number(payload, "max_empty_ratio", 0.15, 0.0, 1.0, "背景图比例上限")
+        result = export_detection_dataset(
             self.root, out=str(payload.get("out") or "") or None,
-            val_ratio=float(payload.get("val_ratio") or 0.2),
+            val_ratio=val_ratio, seed=seed, exclude_status=table[scope],
+            max_empty_ratio=max_empty_ratio,
             tag=str(payload.get("tag") or "") or None,
             mode=str(payload.get("mode") or "symlink"))
+        result["scope"] = scope
+        return result
 
     def reveal_export(self, payload: dict) -> dict:
         """在系统文件管理器里定位导出目录：产物是目录，光给路径用户还是找不到。"""
@@ -942,6 +1008,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self._send_json(self.store.pool_payload(lib))
             elif path == "/api/models":
                 self._send_json(self.store.models_payload())
+            elif path == "/api/version":
+                # 顶栏的版本徽标；?refresh=1 是用户在「关于」里点了「检查更新」
+                refresh = parse_qs(parsed.query).get("refresh", ["0"])[0] in ("1", "true", "yes")
+                self._send_json(self.store.version_payload(force=refresh))
             elif path == "/api/coords":
                 from .coords import render_coords
 
@@ -1188,6 +1258,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
 def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True,
           max_upload_mb: int = 1024) -> None:
+    from . import version as versioning
+
     store = ReviewStore(root)
     ReviewHandler.store = store
     ReviewHandler.max_upload_mb = max_upload_mb
@@ -1206,10 +1278,14 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bo
     url = f"http://{host}:{httpd.server_address[1]}/"
     total = len(store.index.items)
     objects_total = len(store.objects_index.items)
-    flagged = len(flagged_items(root))
+    # 用内存里已经读好的两本索引现算，别再为这一行去解析一遍 index.json
+    counts = review_counts(list(store.index.items.values()),
+                           list(store.objects_index.items.values()))  # noqa: E501
     print(f"[info] 工作台: {url}")
+    print(f"[info] 自动标注 v{versioning.VERSION} · 开发者 {versioning.DEVELOPER} · {versioning.REPO_URL}")
     print(f"[info] 数据集 {store.index.name}：姿态库 {total} 张 · 提示词库 {objects_total} 张，"
-          f"其中 {flagged} 张带 QC 标记")
+          f"等你复核 {counts['pending']} 张（其中 {counts['flagged']} 张"
+          f"机器自己报了问题，进页面按 F 逐张跳）")
     print("[info] 二级模块：/pose 姿态标注 · /objects 提示词标注 · /models 模型管理")
     print(f"[info] 右上角可上传视频/图片目录（单文件上限 {max_upload_mb} MB），上传后自动标注并生成坐标文件")
     if store.recovery["recovered"] or store.recovery["interrupted"] or store.recovery["missing_files"]:
@@ -1218,6 +1294,7 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bo
               f"{store.recovery['missing_files']} 条索引记录的原图已丢失")
     print("[info] 快捷键：Q 接受 / E 驳回 / ←→ 或 A D 翻页 / 0 1 2 设置关键点可见性 / X 删除目标 / U 撤销")
     print("[info] Ctrl+C 退出")
+    versioning.start_background_check()   # 有新版本自己补一行，不挡启动
     if open_browser:
         import webbrowser
 

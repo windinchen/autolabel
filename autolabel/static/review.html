@@ -36,7 +36,7 @@
   <symbol id="ic-target" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2.4M8 12.8v2.4M.8 8h2.4M12.8 8h2.4"/></symbol>
   <symbol id="ic-undo" viewBox="0 0 16 16"><path d="M3 7.4h6.4a3.2 3.2 0 0 1 0 6.4H5.6M3 7.4l2.8-2.8M3 7.4l2.8 2.8"/></symbol>
   <symbol id="ic-check" viewBox="0 0 16 16"><path d="m3.2 8.4 3.2 3.2 6.4-7.2"/></symbol>
-  <symbol id="ic-cross" viewBox="0 0 16 16"><path d="M3.6 3.6l8.8 8.8M12.4 3.6l-8.8 8.8"/></symbol>
+  <symbol id="ic-cross" viewBox="0 0 16 16"><path d="M3.6 3.6l8.8 8.8M12.4 3.6l-8.8 8.8"/></symbol>  <symbol id="ic-refresh" viewBox="0 0 16 16"><path d="M13.4 8a5.4 5.4 0 1 1-1.6-3.8"/><path d="M12.2 1.4v2.9H9.3"/></symbol>
 </svg>
 
 <header>
@@ -49,6 +49,8 @@
     <button id="btn-flagged" title="跳到下一张待确认（F）">跳转</button>
   </span>
   <div class="controls">
+    <a class="vchip" id="version-chip" href="https://github.com/windinchen/autolabel"
+       target="_blank" rel="noopener noreferrer" title="当前版本 · 点开看 GitHub 仓库">v—</a>
     <div class="wrap-rel">
       <button class="searchbtn" id="btn-palette" title="命令面板">
         <svg class="ic" style="width:13px;height:13px"><use href="#ic-search"/></svg>
@@ -91,12 +93,28 @@
         <button class="menu-item" id="btn-export-yolo"
           title="导出 YOLO 标准训练集：images/{train,val} + labels/{train,val} + data.yaml，可直接 yolo pose train（已驳回的默认剔除）">
           YOLO 训练集</button>
+        <div class="menu-label">关于</div>
+        <div class="menu-field muted small"><span>版本</span><span class="mono" id="about-version">—</span></div>
+        <div class="menu-field muted small"><span>开发者</span><a id="about-dev"
+          href="https://github.com/windinchen" target="_blank" rel="noopener noreferrer">windinchen</a></div>
+        <a class="menu-item" id="about-home" href="https://github.com/windinchen/autolabel"
+           target="_blank" rel="noopener noreferrer"><svg class="ic"><use href="#ic-cube"/></svg>GitHub 仓库</a>
+        <button class="menu-item" id="about-check"><svg class="ic"><use href="#ic-refresh"/></svg>检查更新</button>
+        <div class="menu-field muted small" id="about-note"></div>
         <div class="menu-sep"></div>
         <div id="appearance-ctl"></div>
       </div>
     </div>
   </div>
 </header>
+
+<div class="update-bar" id="update-bar" hidden>
+  <svg class="ic"><use href="#ic-refresh"/></svg>
+  <span id="update-text"></span>
+  <a id="update-open" href="https://github.com/windinchen/autolabel/releases"
+     target="_blank" rel="noopener noreferrer">查看更新</a>
+  <button id="update-later">知道了</button>
+</div>
 <div class="progress" id="progress-track"><div id="progress-bar" class="bar"></div></div>
 
 <div id="export-note" class="export-note bar muted small hidden"></div>
@@ -202,7 +220,7 @@
       <div class="panel-title">复核</div>
       <div><span>Q</span><span>接受当前帧</span></div>
       <div><span>E</span><span>驳回当前帧</span></div>
-      <div><span>U</span><span>撤销上一次修改（⌘Z 同）</span></div>
+      <div><span>U</span><span>撤销上一次修改（⌘Z 同）；撤销条开着时先退回刚才那次接受 / 驳回</span></div>
       <div><span>F</span><span>跳到下一张待确认</span></div>
       <div><span>J / K</span><span>待办下一条 / 上一条</span></div>
       <div><span>↑ / ↓</span><span>队列内上下移动</span></div>

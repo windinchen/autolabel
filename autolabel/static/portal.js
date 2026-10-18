@@ -30,33 +30,48 @@ const STAT_STRIP = [
 ];
 
 
-/** 逐张数一遍两个库的索引：图片文件数取后端现算的池视角，其余从条目现算。 */
+/** 概览数字：口径由后端 `/api/dataset` 的 `review` 一次算清，前端只做兜底。
+ *
+ * 以前这里自己数一遍，而且两个库数的是两件事——姿态库数「所有没定论的」、
+ * 提示词库只数「带标记的」，于是「等你复核」是个拼起来的数；正向标记
+ * （两个模型结论一致）还被当成待办。现在后端算，兜底逻辑也照同一口径写。 */
 function buildStats(ds) {
   const pose = ds.pose_items || ds.items || [];
   const objects = ds.object_items || [];
   const pool = ds.pool || {};
+  const positive = new Set(ds.positive_flags || ["multi_model_confirmed"]);
+  const lowScore = typeof ds.low_score === "number" ? ds.low_score : 0.4;
+  const settled = (status) => ["approved", "rejected"].includes(status);
   const values = {
     files: pool.files !== undefined ? pool.files : (ds.pool_files || []).length,
     pool_shared: pool.shared || 0,
     pose_items: pose.length, object_items: objects.length,
     pose_labeled: 0, pose_unreviewed: 0, pose_flagged: 0, pending: 0,
-    prompt_labeled: 0, prompt_boxes: 0, prompt_flagged: 0,
+    prompt_labeled: 0, prompt_boxes: 0, prompt_flagged: 0, prompt_unreviewed: 0,
     batches: (ds.batches || []).length,
   };
   for (const item of pose) {
     if (item.objects !== null && item.objects !== undefined) values.pose_labeled += 1;
-    if (["unreviewed", "edited"].includes(item.status)) values.pose_unreviewed += 1;
-    if ((item.flags || []).length) values.pose_flagged += 1;
+    if (!settled(item.status)) values.pose_unreviewed += 1;
+    const issues = (item.flags || []).filter((f) => !positive.has(f));
+    const low = item.score !== null && item.score !== undefined && item.score < lowScore;
+    if (!settled(item.status) && (issues.length || low)) values.pose_flagged += 1;
   }
   for (const item of objects) {
     if (item.prompt_objects !== null && item.prompt_objects !== undefined) {
       values.prompt_labeled += 1;
       values.prompt_boxes += Number(item.prompt_objects || 0);
     }
-    if ((item.prompt_flags || []).length
-        && !["approved", "rejected"].includes(item.prompt_status)) values.prompt_flagged += 1;
+    const issues = (item.prompt_flags || []).filter((f) => !positive.has(f));
+    const unlabeled = item.prompt_objects === null || item.prompt_objects === undefined;
+    if (!settled(item.prompt_status) && (issues.length || unlabeled)) values.prompt_flagged += 1;
   }
-  values.pending = values.pose_unreviewed + values.prompt_flagged;
+  values.pending = values.pose_unreviewed + values.prompt_unreviewed;
+  const review = ds.review || {};
+  for (const key of ["pose_pending", "pose_flagged", "prompt_pending", "prompt_flagged", "pending"]) {
+    if (typeof review[key] === "number") values[key === "pose_pending" ? "pose_unreviewed"
+      : key === "prompt_pending" ? "prompt_unreviewed" : key] = review[key];
+  }
   return values;
 }
 function renderStats(ds) {
@@ -65,7 +80,7 @@ function renderStats(ds) {
     files: "两个库共用同一份，不占双份",
     pose_items: "已标 " + values.pose_labeled + " · 带标记 " + values.pose_flagged,
     object_items: "已标 " + values.prompt_labeled + " · 框 " + values.prompt_boxes,
-    pending: "还没点接受 / 驳回的",
+    pending: "两个库都没点接受 / 驳回的，与页内队列同口径",
     batches: "每次导入算一批",
   };
   const box = $("portal-stats");
@@ -241,35 +256,41 @@ function renderExports(ds) {
     }
     if (row.action) {
       el.querySelector(".model-main").append(buildExportNote(ds, row.action.kind));
+      // 以前界面只有一个按钮，导出的永远是"剔除已驳回"这一档，
+      // 想要"只导人工确认过的"只能回命令行敲 --only-approved。
+      const scope = document.createElement("select");
+      scope.className = "export-scope";
+      scope.title = "导出范围：哪些帧进训练集";
+      for (const [value, label] of EXPORT_SCOPES) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        scope.append(option);
+      }
       const b = document.createElement("button");
       b.className = "btn primary";
       b.id = row.action.id;
       b.textContent = row.action.label;
-      b.onclick = () => exportDataset(b, row.action.kind);
-      actions.append(b);
+      b.onclick = () => exportDataset(b, row.action.kind, scope);
+      actions.append(scope, b);
     }
     box.append(el);
   }
 }
 
-async function exportDataset(button, kind) {
+async function exportDataset(button, kind, scopeSelect) {
   if (button.disabled) return;
   const label = button.textContent;
   button.disabled = true;
   button.textContent = "导出中…";
+  const scope = scopeSelect ? scopeSelect.value : "reviewed";
   try {
-    if (kind === "pose") {
-      const info = (await postJson("/api/export", { val_ratio: 0.2 })).export || {};
-      const people = info.people || {};
-      const opened = await revealExport(info.out, { quiet: true });
-      toast(`YOLO 姿态训练集已导出：${info.train || 0} 训练 / ${info.val || 0} 验证 · `
-        + `${(people.train || 0) + (people.val || 0)} 人 → ${info.out}` + openedSuffix(opened));
-    } else {
-      const info = (await postJson("/api/prompt/export", { val_ratio: 0.2 })).export || {};
-      const opened = await revealExport(info.out, { quiet: true });
-      toast(`YOLO 检测训练集已导出：${info.train || 0} 训练 / ${info.val || 0} 验证 → ${info.out}`
-        + openedSuffix(opened));
-    }
+    const url = kind === "pose" ? "/api/export" : "/api/prompt/export";
+    const info = (await postJson(url, { val_ratio: 0.2, scope })).export || {};
+    const opened = await revealExport(info.out, { quiet: true });
+    const verb = info.reused ? "内容没变，已复用上次那份" : "YOLO 训练集已导出";
+    toast(`${verb}（${scopeLabel(scope)}）：${exportSummary(info, kind)} → ${info.out}`
+      + openedSuffix(opened));
   } catch (err) {
     toast("导出失败：" + err.message, true);
   }

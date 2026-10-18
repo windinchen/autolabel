@@ -174,7 +174,7 @@ def cmd_qc(args: argparse.Namespace) -> int:
     if args.render:
         outputs = render_overlays(args.dataset, limit=args.render, only_flagged=not args.render_all)
         print(f"[ok] 渲染 {len(outputs)} 张叠加图 -> {os.path.join(args.dataset, 'qc', 'overlays')}")
-    stats = write_report(args.dataset, top_n=args.top)
+    stats = write_report(args.dataset, top_n=args.top, include_reviewed=args.include_reviewed)
     print(f"[ok] 报告 -> {stats['report']}")
     print(f"     图片 {stats['images']} · 人数 {stats['persons_total']} · 待复核 {stats['flagged_count']}")
     top = ", ".join(f"{f}={c}" for f, c in list(stats["flag_counts"].items())[:6])
@@ -195,6 +195,23 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_version(args: argparse.Namespace) -> int:
+    from . import version as versioning
+
+    if args.bump:
+        try:
+            old, new = versioning.rewrite(versioning.bump(part=args.bump))
+        except ValueError as exc:
+            print(f"[error] {exc}", file=sys.stderr)
+            return 1
+        print(f"[ok] 版本号 {old} → {new}（改的是 {versioning.version_file()}）")
+        print("     日常改动按约定只升 0.01；升完记得同步 demo_docs/CHANGELOG.md，再提交打 tag：")
+        print(f"     git add -A && git commit -m 'v{new}' && git tag v{new} && git push origin main v{new}")
+        return 0
+    print(versioning.describe(versioning.status(force=args.check)))
+    return 0
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     from .export import export_dataset
 
@@ -207,6 +224,12 @@ def cmd_export(args: argparse.Namespace) -> int:
     print(f"[ok] 导出 -> {result['out']}")
     print(f"     train {result['train_images']} 张 / {result['people']['train']} 人 · "
           f"val {result['val_images']} 张 / {result['people']['val']} 人 · 跳过 {result['skipped']}")
+    if result.get("skipped_note"):
+        # 背景图被比例上限压掉时只报个数字没用，得说清少掉的张数去哪了
+        print(f"     剔除明细 {result['skipped_note']}")
+    if result.get("empty_dropped"):
+        print(f"     背景图（无人）只保留 {result['empty']} 张，上限 --max-empty-ratio "
+              f"{args.max_empty_ratio}；想全要就设 1")
     print(f"     data.yaml: {os.path.join(result['out'], 'data.yaml')}")
     if result.get("coords"):
         print(f"     坐标文件: {result['coords']}（coords.csv / coords_long.csv / coords.jsonl）")
@@ -1097,6 +1120,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=_positive_int, default=30)
     p.add_argument("--render", type=_non_negative_int, default=0, help="渲染 N 张叠加图")
     p.add_argument("--render-all", action="store_true", help="叠加图覆盖全部图片而非仅带标记的")
+    p.add_argument("--include-reviewed", action="store_true",
+                   help="复核清单连已接受 / 已驳回的一起列（默认只列还没定论的）")
     p.add_argument("--json", action="store_true", help="额外打印 JSON 统计")
     p.set_defaults(func=cmd_qc)
 
@@ -1107,6 +1132,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-browser", action="store_true")
     p.add_argument("--max-upload-mb", type=_positive_int, default=1024, help="网页上传单文件大小上限")
     p.set_defaults(func=cmd_review)
+
+    p = sub.add_parser("version", help="看版本号 / 开发者 / 与 GitHub 比对 / 升版本")
+    p.add_argument("--check", action="store_true", help="立刻联网重新比对（平时读半天内的缓存）")
+    p.add_argument("--bump", nargs="?", const="patch", choices=["patch", "minor", "major"],
+                   help="升版本号并写回，默认 patch（+0.01）")
+    p.set_defaults(func=cmd_version)
 
     p = sub.add_parser("export", help="导出 YOLO 训练数据集（train/val + data.yaml）")
     add_dataset(p)

@@ -8,7 +8,8 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from .dataset import label_path_for, load_index, now_str, resolve_image
+from .dataset import (LIB_OBJECTS, LIB_POSE, is_definitive, label_path_for, load_index, now_str,
+                      resolve_image)
 from .yolo_pose import COCO17_KEYPOINTS, COCO17_SKELETON, parse_label_file
 
 # 复核优先级权重：越大越该先看
@@ -51,6 +52,53 @@ FLAG_HINTS = {
 # 正向标记不构成"待复核"理由
 POSITIVE_FLAGS = {"multi_model_confirmed"}
 
+# 平均置信度低于这条线，机器自己都没把握，也算"该让人看一眼"
+LOW_SCORE = 0.4
+
+
+def _lib_key(lib: str) -> str:
+    """状态字段归属：``objects`` / ``prompt`` 都算提示词库，其余按姿态库。"""
+    return LIB_OBJECTS if str(lib or "") in (LIB_OBJECTS, "prompt") else LIB_POSE
+
+
+def issue_flags(item: dict, lib: str = LIB_POSE) -> List[str]:
+    """这张图上的"真问题"：去掉「多模型结论一致」这类正向标记。"""
+    if _lib_key(lib) == LIB_OBJECTS:
+        return [f for f in (item.get("prompt_flags") or []) if f not in POSITIVE_FLAGS]
+    flags = list(item.get("flags", [])) + list(item.get("object_flags", []))
+    return [f for f in flags if f not in POSITIVE_FLAGS]
+
+
+def needs_review(item: dict, lib: str = LIB_POSE) -> bool:
+    """这一帧还需不需要人看一眼：没定论，且机器自己报了问题。
+
+    姿态库的问题是 QC 标记或平均置信度偏低；提示词库是标记或压根还没标过框。
+    界面右下角的「待确认 N 处」、红点、``F`` 键跳转、门户的「带标记」全部走这里。
+    """
+    lib = _lib_key(lib)
+    if is_definitive(item, lib):
+        return False
+    if issue_flags(item, lib):
+        return True
+    if lib == LIB_OBJECTS:
+        return item.get("prompt_objects") is None
+    score = item.get("score")
+    return score is not None and float(score) < LOW_SCORE
+
+
+def review_counts(pose_rows: List[dict], prompt_rows: List[dict]) -> dict:
+    """两个库的「等你复核」计数：pending = 还没定论的帧，与两页默认筛选同口径。"""
+    counts = {
+        "pose_pending": sum(1 for it in pose_rows if not is_definitive(it, LIB_POSE)),
+        "pose_flagged": sum(1 for it in pose_rows if needs_review(it, LIB_POSE)),
+        "prompt_pending": sum(1 for it in prompt_rows if not is_definitive(it, LIB_OBJECTS)),
+        "prompt_flagged": sum(1 for it in prompt_rows if needs_review(it, LIB_OBJECTS)),
+    }
+    # 合计也在这算：门户那一格、启动日志、以后加的报表都读同一个键，别各自加一遍
+    counts["pending"] = counts["pose_pending"] + counts["prompt_pending"]
+    counts["flagged"] = counts["pose_flagged"] + counts["prompt_flagged"]
+    return counts
+
 
 def review_priority(item: dict) -> float:
     flags = list(item.get("flags", [])) + list(item.get("object_flags", []))
@@ -60,15 +108,20 @@ def review_priority(item: dict) -> float:
     return round(score, 3)
 
 
-def flagged_items(root: str, include_approved: bool = False) -> List[Tuple[str, dict, float]]:
+def flagged_items(root: str, include_reviewed: bool = False) -> List[Tuple[str, dict, float]]:
+    """优先复核清单：还没定论、且机器自己报了问题的帧，按优先级从高到低。
+
+    :param include_reviewed: 连人工已经定论（接受 / 驳回）的帧一起给，用于复盘
+        "当初驳回的那批到底是什么问题"。默认不含——已驳回的帧早就排除了出训练集，
+        再挂在清单最前面只会让人反复看同一张。
+    """
     idx = load_index(root)
     out = []
     for rel, item in idx.ordered_items():
-        if not include_approved and item.get("status") == "approved":
+        if not include_reviewed and is_definitive(item, LIB_POSE):
             continue
-        flags = [f for f in list(item.get("flags", [])) + list(item.get("object_flags", []))
-                 if f not in POSITIVE_FLAGS]
-        if flags or float(item.get("score", 1.0)) < 0.4:
+        flags = issue_flags(item, LIB_POSE)
+        if flags or needs_review(item, LIB_POSE):
             out.append((rel, item, review_priority(item)))
     out.sort(key=lambda t: (-t[2], t[0]))
     return out
@@ -87,6 +140,7 @@ def dataset_stats(root: str) -> dict:
     box_heights: List[float] = []
     box_scores: List[float] = []
     missing_labels = 0
+    bad_labels = 0
     for rel, item in idx.ordered_items():
         status = item.get("status", "unreviewed")
         status_counts[status] = status_counts.get(status, 0) + 1
@@ -100,6 +154,8 @@ def dataset_stats(root: str) -> dict:
         try:
             persons = parse_label_file(lp, num_kpt)
         except ValueError:
+            # 坏标签既不缺也不在，统计里必须有个格子，否则"图片 100 / 人数 0"没人解释
+            bad_labels += 1
             continue
         persons_per_image.append(len(persons))
         persons_total += len(persons)
@@ -118,6 +174,7 @@ def dataset_stats(root: str) -> dict:
         "dataset": idx.name,
         "images": len(idx.items),
         "missing_labels": missing_labels,
+        "bad_labels": bad_labels,
         "status_counts": status_counts,
         "flag_counts": dict(sorted(flag_counts.items(), key=lambda kv: -kv[1])),
         "persons_total": persons_total,
@@ -137,7 +194,7 @@ def dataset_stats(root: str) -> dict:
     }
 
 
-def write_report(root: str, top_n: int = 30) -> dict:
+def write_report(root: str, top_n: int = 30, include_reviewed: bool = False) -> dict:
     """生成 qc/report.md、qc/flags.csv、qc/stats.json。"""
     idx = load_index(root)
     stats = dataset_stats(root)
@@ -146,7 +203,7 @@ def write_report(root: str, top_n: int = 30) -> dict:
     with open(os.path.join(qc_root, "stats.json"), "w", encoding="utf-8") as fh:
         json.dump(stats, fh, ensure_ascii=False, indent=2)
 
-    flagged = flagged_items(root)
+    flagged = flagged_items(root, include_reviewed=include_reviewed)
     with open(os.path.join(qc_root, "flags.csv"), "w", encoding="utf-8") as fh:
         fh.write("image,priority,status,persons,score,visible_ratio,flags\n")
         for rel, item, priority in flagged:
@@ -157,11 +214,13 @@ def write_report(root: str, top_n: int = 30) -> dict:
     lines: List[str] = [f"# QC 报告 · {idx.name}", "", f"- 生成时间：{stats['generated_at']}",
                         f"- 标注参数：`{json.dumps(stats['label_settings'], ensure_ascii=False, sort_keys=True)}`",
                         "", "## 总览", "",
-                        f"- 图片总数：{stats['images']}（缺标签 {stats['missing_labels']}）",
+                        f"- 图片总数：{stats['images']}（缺标签 {stats['missing_labels']} · "
+                        f"标签解析失败 {stats['bad_labels']}）",
                         f"- 人数合计：{stats['persons_total']}，平均每图 {stats['persons_per_image']['mean']}，"
                         f"无人图 {stats['persons_per_image']['empty_images']}",
                         "- 复核状态：" + ", ".join(f"{k}={v}" for k, v in sorted(stats["status_counts"].items())),
-                        f"- 待复核：{len(flagged)} 张",
+                        f"- 待复核：{len(flagged)} 张（既没接受也没驳回、且机器自己报了问题；"
+                        f"已定论 {stats['status_counts'].get('approved', 0) + stats['status_counts'].get('rejected', 0)} 张不占位）",
                         "", "## 框高度分布（像素）", "",
                         "| p10 | p50 | p90 | min | max |", "| --- | --- | --- | --- | --- |",
                         f"| {stats['box_height_px']['p10']} | {stats['box_height_px']['p50']} | "

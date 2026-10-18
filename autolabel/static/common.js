@@ -177,6 +177,10 @@ function appearanceCommands() {
     { label: "字号放大一档", tag: "字号", key: "⌥=", run: () => said("字号「" + stepFont(1).label + "」") }
       ,
     { label: "字号缩小一档", tag: "字号", key: "⌥-", run: () => said("字号「" + stepFont(-1).label + "」") },
+    { label: "检查更新（比对 GitHub）", tag: "关于", run: () => checkForUpdates() },
+    { label: "打开 GitHub 仓库", tag: "关于", run: () => openExternal((versionState.info || {}).repo_url) },
+    { label: "打开开发者 GitHub 主页", tag: "关于",
+      run: () => openExternal((versionState.info || {}).developer_url) },
   ].concat(FONT_CHOICES.map((c) => ({
     label: "字号设为" + c.label, tag: "字号", run: () => { setFontStep(c.value); said("字号「" + c.label + "」"); },
   })));
@@ -324,6 +328,106 @@ function initNav() {
   if (brand) brand.href = "/";
   bindConfirmBox();
   bindModalKeys();
+  initVersionWidget();
+}
+
+// --------------------------------------------------------------------------- //
+// 版本与更新提示：四个页面顶栏都挂着版本号，数字只来自后端 autolabel/version.py，
+// 前端一个都不写死——写死就会出现"界面说 1.2、命令行说 1.1"这种没人信的数字。
+// --------------------------------------------------------------------------- //
+const UPDATE_DISMISS_KEY = "autolabel.updateDismissed";
+const versionState = { info: null };
+
+const dismissedVersion = () => {
+  try { return localStorage.getItem(UPDATE_DISMISS_KEY) || ""; } catch (e) { return ""; }
+};
+
+function rememberDismissed(version) {
+  try { localStorage.setItem(UPDATE_DISMISS_KEY, String(version || "")); } catch (e) { /* 无痕模式只是记不住 */ }
+}
+
+function openExternal(url) {
+  if (url) window.open(url, "_blank", "noopener");
+}
+
+/** 「上次检查」这行要说实话：没查到就写没查到，别留空让人以为软件坏了。 */
+function versionNote(info) {
+  if (!info.checked) return "GitHub 版本没查到" + (info.note ? "：" + info.note : "");
+  if (info.update_available) return "GitHub 最新 v" + info.latest + "，可以升级";
+  if (info.ahead) return "GitHub 最新 v" + info.latest + "，本地是开发中的版本";
+  return "GitHub 最新 v" + info.latest + " · 已是最新版";
+}
+
+function renderVersion(info) {
+  versionState.info = info || {};
+  const current = info.current || "";
+  const chip = $("version-chip");
+  if (chip) {
+    chip.textContent = "v" + (current || "—");
+    chip.href = info.repo_url || "#";
+    chip.title = "当前 v" + current + " · 开发者 " + (info.developer || "—") + " · 点开看 GitHub 仓库";
+    chip.classList.toggle("update", !!info.update_available);
+  }
+  const version = $("about-version");
+  if (version) {
+    version.textContent = "v" + (current || "—")
+      + (info.checked && info.latest && info.latest !== current ? " · GitHub v" + info.latest : "");
+  }
+  const dev = $("about-dev");
+  if (dev) {
+    dev.textContent = info.developer || "—";
+    dev.href = info.developer_url || "#";
+    dev.title = "打开 " + (info.developer || "") + " 的 GitHub 主页";
+  }
+  const home = $("about-home");
+  if (home) home.href = info.repo_url || "#";
+  const note = $("about-note");
+  if (note) note.textContent = versionNote(info);
+  // 「知道了」只按版本生效：升到 GitHub 那一版之前不再刷这条，但真出了更新版还会来
+  const bar = $("update-bar");
+  const show = !!info.update_available && info.latest !== dismissedVersion();
+  if (bar) bar.hidden = !show;
+  if (show) {
+    const text = $("update-text");
+    if (text) text.textContent = "GitHub 上有新版本 v" + info.latest + "（当前 v" + current + "）";
+    const open = $("update-open");
+    if (open) open.href = info.releases_url || info.repo_url || "#";
+  }
+}
+
+async function loadVersion(force) {
+  try {
+    const info = await getJson("/api/version" + (force ? "?refresh=1" : ""));
+    renderVersion(info);
+    return info;
+  } catch (e) {
+    return null;   // 版本徽标不是关键路径：取不到就安静待着，别在顶栏报错
+  }
+}
+
+/** 菜单 / 命令面板里的「检查更新」：真的联网比一次，有没有结果都当面说清。 */
+async function checkForUpdates() {
+  toast("正在比对 GitHub 上的版本…");
+  const info = await loadVersion(true);
+  if (!info) return toast("没查到 GitHub 上的版本，这台机器可能没联网", true);
+  if (info.update_available) return toast("有新版本 v" + info.latest + "（当前 v" + info.current + "）");
+  if (!info.checked) return toast("没查到 GitHub 上的版本：" + (info.note || "未知原因"), true);
+  return toast(info.ahead ? "本地 v" + info.current + " 比 GitHub 的 v" + info.latest + " 更新"
+                          : "已经是最新版 v" + info.current);
+}
+
+function initVersionWidget() {
+  const later = $("update-later");
+  if (later) {
+    later.addEventListener("click", () => {
+      rememberDismissed((versionState.info || {}).latest);
+      const bar = $("update-bar");
+      if (bar) bar.hidden = true;
+    });
+  }
+  const check = $("about-check");
+  if (check) check.addEventListener("click", () => checkForUpdates());
+  loadVersion(false);
 }
 
 // --------------------------------------------------------------------------- //
@@ -778,10 +882,13 @@ function shellKeys(e) {
 }
 
 /** 撤销条：接受/驳回后停 5 秒，手滑不用去面板里翻「撤销」。 */
-function showUndoBar(text) {
+function showUndoBar(text, action) {
   const bar = $("undo-bar");
   if (!bar) { return; }
   $("undo-label").textContent = text;
+  // 撤销条承诺的是"退回刚才那一步"。以前只带一句话，按钮固定绑在页面的"撤销坐标修改"上，
+  // 而 Q / E 之后界面会自动翻页——点撤销就把**下一帧**的坐标改回去了，状态原样留着。
+  shell.undoAction = action || null;
   bar.classList.add("on");
   clearInterval(shell.cd);
   clearTimeout(shell.hideUndo);
@@ -798,8 +905,65 @@ function showUndoBar(text) {
 function hideUndoBar() {
   clearInterval(shell.cd);
   clearTimeout(shell.hideUndo);
+  shell.undoAction = null;
   const bar = $("undo-bar");
   if (bar) { bar.classList.remove("on"); }
+}
+
+/** 撤销条上的按钮与 `U` 键都走这里；没有待撤销动作时返回 false，让页面退回常规撤销。 */
+function runPendingUndo() {
+  const action = shell.undoAction;
+  if (!action) { return false; }
+  shell.undoAction = null;
+  hideUndoBar();
+  action();
+  return true;
+}
+
+// ---- 「这一帧要不要人看」的口径：由后端下发，前端不再自己猜 ----
+const flagPolicy = { positive: new Set(["multi_model_confirmed"]), lowScore: 0.4 };
+
+/** 数据集加载后同步后端口径：正向标记清单 + 置信度阈值。 */
+function setFlagPolicy(ds) {
+  if (ds && Array.isArray(ds.positive_flags)) flagPolicy.positive = new Set(ds.positive_flags);
+  if (ds && typeof ds.low_score === "number") flagPolicy.lowScore = ds.low_score;
+}
+
+/** 真正要人处理的标记：剔掉「两个模型结论一致」这类正向标记（后端权重是负的）。 */
+function issueFlags(item, key) {
+  const list = (item && item[key || "flags"]) || [];
+  return list.filter((f) => !flagPolicy.positive.has(f));
+}
+
+/** 被剔掉的正向标记，单独显示成加分项，别让用户以为是漏了。 */
+function positiveFlags(item, key) {
+  const list = (item && item[key || "flags"]) || [];
+  return list.filter((f) => flagPolicy.positive.has(f));
+}
+
+/** 导出范围：与后端 /api/export 的 scope 一一对应，界面上终于能选。 */
+const EXPORT_SCOPES = [
+  ["reviewed", "剔除已驳回（含未复核）"],
+  ["approved", "只要已接受 / 已修改"],
+  ["all", "全部帧（含已驳回）"],
+];
+const scopeLabel = (value) => (EXPORT_SCOPES.find((row) => row[0] === value) || ["", value])[1];
+
+/** 导出结果说人话：收了多少 + 为什么少了这些张（后端算好的剔除明细）。 */
+function exportSummary(info, kind) {
+  const counts = (info && info.counts) || {};
+  const bits = [`${info.train || 0} 训练 / ${info.val || 0} 验证`];
+  if (kind === "pose") {
+    const people = info.people || {};
+    bits.push(`${(people.train || 0) + (people.val || 0)} 人`);
+  } else {
+    const boxes = info.boxes || {};
+    bits.push(`${(boxes.train || 0) + (boxes.val || 0)} 框`);
+  }
+  if (info.skipped_note) bits.push(`没收进来的 ${info.skipped_note}`);
+  const dropped = info.empty_dropped !== undefined ? info.empty_dropped : counts.empty_dropped;
+  if (dropped) bits.push(`其中背景图按上限少收 ${dropped} 张`);
+  return bits.join(" · ");
 }
 
 /** 下载一个后端生成的文件（坐标 CSV / JSONL 这类一次性产物）。 */
