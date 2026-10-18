@@ -227,15 +227,12 @@ class ReviewStore:
             })
         object_items = []
         for rel, item in self.objects_index.ordered_items():
+            # 行里只留 prompt_* 这一套键：界面读的本来就是这套，以前同时给一份
+            # status/objects/score/flags/priority 的重复拷贝，两万张的库白胖一截
             object_items.append({
                 "image": rel,
                 "width": item.get("width"),
                 "height": item.get("height"),
-                "status": item.get("prompt_status", STATUS_UNREVIEWED),
-                "objects": item.get("prompt_objects"),
-                "score": item.get("prompt_score"),
-                "flags": sorted(set(item.get("prompt_flags") or [])),
-                "priority": prompt_priority(item),
                 "time_sec": item.get("time_sec"),
                 "video": os.path.basename(item["video"]) if item.get("video") else None,
                 "batch_id": item.get("batch_id"),
@@ -259,8 +256,10 @@ class ReviewStore:
         return {
             "name": self.index.name,
             "root": self.root,
+            # 同一份姿态清单以前在 items 与 pose_items 里各序列化一遍：1500 张的
+            # 数据集响应体 720 KB，其中 305 KB 纯属第二份拷贝。界面两处写的都是
+            # ``ds.pose_items || ds.items``，去掉重复键不用动前端。
             "items": items,
-            "pose_items": items,
             "object_items": object_items,
             "class_names": {str(k): v for k, v in self.index.class_names.items()},
             "keypoint_names": list(self.index.data.get("keypoint_names", COCO17_KEYPOINTS))[:num_kpt],
@@ -889,8 +888,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     max_upload_mb: int = 1024
 
+    # 一屏队列就要拉几十张缩略图，全打出来的话终端只剩刷屏，真正要看的报错被冲走
+    QUIET_LOG_PREFIXES = ("/api/", "/image/", "/thumb/")
+
     def log_message(self, fmt: str, *args) -> None:  # 降噪
-        if self.path.startswith("/api/"):
+        if self.path.startswith(self.QUIET_LOG_PREFIXES):
             return
         super().log_message(fmt, *args)
 
@@ -966,7 +968,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
         except FileNotFoundError as exc:
             self._send_json({"error": f"文件不存在: {exc}"}, status=404)
         except KeyError as exc:
-            self._send_json({"error": f"未知对象: {exc}"}, status=404)
+            self._send_json({"error": f"未知对象: {exc.args[0] if exc.args else ''}"}, status=404)
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
         except Exception as exc:  # noqa: BLE001
@@ -1100,7 +1102,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
         except FileNotFoundError as exc:
             self._send_json({"error": str(exc)}, status=404)
         except KeyError as exc:
-            self._send_json({"error": f"未知对象: {exc}"}, status=404)
+            self._send_json({"error": f"未知对象: {exc.args[0] if exc.args else ''}"}, status=404)
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
         except Exception as exc:  # noqa: BLE001
@@ -1193,6 +1195,13 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bo
     pruned = prune_thumbs(store.root)
     if pruned:
         print(f"[info] 清理缩略图缓存 {pruned} 张（超过 30 天未使用）")
+    from .upload import prune_stale_uploads
+
+    # 上传的原始文件在任务成功后才删，中途被打断就没人认领了（一次视频就几百 MB）
+    stale = prune_stale_uploads(store.root)
+    if stale["files"]:
+        print(f"[info] 清理上次遗留的上传临时文件 {stale['files']} 个"
+              f"（{stale['bytes'] / 1048576:.1f} MB，超过 24 小时未使用）")
     httpd = ThreadingHTTPServer((host, port), ReviewHandler)
     url = f"http://{host}:{httpd.server_address[1]}/"
     total = len(store.index.items)

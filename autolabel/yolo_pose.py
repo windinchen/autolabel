@@ -304,7 +304,14 @@ def merge_person_flips(primary: Person, mirrored: Person) -> Person:
         y = (a.y * wa + b.y * wb) / (wa + wb)
         v = max(a.v, b.v)
         kps.append(Keypoint(x=x, y=y, v=v, conf=max(a.conf, b.conf)))
-    merged = Person(cls=primary.cls, cx=primary.cx, cy=primary.cy, w=primary.w, h=primary.h,
+    # 框跟着关键点一起融合：只留一路的框，融合后的骨架会漂到框外，
+    # 再被判成 keypoints_outside_box，让人工去修软件自己造出来的不匹配。
+    wa, wb = max(primary.score, 1e-6), max(mirrored.score, 1e-6)
+    merged = Person(cls=primary.cls,
+                    cx=(primary.cx * wa + mirrored.cx * wb) / (wa + wb),
+                    cy=(primary.cy * wa + mirrored.cy * wb) / (wa + wb),
+                    w=(primary.w * wa + mirrored.w * wb) / (wa + wb),
+                    h=(primary.h * wa + mirrored.h * wb) / (wa + wb),
                     keypoints=kps, score=max(primary.score, mirrored.score))
     return merged
 
@@ -389,8 +396,12 @@ def person_sanity_flags(
     if person.pixel_area(img_w, img_h) <= 0 or min(person.w * img_w, person.h * img_h) < min_box_px:
         flags.append("tiny_box")
     x1, y1, x2, y2 = person.xyxy(img_w, img_h)
-    if person.w > 0:
-        ar = person.h / max(person.w, 1e-6)
+    # 长宽比必须按像素算：归一化后的 h/w 会把图片自己的宽高比乘进去
+    # （ar_norm = ar_px × 图宽/图高），同一个人塞进 16:9 横屏被拉高 1.78 倍、
+    # 塞进竖屏手机视频又被压掉一半，判不判「异常」全跟着图片形状走。
+    px_w, px_h = person.w * img_w, person.h * img_h
+    if px_w >= 1.0:
+        ar = px_h / px_w
         if ar < 0.25 or ar > 6.0:
             flags.append("odd_aspect")
     if visible:

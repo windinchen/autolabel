@@ -8,9 +8,10 @@ import json
 import os
 import sys
 import unicodedata
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .backends import BackendSettings
+from . import __version__
 from .dataset import (
     STATUS_APPROVED,
     STATUS_UNREVIEWED,
@@ -64,9 +65,35 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _missing_sources(sources: Sequence[str]) -> Tuple[List[str], List[str]]:
+    """把导入源分成「不存在」与「存在」两组（展开 ~ 与相对路径后再判断）。"""
+    missing, existing = [], []
+    for source in sources:
+        path = os.path.abspath(os.path.expanduser(str(source)))
+        (existing if os.path.exists(path) else missing).append(str(source))
+    return missing, existing
+
+
 def cmd_import(args: argparse.Namespace) -> int:
     from .batches import attach_items, batch_name, create_batch, finish_batch
 
+    missing, existing = _missing_sources(args.sources)
+    for source in missing:
+        print(f"[warn] 路径不存在，跳过: {source}")
+    if not existing:
+        raise FileNotFoundError(
+            f"导入源都不存在：{'、'.join(missing)}；"
+            "路径打错了？相对路径请写成绝对路径或先 cd 到上级目录")
+    # 先导入再建批次：一条都没入库时不该在批次表里留一个 0 张的空批次
+    stats = import_images(args.dataset, existing, recursive=not args.no_recursive,
+                          max_side=args.max_side, jpeg_quality=args.jpeg_quality, dedupe=args.dedupe,
+                          subdir=args.subdir, lib=args.lib)
+    added = [rel for _src, rel in stats["imported_files"]]
+    if not added:
+        print(f"[info] 扫描 {stats['scanned']} 张，没有新图入库："
+              f"完全重复 {stats['skipped_exact']} · 近似重复 {stats['skipped_similar']} · "
+              f"失败 {stats['failed']}（已入库的要重标用 autolabel label --force）")
+        return 0
     batch = create_batch(args.dataset,
                          name=batch_name("image", [os.path.basename(str(s)) for s in args.sources],
                                          args.batch_name or ""),
@@ -74,11 +101,7 @@ def cmd_import(args: argparse.Namespace) -> int:
                          params={"dedupe": args.dedupe, "max_side": args.max_side,
                                  "subdir": args.subdir},
                          uploads=args.sources)
-    stats = import_images(args.dataset, args.sources, recursive=not args.no_recursive,
-                          max_side=args.max_side, jpeg_quality=args.jpeg_quality, dedupe=args.dedupe,
-                          subdir=args.subdir, lib=args.lib)
-    attach_items(args.dataset, batch["id"], [rel for _src, rel in stats["imported_files"]],
-                 lib=args.lib)
+    attach_items(args.dataset, batch["id"], added, lib=args.lib)
     finish_batch(args.dataset, batch["id"], "done", _import_note(stats["imported"], stats.get("reused")))
     print(f"[ok] 扫描 {stats['scanned']} · 导入 {stats['imported']} · "
           f"重复跳过 {stats['skipped_exact']} · 近似重复跳过 {stats['skipped_similar']} · "
@@ -138,6 +161,8 @@ def cmd_label(args: argparse.Namespace) -> int:
                           render_qc=args.render_qc, dry_run=args.dry_run)
     print(f"[ok] 标注完成 {stats['labeled']} 张 · 人数 {stats['people']} · 无人图 {stats['empty']} · "
           f"带标记 {stats['flagged']} · 失败 {stats['failed']}")
+    if stats.get("skipped_human"):
+        print(f"     人工已复核 {stats['skipped_human']} 张未覆盖（连它们一起重标加 --force）")
     if stats.get("img_per_sec"):
         print(f"     速度 {stats['img_per_sec']} img/s（{stats['elapsed_sec']}s）")
     return 0
@@ -235,6 +260,13 @@ def cmd_auto(args: argparse.Namespace) -> int:
     from .batches import attach_items, batch_name, create_batch, finish_batch
     from .library import LIB_POSE, lib_name
 
+    missing, existing = _missing_sources(args.sources)
+    for source in missing:
+        print(f"[warn] 路径不存在，跳过: {source}")
+    if not existing:
+        raise FileNotFoundError(
+            f"导入源都不存在：{'、'.join(missing)}；路径打错了？")
+    args.sources = existing
     lib = getattr(args, "lib", LIB_POSE) or LIB_POSE
     batch = create_batch(
         root, name=batch_name("video" if videos and not stills else "image",
@@ -265,6 +297,10 @@ def cmd_auto(args: argparse.Namespace) -> int:
               f"重复跳过 {stats['skipped_exact'] + stats['skipped_similar']} · 失败 {stats['failed']}")
     attach_items(root, batch["id"], imported, lib=lib)
     print(f"      批次 {batch['id']}（{lib_name(lib)}）")
+    if not imported:
+        # 一张都没进来就别再往下标注 / 出坐标，否则会产出一堆空文件看着像成功了
+        finish_batch(root, batch["id"], "failed", "没有可导入的图片（源里没有支持的图片/视频，或全部重复）")
+        raise ValueError("没有可导入的图片：源里没有支持的图片/视频扩展名，或全部与已有素材重复")
 
     if lib != LIB_POSE:
         # 提示词库不跑 YOLO-pose：入库即收尾，骨骼标注 / QC / 骨骼坐标是姿态库那套流水线
@@ -900,8 +936,87 @@ def cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- 参数校验：错在参数上就在参数上报，别等流水线跑到一半 ---------- #
+
+def _positive_int(text: str) -> int:
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"得是整数，收到「{text}」") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"得大于 0，收到 {value}")
+    return value
+
+
+def _non_negative_int(text: str) -> int:
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"得是整数，收到「{text}」") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"不能是负数，收到 {value}")
+    return value
+
+
+def _positive_float(text: str) -> float:
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"得是数字，收到「{text}」") from None
+    if value <= 0:
+        raise argparse.ArgumentTypeError(f"得大于 0，收到 {value}")
+    return value
+
+
+def _non_negative_float(text: str) -> float:
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"得是数字，收到「{text}」") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"不能是负数，收到 {value}")
+    return value
+
+
+def _fraction(text: str) -> float:
+    """0~1 之间的比例（不含两端）：验证集占比、置信度阈值这类。"""
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"得是数字，收到「{text}」") from None
+    if not 0.0 < value < 1.0:
+        raise argparse.ArgumentTypeError(f"得在 0 和 1 之间（不含两端），收到 {value}")
+    return value
+
+
+def _unit_interval(text: str) -> float:
+    """允许取到端点的 0~1：背景图占比这类可以为 0。"""
+    try:
+        value = float(text)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"得是数字，收到「{text}」") from None
+    if not 0.0 <= value <= 1.0:
+        raise argparse.ArgumentTypeError(f"得在 0 到 1 之间，收到 {value}")
+    return value
+
+
+def _quality(text: str) -> int:
+    value = _positive_int(text)
+    if value > 100:
+        raise argparse.ArgumentTypeError(f"JPEG 质量得在 1~100，收到 {value}")
+    return value
+
+
+def _port(text: str) -> int:
+    value = _positive_int(text)
+    if value > 65535:
+        raise argparse.ArgumentTypeError(f"端口得在 1~65535，收到 {value}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="autolabel", description="人体骨骼自动标注系统（YOLO pose）")
+    parser.add_argument("--version", action="version", version=f"autolabel {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_dataset(p: argparse.ArgumentParser) -> None:
@@ -915,28 +1030,29 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--vlm", dest="vlm_profile", metavar="配置",
                        help="改用多模态大模型标注，取「模型管理」里的配置 ID 或名称")
         p.add_argument("--device", choices=["auto", "mps", "cuda", "cpu", "0", "1"])
-        p.add_argument("--imgsz", type=int)
-        p.add_argument("--conf", type=float)
-        p.add_argument("--iou", type=float)
-        p.add_argument("--max-det", type=int)
+        p.add_argument("--imgsz", type=_positive_int)
+        p.add_argument("--conf", type=_fraction)
+        p.add_argument("--iou", type=_fraction)
+        p.add_argument("--max-det", type=_positive_int)
         p.add_argument("--half", action="store_true", default=None)
         p.add_argument("--no-flip", dest="flip_tta", action="store_false", default=None,
                        help="关闭水平翻转融合（更快，关键点质量略降）")
         p.add_argument("--visibility-policy", choices=["threshold", "all_visible", "binary"])
-        p.add_argument("--visible-conf", type=float)
-        p.add_argument("--occluded-conf", type=float)
+        p.add_argument("--visible-conf", type=_fraction)
+        p.add_argument("--occluded-conf", type=_fraction)
         p.add_argument("--box-mode", choices=["expand", "model", "keypoints"])
-        p.add_argument("--bbox-margin", type=float)
-        p.add_argument("--limit", type=int, help="只标注前 N 张，用于试跑")
-        p.add_argument("--render-qc", type=int, default=0, help="同时渲染 N 张骨架叠加图")
-        p.add_argument("--force", action="store_true", help="忽略断点续跑，全部重标")
+        p.add_argument("--bbox-margin", type=_positive_float)
+        p.add_argument("--limit", type=_non_negative_int, help="只标注前 N 张，用于试跑")
+        p.add_argument("--render-qc", type=_non_negative_int, default=0, help="同时渲染 N 张骨架叠加图")
+        p.add_argument("--force", action="store_true",
+                   help="连人工已接受 / 手工改过的图一起重标（默认跳过它们与已按当前参数标好的图）")
         p.add_argument("--dry-run", action="store_true", help="只跑流程不写标签")
 
     p = sub.add_parser("init", help="创建数据集骨架")
     add_dataset(p)
     p.add_argument("--name", help="数据集名称")
     p.add_argument("--class-names", default="person", help="逗号分隔类别名，默认单类 person")
-    p.add_argument("--num-keypoints", type=int, default=17, help="关键点数，COCO 为 17")
+    p.add_argument("--num-keypoints", type=_positive_int, default=17, help="关键点数，COCO 为 17")
     p.set_defaults(func=cmd_init)
 
     def add_lib(parser: argparse.ArgumentParser, default: str = "pose") -> None:
@@ -948,8 +1064,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_dataset(p)
     p.add_argument("sources", nargs="+", help="图片或目录")
     p.add_argument("--no-recursive", action="store_true")
-    p.add_argument("--max-side", type=int, default=1600)
-    p.add_argument("--jpeg-quality", type=int, default=95)
+    p.add_argument("--max-side", type=_positive_int, default=1600)
+    p.add_argument("--jpeg-quality", type=_quality, default=95)
     p.add_argument("--dedupe", choices=["none", "exact", "perceptual"], default="exact")
     p.add_argument("--subdir", default="", help="导入到 images/ 下的子目录")
     p.add_argument("--batch-name", help="批次名称，用于「批次管理」分组显示")
@@ -959,12 +1075,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("video", help="视频抽帧导入（ffmpeg）")
     add_dataset(p)
     p.add_argument("video", help="视频文件")
-    p.add_argument("--fps", type=float, default=0.5, help="采样帧率，0.5 = 每 2 秒 1 帧")
-    p.add_argument("--max-frames", type=int, default=600)
-    p.add_argument("--scene", type=float, help="按场景切点抽帧的阈值（0.2~0.4），设置后忽略 --fps")
-    p.add_argument("--start", type=float, default=0.0, help="起始秒")
-    p.add_argument("--duration", type=float, help="截取时长（秒）")
-    p.add_argument("--max-side", type=int, default=1600)
+    p.add_argument("--fps", type=_positive_float, default=0.5, help="采样帧率，0.5 = 每 2 秒 1 帧")
+    p.add_argument("--max-frames", type=_positive_int, default=600)
+    p.add_argument("--scene", type=_fraction, help="按场景切点抽帧的阈值（0.2~0.4），设置后忽略 --fps")
+    p.add_argument("--start", type=_non_negative_float, default=0.0, help="起始秒")
+    p.add_argument("--duration", type=_positive_float, help="截取时长（秒）")
+    p.add_argument("--max-side", type=_positive_int, default=1600)
     p.add_argument("--dedupe", choices=["none", "exact", "perceptual"], default="perceptual")
     p.add_argument("--subdir", default="")
     p.add_argument("--batch-name", help="批次名称，用于「批次管理」分组显示")
@@ -978,8 +1094,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("qc", help="生成质量报告与复核清单")
     add_dataset(p)
-    p.add_argument("--top", type=int, default=30)
-    p.add_argument("--render", type=int, default=0, help="渲染 N 张叠加图")
+    p.add_argument("--top", type=_positive_int, default=30)
+    p.add_argument("--render", type=_non_negative_int, default=0, help="渲染 N 张叠加图")
     p.add_argument("--render-all", action="store_true", help="叠加图覆盖全部图片而非仅带标记的")
     p.add_argument("--json", action="store_true", help="额外打印 JSON 统计")
     p.set_defaults(func=cmd_qc)
@@ -987,18 +1103,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("review", help="打开浏览器复核界面")
     add_dataset(p)
     p.add_argument("--host", default="127.0.0.1")
-    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--port", type=_port, default=8765)
     p.add_argument("--no-browser", action="store_true")
-    p.add_argument("--max-upload-mb", type=int, default=1024, help="网页上传单文件大小上限")
+    p.add_argument("--max-upload-mb", type=_positive_int, default=1024, help="网页上传单文件大小上限")
     p.set_defaults(func=cmd_review)
 
     p = sub.add_parser("export", help="导出 YOLO 训练数据集（train/val + data.yaml）")
     add_dataset(p)
     p.add_argument("--out", help="导出目录，默认 <dataset>/exports/<时间戳>")
     p.add_argument("--tag", help="导出子目录名")
-    p.add_argument("--val-ratio", type=float, default=0.2)
+    p.add_argument("--val-ratio", type=_fraction, default=0.2, help="验证集占比，0~1 之间（不含两端）")
     p.add_argument("--seed", type=int, default=7)
-    p.add_argument("--max-empty-ratio", type=float, default=0.15, help="背景图占比上限")
+    p.add_argument("--max-empty-ratio", type=_unit_interval, default=0.15, help="背景图占比上限")
     p.add_argument("--mode", choices=["symlink", "copy", "hardlink"], default="symlink")
     p.add_argument("--coco", action="store_true", help="同时导出 COCO keypoint JSON")
     p.add_argument("--coords", action="store_true", help="同时导出 CSV/JSONL 坐标文件（含 split 列）")
@@ -1024,17 +1140,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("sources", nargs="+", help="图片、图片目录或视频文件（按扩展名自动分流）")
     p.add_argument("--name", help="数据集名称，仅首次创建时使用")
     p.add_argument("--no-recursive", action="store_true")
-    p.add_argument("--max-side", type=int, default=1600)
-    p.add_argument("--jpeg-quality", type=int, default=95)
+    p.add_argument("--max-side", type=_positive_int, default=1600)
+    p.add_argument("--jpeg-quality", type=_quality, default=95)
     p.add_argument("--dedupe", choices=["none", "exact", "perceptual"], default="exact", help="图片去重方式")
     p.add_argument("--video-dedupe", choices=["none", "exact", "perceptual"], default="perceptual",
                    help="视频帧去重方式，默认感知去重以剔除近重复帧")
     p.add_argument("--subdir", default="", help="导入到 images/ 下的子目录")
-    p.add_argument("--fps", type=float, default=0.5, help="视频采样帧率，0.5 = 每 2 秒 1 帧")
-    p.add_argument("--max-frames", type=int, default=600)
-    p.add_argument("--scene", type=float, help="按场景切点抽帧的阈值（0.2~0.4），设置后忽略 --fps")
-    p.add_argument("--start", type=float, default=0.0)
-    p.add_argument("--duration", type=float)
+    p.add_argument("--fps", type=_positive_float, default=0.5, help="视频采样帧率，0.5 = 每 2 秒 1 帧")
+    p.add_argument("--max-frames", type=_positive_int, default=600)
+    p.add_argument("--scene", type=_fraction, help="按场景切点抽帧的阈值（0.2~0.4），设置后忽略 --fps")
+    p.add_argument("--start", type=_non_negative_float, default=0.0)
+    p.add_argument("--duration", type=_positive_float)
     add_lib(p)
     add_label_args(p)
     p.add_argument("--formats", default="csv,long,jsonl", help="坐标文件格式")
@@ -1048,7 +1164,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("validate", help="校验标签格式")
     add_dataset(p)
-    p.add_argument("--num-keypoints", type=int, default=0)
+    p.add_argument("--num-keypoints", type=_non_negative_int, default=0)
     p.set_defaults(func=cmd_validate)
 
     p = sub.add_parser("status", help="数据集概览")
@@ -1076,7 +1192,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_dataset(p)
     p.add_argument("--add", action="append", default=[], metavar="图片路径",
                    help="把素材池里的这张图添加进 --lib 指定的库（不复制文件），可重复")
-    p.add_argument("--limit", type=int, default=30, help="最多列几条，默认 30")
+    p.add_argument("--limit", type=_non_negative_int, default=30, help="最多列几条，默认 30")
     add_lib(p)
     p.set_defaults(func=cmd_pool)
 
@@ -1104,7 +1220,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--images", action="append", default=[], metavar="相对路径",
                    help="只标这些图（逗号分隔可重复），默认整个数据集")
     p.add_argument("--vlm", default="", help="多模态配置名或 ID，默认用「模型管理」里设的默认配置")
-    p.add_argument("--limit", type=int, default=0, help="只标前 N 张，用于试跑")
+    p.add_argument("--limit", type=_non_negative_int, default=0, help="只标前 N 张，用于试跑")
     p.add_argument("--overwrite", action="store_true",
                    help="已经标过的也重标（默认跳过同签名已标的、人工接受过的、人工画过框的图）")
     p.add_argument("--prompt-extra", default="", help="附加到提示词里的全局补充说明")
@@ -1166,6 +1282,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     except KeyboardInterrupt:
         print("\n[info] 已中断")
         return 130
+    except (FileNotFoundError, NotADirectoryError, ValueError, KeyError) as exc:
+        # 路径打错、批次不存在、参数越界这类用户自己就能改对的问题：一行说清楚。
+        # 以前直接甩 Python 栈，普通用户看到的是 8 行看不懂的英文。
+        message = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
+        print(f"[error] {message}", file=sys.stderr)
+        if os.environ.get("AUTOLABEL_TRACEBACK"):  # 排查用：贴栈出来
+            raise
+        return 1
 
 
 if __name__ == "__main__":

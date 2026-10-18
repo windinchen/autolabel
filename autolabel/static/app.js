@@ -18,13 +18,22 @@ const LOWCONF = 0.4;
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
 const imgCache = new Map();
+// 连续翻页时后发的请求可能先回来：只有最新一次的加载结果才允许写 state.item
+let loadSeq = 0;
 
 // --------------------------------------------------------------------------- //
 // 初始化
 // --------------------------------------------------------------------------- //
 async function boot() {
-  const res = await fetch("/api/dataset");
-  state.ds = await res.json();
+  let ds;
+  try {
+    ds = await getJson("/api/dataset");
+  } catch (err) {
+    $("hint").textContent = "数据集读不出来：" + err.message;
+    toast("数据集读不出来：" + err.message, true);
+    return;
+  }
+  state.ds = ds;
   if (state.ds.batches) batchState.list = poseBatches(state.ds.batches);
   renderModelOptions(state.ds.models);
   setHeaderCount(state.ds);
@@ -185,13 +194,31 @@ async function selectIndex(i, keep = false) {
   if (!state.list.length) { state.item = null; renderPanel2(); return; }
   if (state.dirty) await save(true);
   i = clamp(i, 0, state.list.length - 1);
+  const seq = ++loadSeq;
   state.idx = i;
   const meta = state.list[i];
-  const res = await fetch("/api/item?image=" + encodeURIComponent(meta.image));
-  state.item = await res.json();
+  let item;
+  try {
+    item = await getJson("/api/item?image=" + encodeURIComponent(meta.image));
+  } catch (err) {
+    if (seq !== loadSeq) return;
+    // 最常见的是图在另一个标签页被删了：说清楚，别留一张白画布让人以为软件卡死
+    state.item = null;
+    state.selObj = -1;
+    state.selKpt = -1;
+    $("hint").textContent = "读不到这张图的标注：" + err.message;
+    toast("读不到 " + meta.image + "：" + err.message, true);
+    renderPanel();
+    renderFilmstrip();
+    draw();
+    return;
+  }
+  if (seq !== loadSeq) return;
+  state.item = item;
   state.selObj = state.item.objects.length ? 0 : -1;
   state.selKpt = -1;
   await loadImage(meta.image);
+  if (seq !== loadSeq) return;
   fitView();
   draw();
   renderPanel();
@@ -532,6 +559,15 @@ function onKeyDown(e) {
     return;
   }
   if (["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName)) return;
+  if (e.metaKey || e.ctrlKey) {
+    // ⌘/Ctrl 加字母是浏览器与系统的（全选、收藏、页内查找、下载、书签栏、切标签页…），
+    // 以前这些组合会顺手翻页、改关键点可见性、甚至跳去模型页。只按直觉接住撤销。
+    if ((e.key === "z" || e.key === "Z") && !e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      undo();;
+    }
+    return;
+  }
   const step = e.shiftKey ? 5 : 1;
   if (e.altKey && state.selObj >= 0 && state.selKpt >= 0 && e.key.startsWith("Arrow")) {
     e.preventDefault();

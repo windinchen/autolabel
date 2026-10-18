@@ -88,8 +88,7 @@ def export_dataset(
         split = "val" if rel in val_set else "train"
         src_img = os.path.join(os.path.abspath(root), "images", rel)
         src_lbl = label_path_for(root, rel)
-        stem = os.path.splitext(os.path.basename(rel))[0]
-        split_unique = f"{stem}"
+        split_unique = export_stem(rel)
         dst_img = os.path.join(out_root, "images", split, split_unique + ".jpg")
         dst_lbl = os.path.join(out_root, "labels", split, split_unique + ".txt")
         _place(src_img, dst_img, mode)
@@ -104,7 +103,7 @@ def export_dataset(
     num_kpt = int(idx.data.get("kpt_shape", [17, 3])[0])
     lines = [f"# 由自动标注系统生成 on {now_str()}", f"path: {out_root}", "train: images/train",
              "val: images/val", f"kpt_shape: [{num_kpt}, 3]",
-             f"flip_idx: {list(COCO17_FLIP_IDX[:num_kpt])}"]
+             f"flip_idx: {flip_idx_for(num_kpt)}"]
     lines.append("names:")
     for cid in sorted(names):
         lines.append(f"  {cid}: {names[cid]}")
@@ -147,6 +146,33 @@ def export_dataset(
     return {"out": out_root, **counts, "skipped": len(skipped),
             "train_images": counts["train"], "val_images": counts["val"],
             "coords": coord_out}
+
+
+def export_stem(rel: str) -> str:
+    """导出目录里用的文件名：把子目录压进名字里。
+
+    导出目录是平的（``images/train/``），只取 basename 的话 ``a/frame_0001.jpg`` 和
+    ``b/frame_0001.jpg`` 会抢同一个 ``frame_0001.jpg``——后放的把前面的连图片带标签一起
+    盖掉，实测 4 张图导完只剩 2 个文件，manifest 与 COCO 里却还写着 4 张。
+    平铺的数据集（绝大多数）算出来和原来一模一样，只有带子目录的会多一段前缀。
+    """
+    stem = os.path.splitext(str(rel).replace(os.sep, "/"))[0].replace("/", "__").strip("_")
+    return stem or "image"
+
+
+def flip_idx_for(num_kpt: int) -> List[int]:
+    """按关键点数给出 flip_idx：配对点落在范围外的改成自己映自己。
+
+    直接切 ``COCO17_FLIP_IDX[:n]`` 在 n<17 时会把「左膝 → 14」这种越界下标写进
+    ``data.yaml``（14 点数据集里根本没有第 14 号点），n>17 时又短一截；
+    这两种都是自定义/裁剪关键点模型会踩到的。
+    """
+    total = max(0, int(num_kpt))
+    out: List[int] = []
+    for index in range(total):
+        partner = COCO17_FLIP_IDX[index] if index < len(COCO17_FLIP_IDX) else index
+        out.append(partner if partner < total else index)
+    return out
 
 
 def split_bucket(seed: int, rel: str) -> int:
@@ -264,7 +290,9 @@ def _place(src: str, dst: str, mode: str) -> None:
     if os.path.islink(dst) or os.path.exists(dst):
         os.remove(dst)
     if mode == "symlink":
-        os.symlink(os.path.abspath(src), dst)
+        # 相对链接：整个导出目录（或整个数据集）搬家、换机器挂载点变了都还连得上，
+        # 绝对路径的软链一挪目录就全断，只能重新导一份。
+        os.symlink(os.path.relpath(src, os.path.dirname(dst)), dst)
     elif mode == "copy":
         shutil.copy2(src, dst)
     elif mode == "hardlink":
@@ -292,6 +320,8 @@ def write_coco_keypoints(path: str, records: Sequence[Tuple[str, dict, str, List
             for k in person.keypoints[:num_kpt]:
                 kps.extend([round(k.x * w, 2), round(k.y * h, 2), int(k.v)])
                 num_visible += int(k.v != 0)
+            # 少给点的标签（手改过 / 老版本写的）补零，否则 COCO 的三元组会整体错位
+            kps.extend([0.0, 0.0, 0.0] * max(0, num_kpt - len(person.keypoints[:num_kpt])))
             annotations.append({
                 "id": ann_id, "image_id": i, "category_id": int(person.cls) + 1,
                 "bbox": [round(x1, 2), round(y1, 2), round(x2 - x1, 2), round(y2 - y1, 2)],

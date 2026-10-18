@@ -13,6 +13,7 @@ import numpy as np
 from .backends import BackendSettings, build_backend
 from .dataset import (
     STATUS_APPROVED,
+    STATUS_EDITED,
     STATUS_UNREVIEWED,
     label_path_for,
     load_index,
@@ -21,6 +22,15 @@ from .dataset import (
 )
 from .image_utils import load_rgb
 from .yolo_pose import Person, person_sanity_flags, write_label_file
+
+
+#: 人工在复核界面动过的状态：接受过的、手工改过骨骼的。模型重标默认不许覆盖它们。
+HUMAN_STATUSES = (STATUS_APPROVED, STATUS_EDITED)
+
+
+def _human_reviewed(item: dict) -> bool:
+    """这张图的人工结果是否值得保护（接受过 / 手工改过）。"""
+    return item.get("status") in HUMAN_STATUSES
 
 
 def settings_signature(settings: BackendSettings) -> str:
@@ -79,7 +89,8 @@ def label_dataset(
 ) -> dict:
     """对数据集内图片批量推理并写标签。
 
-    :param only_missing: 跳过参数指纹一致且标签已存在的图片（断点续跑）
+    :param only_missing: 断点续跑——跳过参数指纹一致且标签已存在的图片，
+        以及人工接受过 / 改过骨骼的图片（`--force` 才会连它们一起重标）
     :param render_qc: 额外渲染前 N 张带骨架叠加图的 QC 预览
     :param progress: 每完成一张回调 (已完成, 总数)，供上传界面的进度条使用
     :param should_stop: 每张前检查，返回 True 就停下来（用于界面「清除任务」）
@@ -100,27 +111,39 @@ def label_dataset(
 
     signature = settings_signature(settings)
     previous = idx.data.get("settings", {})
-    if previous.get("signature") != signature:
-        # 参数变化后，之前的自动标签视为过期（人工已复核的保留）
+    if previous.get("signature") not in (None, signature) and only_missing and verbose:
         stale = [k for k, v in idx.items.items()
-                 if v.get("status") not in (STATUS_APPROVED,) and v.get("label_signature") != signature]
-        if stale and only_missing and verbose:
-            print(f"[info] 标注参数已变化，{len(stale)} 张需要重标")
-    only_missing = only_missing and previous.get("signature") == signature
+                 if not _human_reviewed(v) and v.get("label_signature") != signature]
+        if stale:
+            print(f"[info] 标注参数已变化，{len(stale)} 张需要重标（人工已复核的不计入）")
 
     ensemble = build_backend(settings)
     if not dry_run:
         ensemble.load()
 
-    targets = [(rel, item) for rel, item in idx.ordered_items()
-               if not (only_missing and _already_labeled(root, rel, item, signature))]
+    # 该不该跳交给逐张判断：`_already_labeled` 本来就是按参数指纹比的，
+    # 以前额外来一句「参数一变就整批不续跑」，把中断前已经按新参数标好的那些又重标一遍。
+    targets: List[tuple] = []
+    skipped_human = 0
+    for rel, item in idx.ordered_items():
+        if only_missing and _human_reviewed(item) and os.path.exists(label_path_for(root, rel)):
+            skipped_human += 1
+            continue
+        if only_missing and _already_labeled(root, rel, item, signature):
+            continue
+        targets.append((rel, item))
     if limit:
         targets = targets[:limit]
 
     stats = {"total": len(targets), "labeled": 0, "people": 0, "empty": 0,
-             "flagged": 0, "failed": 0, "skipped_reviewed": 0, "cancelled": 0}
+             "flagged": 0, "failed": 0, "skipped_reviewed": 0, "skipped_human": skipped_human,
+             "cancelled": 0}
     if not targets:
-        print("[info] 没有需要标注的图片（全部已完成，可用 --force 强制重标）")
+        if skipped_human:
+            print(f"[info] 没有需要标注的图片（人工已复核 {skipped_human} 张按规则不动，"
+                  f"其余已完成；连人工结果一起重标用 --force）")
+        else:
+            print("[info] 没有需要标注的图片（全部已完成，可用 --force 强制重标）")
         return stats
 
     start = time.time()
@@ -204,6 +227,7 @@ def label_dataset(
 
 
 def _already_labeled(root: str, rel: str, item: dict, signature: str) -> bool:
+    """这张图是否已经用**当前这套参数**标好了（断点续跑的最小单位是单张，不是整批）。"""
     return (item.get("label_signature") == signature
             and item.get("objects") is not None
             and os.path.exists(label_path_for(root, rel)))

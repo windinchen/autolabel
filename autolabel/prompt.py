@@ -817,8 +817,10 @@ def export_detection_dataset(
     counts = {"train": 0, "val": 0, "boxes": {"train": 0, "val": 0}, "empty": len(empty), "dropped": 0}
     for rec in selected:
         split = "val" if rec["image"] in val_set else "train"
-        stem = os.path.splitext(os.path.basename(rec["image"]))[0]
-        dst_img = os.path.join(out_root, "images", split, os.path.basename(rec["image"]))
+        from .export import export_stem
+
+        stem = export_stem(rec["image"])
+        dst_img = os.path.join(out_root, "images", split, stem + os.path.splitext(rec["image"])[1])
         dst_lbl = os.path.join(out_root, "labels", split, stem + ".txt")
         _place(resolve_image(root, rec["image"]), dst_img, mode)
         lines: List[str] = []

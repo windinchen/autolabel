@@ -1,5 +1,84 @@
 # 变更记录
 
+## 2026-10-18 18:10 — 合理性检查：两万张的库启动不再像卡死，接口不再白胖一倍
+
+第五轮看的是**资源与健壮性**：句柄与临时文件泄漏、大目录性能、启动耗时、日志噪音、异常兜底、`.autolabel/` 膨胀。做法是先造一个 1500 张的合成数据集，把每个热路径单独计时，再对着数字找根因。**测试 364 → 373**（新增 `tests/test_resource_robustness.py` 9 条；跳过项仍是缺 ffmpeg 的那条）。
+
+- **① 启动对账是 O(N²)（`autolabel/batches.py`）**：`_reconcile_lib()` 判断"这张图是不是对面库已经认领了"时，在**逐张遍历的循环里**调 `load_index_or_none(root, _other(lib))`——每扫到一张图就把对面库整个 `index.json` 读一遍、解析一遍。cProfile 实测 1500 张的数据集启动对账要把索引解析 **1507 次**、耗时 1.03 秒；按这条曲线两万张要几分钟，用户看到的就是"点了启动，终端一直不动"。改成每轮对账把对面库的索引读一次提到循环外，解析次数降到 **4 次**、同一数据集耗时 **0.04 秒**。「两边都没记才算孤儿」「某库在标注时另一个库不抢孤儿素材」两条语义不变，并有专门一条测试盯着。
+- **② `/api/dataset` 把同一份清单序列化两遍（`autolabel/review.py`）**：返回值里 `items` 和 `pose_items` 指向**同一个 Python 列表**，`json.dumps` 老老实实各写一遍；提示词库的行还同时给 `prompt_status` 与 `status`、`prompt_flags` 与 `flags` 等同义键。实测 1500 张（只有姿态库）响应体 **725 KB**，其中 **305 KB 纯属第二份拷贝**；两库各 1500 张时约 1.17 MB。界面两处读姿态清单写的都是 `ds.pose_items || ds.items`、提示词页只读 `prompt_*`，于是删掉 `pose_items` 与那五个同义键，前端一行不用改：**725 KB → 420 KB**、两库 1503 张时 **1166 KB → 751 KB**。这是每次进页面 / 每次接受后刷新列表都要走的接口，省的是实打实的等待。
+- **③ `.autolabel/deleted/` 只增不减（`autolabel/batches.py`）**：每次删除动作都落一份快照，界面上逐张删两万张就攒两万个文件，而启动对账其实只回头看最近 20 份。改成只保留最近 **200 份**，留 25 份余量再一次清一批（不是每次删除都去扫目录）。刚写的快照一定在最近一窗里，误删找回不受影响；更早的删除要靠自己的备份，已写进常见问题。
+- **④ 上传临时文件没人认领（`autolabel/upload.py` + `serve()`）**：上传的原始文件先落 `.autolabel/uploads/`，**任务成功后**才删。上传到一半 Ctrl+C / 崩溃 / 重启电脑，这批原文件就永远留在数据集里，一次视频上传就是几百 MB，界面上还完全看不见它。新增 `prune_stale_uploads()`，复核服务启动时清掉超过 24 小时没被碰过的残留并打印释放了多少 MB；只看 mtime、且留 24 小时余量，另一个还在跑的服务刚收下的文件不会被动。
+- **⑤ 访问日志把终端刷满（`autolabel/review.py`）**：`log_message()` 只静音了 `/api/`，`/image/`、`/thumb/` 照打——焦点队列一屏就要拉几十张缩略图，翻一屏队列终端全是 `GET /thumb/...`，真正要看的启动告警和报错被冲走。静音前缀扩到 `("/api/", "/image/", "/thumb/")`，页面访问照常留痕（否则出问题时没线索）。
+- **这一轮查过但干净的**：210 个请求（概览 + 100 张缩略图 + 100 张原图）打完，进程句柄数 **6 → 6**，没有泄漏；`video.py` / `coords.py` / `prompt.py` 的临时目录一律 `try/finally` + `rmtree`，`ffprobe` / `ffmpeg` 的 `subprocess.run` 都带 `timeout`，超时报的是人话还顺带告诉用户 `AUTOLABEL_FFMPEG_TIMEOUT` 怎么调；撤销历史每图封顶 10 份、批次表 300 条、批次里的文件名 30 个、`manifest.skipped` 2000 条，都有上限；`_kept_file_tombstones()` 只读最近 20 份快照，不会因为快照多而变慢；HTTP 层四类异常收口齐全（缺文件 404 / 未知对象 404 / 参数不对 400 / 其余 500），上传超限先把请求体读干净再回 413；缩略图是 320px 缓存并带 30 天清理。
+- **已知边界**：`/api/dataset` 仍然一次给整本清单，两万张的库省掉重复之后仍有几百 KB，真正的解法是分页 / 虚拟列表（属 UI 重构方案里的 P2），这轮只把白胖的那一半省掉；删一张图、接受一张图都是整本 `index.json` 重写（单文件 JSON 的固有代价，实测约 6 ms/张），要变记得先决定"要不要拆成按张存储"；删除快照只留最近 200 份；上传残留按 mtime 判旧，同时开两个复核服务指向同一个数据集、且某个任务在队列里排了 24 小时以上，它的临时文件会被当成残留清掉（本地单用户工具，先接受）；缩略图清理只在启动时跑，服务连开几周不会中途清。
+- **防回归测试**：`tests/test_resource_robustness.py`（新建 9 条）——造一个"图已落盘、索引里没有"的数据集，用猴子补丁数 `load_index_or_none` 的调用次数，超过 8 次就判定退化成按张重读（旧实现是 40 次起）；对账耗时上限；提示词库已认领的 10 张必须不被姿态库抢走、另外 30 张真空闲孤儿必须补回；`/api/dataset` 不许再有 `pose_items` 且 `items` 六个键齐全；提示词行不许再带 `status`/`objects`/`score`/`flags`/`priority`；界面里每个读 `pose_items` 的位置必须留 `|| ds.items` 兜底（防的就是后端删键、前端白屏）；预置 260 份快照后删一张图，目录必须正好剩 200 份且刚写的快照还在、最老的已清、最近一窗没被误删；起真实服务后 `/thumb/`、`/image/`、`/api/` 不得出现在终端而 `/pose` 必须在；`uploads/` 里三天前的文件被清、刚收下的必须留、启动流程确实接了这一步。
+
+校验：`373 passed, 1 skipped`（跳过项缺 ffmpeg，约 45 秒）、`ruff check --select E4,E7,E9,F` 全绿、五个 JS 文件 `node --check` 全绿；起真实服务实测 `/`、`/pose`、`/objects`、`/models`、`/api/dataset`、`/thumb/`、`/image/` 全部 200，`/api/dataset` 的 `items` 正常、终端只剩页面与启动行。性能对照：1500 张数据集启动对账 **1.03s → 0.04s**（索引解析 1507 → 4 次）、概览响应体 **725 KB → 420 KB**。
+
+
+## 2026-10-18 17:20 — 合理性检查：导出目录不再吃掉同名素材，flip_idx 不再越界，软链能搬家
+
+第四轮看的是**数据格式与导出的正确性**：导出目录里的文件名、`data.yaml` 的关键点配对、软链能不能搬家、COCO JSON 是否自洽。都用小数据集实测复现过。**测试 348 → 364**（新增 `tests/test_export_names.py` 16 条；跳过项仍是缺 ffmpeg 的那条）。
+
+- **① 带子目录的素材在导出目录里互相盖掉（`autolabel/export.py`）**：导出目录是平的两层（`images/train/`、`images/val/`），旧代码取 `os.path.basename` 当输出名，`images/a/frame_0001.jpg` 与 `images/b/frame_0001.jpg` 都写成 `frame_0001.jpg`，而 `_place()` 落盘前会先 `os.remove(dst)`——后放的把前面的连图片带标签一起盖掉。实测 4 张图导完磁盘上只剩 2 个文件，`manifest.json` 的 `counts` 与 COCO 的 `images` 却都记 4 张：训练照跑、loss 照降，只有样本数悄悄少一截，等发现时模型已经练完了。新增 `export_stem(rel)` 把子目录压进输出名（`a/frame_0001.jpg` → `a__frame_0001.jpg`），姿态导出、提示词导出（`prompt.export_detection_dataset`）、坐标文件的 `stem`/`split` 三处共用同一套规则——只改导出不改坐标文件的话，`export --coords` 带过来的 `split` 列会整列对不上。素材平铺（绝大多数真实数据集）算出来和以前一字不差，不给老用户换一批文件名。
+- **② `data.yaml` 的 `flip_idx` 越界（同上）**：以前是 `COCO17_FLIP_IDX[:num_kpt]` 直接切片。14 点模型（COCO 去掉双眼的常见裁剪）会拿到 `[..., 14]`——14 点数据集里没有第 14 号点，翻转增强时关键点直接指错位置；点数多于 17 时又短一截。改成 `flip_idx_for(num_kpt)`：配对落在范围外的点自己映自己，多于 17 的部分补齐，结果永远是当前点数的一个合法排列（`sorted(idx) == range(n)` 且左右配对对称），17 点仍旧逐位等于 COCO 标准表。
+- **③ 软链一搬家就整批断（同上 `_place()`）**：`--mode symlink`（默认）以前写绝对路径，数据集或导出目录一改名、换挂载点、拷去另一台机器就整批断链，只能重导一次。改成相对路径（`../../../images/a/frame_0001.jpg`），实测把整个数据集目录改名之后仍然读得出图片头两字节。取舍见「已知边界」：相对链接记的是层级差，导出目录**单独**挪到不同深度仍会断。
+- **④ COCO 关键点没补齐会整体错位（同上 `write_coco_keypoints()`）**：标签点数少于 `kpt_shape` 声明（人工删过点、老版本写的标签）时，以前只写实际给的那几组 `(x, y, v)`，从缺失点开始后面每一组都往左挪一位，`num_keypoints` 与坐标一起错，而 JSON 看起来完全合法。现在补零到 `num_kpt × 3`，缺的点变成 `v=0`（不参与 YOLO 监督），语义与标签文件一致。
+- **这一轮查过但干净的**：COCO JSON 的自洽性实测无问题——每条 annotation 的 `image_id` 都在 `images` 里、`bbox` 是 xywh 且没越出图片边界、`category_id` 从 1 起、`num_keypoints` 与实际 `v≠0` 的组数相等、`keypoints` 长度恒为 3 的倍数；检测集导出的标签每行恒为 5 列、类别号重映射后连续且与 `data.yaml` 的 `names` 一一对应、`counts.boxes` 与磁盘上的行数相等、归一化值都在 0~1；空标签按 YOLO 背景图约定写空文件；`--mode hardlink` 失败自动退回 `copy`；`--mode` 给了未知值直接报错而不是静默产出半个目录。
+- **已知边界**：相对软链只保证「导出目录跟着数据集一起搬家」，把某一份导出单独拷到别的层级（如 `~/datasets/x`）仍要重导——真要跨机器搬走，正确姿势一直是 `--mode copy`；自定义关键点的 `flip_idx` 仍按 COCO 的左右配对推（索引里没保存模型自带的 flip_idx），非左右对称的自定义骨架还得手工改 `data.yaml`；`a/x.jpg` 与 `x.jpg` 同时存在时导出名不同（`a__x.jpg` / `x.jpg`）但内容可能相同，那是两条素材记录，不算命名冲突。
+- **防回归测试**：`tests/test_export_names.py`（新建 16 条）——两个子目录各放同名素材后，导出目录必须凑齐 4 个文件且图片/标签同名、`manifest.split` 四条名字唯一、每个软链都指向读得通的真实图片；COCO 的 `file_name` 集合必须与磁盘文件集合相等；平铺数据集的导出名必须还是 `img0.jpg`/`img1.jpg`（防的是「修 bug 顺手改了所有人的文件名」）；默认导出的软链必须非绝对路径，且数据集改名后仍能读出 JPEG 头；`flip_idx_for()` 在 17/14/9/5/2/1/24/0 上必须是合法排列且配对对称，17 点逐位等于 `COCO17_FLIP_IDX`；把 `kpt_shape` 改成 14 后 `data.yaml` 解析出的 `flip_idx` 长度必须是 14、最大值 < 14；一张 14 点标签混在 17 点库里时每条 annotation 的 `keypoints` 必须都是 51；`export --coords` 的 `split` 列必须与导出目录里的真实文件名对得上；提示词库带子目录时同样不得撞名。
+
+校验：`364 passed, 1 skipped`（跳过项缺 ffmpeg，约 44 秒）、`ruff check --select E4,E7,E9,F` 全绿；COCO / 检测集格式自洽性单独跑脚本实测无问题；`models/bus.jpg` + `models/yolo11n-pose.pt` 的端到端集成测试仍真实通过（说明导出改动没破坏上一轮的翻转融合结果）。
+
+
+## 2026-10-18 16:40 — 合理性检查：快捷键不再和浏览器抢键，翻页读不到图会说人话
+
+第三轮看的是**复核界面的交互合理性**：快捷键归谁、翻页时读到失败怎么办、并发操作留没留痕迹。都在本地起服务实测过。**测试 342 → 348**（新增 `tests/test_review_keys.py` 6 条；跳过项仍是缺 ffmpeg 的那条）。
+
+- **① `⌘`/`Ctrl` 组合键被页面快捷键抢走（`static/app.js` / `static/objects.js`）**：两个标注页的 `onKeyDown()` 只看 `e.key`，不看修饰键，`INPUT` 的守卫之后直接进 `switch (e.key)`。实测在标注页按 `⌘A`（全选）会翻上一张、`⌘D`（收藏）翻下一张、`⌘F`（页内查找）跳去下一张带标记、`⌘J`（Chrome 下载页）跳待办下一条、`⌘B`（书签栏）弹出批次管理、`⌘M` 直接 `location.href = "/models"` 跳页、`⌘1/2/3`（切标签页）顺手把关键点可见性改成 1/2/3——浏览器该做的动作 and 页面动作**两边一起执行**，用户找书签栏却看见画面换了人。改法：在类型守卫之后、`switch` 之前加修饰键守卫，`⌘` / `Ctrl` 组合只保留两个（`⌘K` 命令面板由 `shellKeys()` 先接走、`⌘Z` 撤销新接），其余原样 `return` 交回浏览器。`⌥` 那几个外观键不受影响（本来就在 `shellKeys()` 里且带 `isTyping()` 判断）。
+- **② `⌘Z` 不是撤销（同上）**：`z` 是「适应窗口」，撤销只有 `U`。按通用直觉按 `⌘Z` 的人会得到视图被重置、撤销没发生——两页都改成 `⌘Z` = 撤销（姿态页 `undo()`、提示词页 `undoItem()`），裸 `Z` 保持适应窗口。速查表两行、`README.md` 与 `04-复核界面指南.md` 的快捷键清单一并补上「`U` 或 `⌘Z`」。
+- **③ 读不到标注时白屏不报错（`static/app.js` 的 `selectIndex()`）**：`const res = await fetch("/api/item?...")` 之后直接 `state.item = await res.json()`，**没看状态码**。这张图在另一个标签页被删（或刚按批次删掉）时，接口回的是 404 + `{"error": "未知对象: ..."}`，前端把这个对象当标注数据用，下一行 `state.item.objects.length` 抛 `TypeError`，Promise 无人认领：画布空白、右侧面板空白、只有控制台里一行英文，用户只能刷新碰运气。改成走 `common.js` 里已有的 `getJson()`（非 2xx 抛错），失败时清空当前张、把接口那句中文原样写在画面下方（`读不到这张图的标注：…`）并弹横幅，队列与进度照常刷新，按 `→` 就能继续。`boot()` 里同样裸奔的 `/api/dataset` 也补了兜底（拉不到就写「数据集读不出来：…」，不再白着一页）。
+- **④ 连续翻页时旧请求后到会覆盖新页（同上）**：`selectIndex()` 是 async，键盘连按 / 长按方向键时多个请求同时在飞，`state.idx` 已经翻到第 N+3 张，早先发出的那张图却可能最后才回来，把 `state.item` 换回旧的一张——界面显示的是 A 的骨架、高亮和 HUD 写着 D，此时点接受，队列里被打勾的是另一行。加 `loadSeq` 请求序号，`fetch` 前后与图片加载回来后各校验一次，过期的结果直接丢弃。
+- **⑤ 接口错误文案里的 Python 味（`autolabel/review.py`）**：`read_item()` 抛 `KeyError(image_rel)`，处理器写的是 `f"未知对象: {exc}"`，`KeyError` 的字符串表示自带引号，界面上一显示就是 `未知对象: 'images/a.jpg'`，看着像程序炸了。取 `exc.args[0]`，`GET` / `POST` 两条路径一起改。
+- **这一轮查过但干净的**：`beforeunload` 两个标注页都挂了（`state.dirty` 时拦关页，站内跳页同样会拦）；`setStatus()` 与 `selectIndex()` 都会先 `await save()` 再动，自动保存 600ms 防抖期间翻页不会把改动落到下一张（`save()` 第一件事就是按引用取好 `state.item`）；`shellKeys()` 里 `⌘K`、速查表、`⋯` 菜单、命令面板的优先级顺序正确，弹层开着时页面快捷键不会被误触发；`portal.js` 的 `r`（刷新）与模型页快捷键都有 `isTyping()` 守卫；提示词页 `selectIndex()` 本来就走 `getJson()` 并提示「读取标注失败」，这次是把姿态页拉到同一水位；接口侧 `ValueError → 400`、`FileNotFoundError → 404`、超限 `413` 的收口上一轮已就位。
+- **已知边界**：两个标签页同时编辑**同一张图**仍是后写的赢（接口没有版本号，服务端只有写入锁，不会写坏文件但不会提醒「这张被别人改过」）——本地单用户工具按投入产出先不动，真要做得给 `/api/item` 加基线版本。`⌘W`（关标签页）由浏览器直接处理，页面无从拦截，靠的仍是 `beforeunload` 那句确认。快速连翻时若前一张还有未保存改动，`await save()` 会串行等它写完，翻页手感会跟着慢一拍，这是保数据而不是 bug。
+- **防回归测试**：`tests/test_review_keys.py`（新建 6 条）——两页的修饰键守卫必须存在、必须在 `switch (e.key)` 之前、且守卫到 `switch` 之间有 `return`；`⌘Z` 分支必须调到各页自己的撤销函数；姿态页读标注必须走 `getJson` 且不许再出现 `state.item = await res.json()`，失败路径要写「读不到这张图的标注」并弹提示；`loadSeq` 的过期检查至少出现两处（`fetch` 之后与图片加载之后各挡一次）；`boot()` 必须有「数据集读不出来」兜底；起真实服务 `GET /api/item?image=ghost.jpg` 断言 404 且 `error == "未知对象: ghost.jpg"`（不带引号）。
+
+校验：`348 passed, 1 skipped`（跳过项缺 ffmpeg，约 44 秒）、`ruff check --select E4,E7,E9,F` 全绿；五个 JS 文件 `node --check` 全部通过。
+
+
+## 2026-10-18 15:40 — 合理性检查：重标不再吃掉人工成果，QC 的几何判断回到像素空间
+
+第二轮的对象是**标注流水线与 QC**：断点续跑到底续没续上、重标覆盖了谁、QC 标记在说什么。四条都在实测里复现过（前两条共用一个根因，一起修）。**测试 334 → 342**（新增 `tests/test_label_pipeline.py` 8 条；跳过项仍是缺 ffmpeg 的那条）。
+
+- **① 换参数重标会静默冲掉人工骨骼（`autolabel/pipeline.py`）**：`label_dataset()` 里有一句 `only_missing = only_missing and previous.get("signature") == signature`——只要索引头的参数指纹和本次不一致，就把「断点续跑」整个关掉，**全部图片进重标队列**，包括人工点过接受的那些。`write_label_file()` 无条件覆盖标签文件，而 `fields["status"]` 又把 `approved` 原样保留：结果是人手改好的骨架被模型输出替换、状态却还是「已接受」，这张图**不会再出现在复核队列里**，用户完全看不见自己丢了什么，只能去 `.autolabel/history/` 翻快照。代码里 `stats["skipped_reviewed"]` 和「人工已复核的保留」那句注释说明本意就是要保，只是没落到标签文件上；`README.md` 与 `02-命令行参考.md` 也都早就写着「已 approved 的图不会被覆盖」——文档和实现第一次对上。改法：新增 `HUMAN_STATUSES = (approved, edited)` 与 `_human_reviewed()`，`only_missing` 时状态是这两种**且标签文件确实存在**的图直接跳过（`edited` 也算，手改还没点接受同样是人工成果）；`--force` 是用户明确说「连人工的一起重标」，才照常覆盖并退回未复核。新统计 `skipped_human` 一路带到 `label` 的收尾输出（`人工已复核 N 张未覆盖（连它们一起重标加 --force）`），全被跳过时也把这句话说清楚，不再只回一句「全部已完成」。`--force` 的 help 一并改成描述真实规则。
+- **② 参数变更后中断，重跑会把整批从头再来（同一处）**：`_already_labeled()` 本来就是**逐张**比 `label_signature` 的，上面那句整批关掉续跑属于多余叠加。跑 5000 张时中途改了 `--imgsz` 又中断（强杀 / OOM / 关终端都会跳过收尾的 `finish()`，索引头仍是旧指纹），重跑会把中断前已经按新参数标好的几千张再标一遍。删掉那句覆盖，跳过与否完全交给逐张判定：一致的跳过、不一致的重标，与索引头是否写回无关。提示语也跟着收敛成「N 张需要重标（人工已复核的不计入）」。
+- **③ `odd_aspect` 在归一化空间算长宽比（`autolabel/yolo_pose.py`）**：`ar = person.h / person.w` 用的是归一化宽高，等于把**图片自己的宽高比**乘了进去（`ar_norm = ar_px × 图宽/图高`）。实测同一副骨架：放进 16:9 横屏（1920×1080）像素比例 4.5 的正常人被拉成 8.0 → **误报**长宽比异常；放进竖屏手机视频（1080×1920）像素比例 9 的断链只剩 5.1 → **漏报**。这个软件的素材大量来自手机视频，等于在最常见方向上把这条标记废掉了。改成按像素算 `px_h / px_w`（阈值 0.25~6.0 不变，本来就是按像素定的），横屏竖屏同一个结论。这条标记同时被 `coords.py` 的逐框标记复用，导出的 CSV 一起受益。
+- **④ 先扩框、后判可见性，bbox 与标签自相矛盾（`autolabel/backends.py`）**：`PoseBackend.infer()` 原先是 `_predict → fuse_flips → finalize_box → assign_visibility`，而 `_predict` 里的 `v` 还是占位的「全可见」（真实 `v` 由 `assign_visibility` 按 `--visible-conf` / `--occluded-conf` 现算）。`expand_bbox_with_keypoints()` 只圈 `v != 0` 的点，在这个顺序下它看到的是「全部可见」，于是把 conf 低到即将被判 `v=0` 的杂点也圈进包围盒：框被撑大，且和落盘标签里的 `v` 打架（标签说这个点不参与监督，框却为它扩了边）。`box_mode="keypoints"` 同理。改成**先定可见性、再定框**（`_predict` 出来的每一路过 `assign_visibility`，再融合、再定框；`assign_visibility` 是幂等的，融合取 `max(v)` 也仍然一致）。
+- **⑤ 多模型融合后只留一路的框（`autolabel/yolo_pose.py`）**：`merge_person_flips()` 关键点按 conf 加权平均，框却整份沿用 `primary` 的——骨架往两个模型的中间挪了，框没挪，于是自己造出 `keypoints_outside_box`，再让人工去修软件自己造成的不匹配。改成框按两路 `score` 加权一起融合。翻转路径上后面还跟着 `finalize_box` 兜底，这次主要是补多模型共识那条路（融合之后没有再定框）。bus.jpg 上真跑一轮：`flip_tta=True` 时三个人的可见关键点全在框内，QC 标记从 `limb_length_mismatch` 变成空。
+- **这一轮查过但干净的**：`tiny_box` / `limb_length_mismatch` / `keypoints_outside_box` / `edge_clipped` 本来就是像素口径；`few_keypoints` 读的是落盘标签的真实 `v`，不受 ④ 影响；`review_priority` 对未知标记给 1.0 权重、正向标记 `multi_model_confirmed` 不计入「待复核」，语义自洽；`_visible_ratio` 把 `v=1` 记为可见与「v=1 同样参与监督」的文档口径一致；标注期间复核界面写索引靠 `updates` 合并而不是整体覆盖，不会互相抹（上一轮已修）；`qc --render` 在未命中任何标记时退回按文件名渲染而不是空跑；提示词库那条路径早就有人工保护（跳过 approved 与手动画框，`--overwrite` 才覆盖并退回 `edited`），这次是把骨骼库拉到同一水位。
+- **已知边界**：人工保护看的是**状态**，状态由人在界面里点出来；如果有人绕过界面手改标签文件（状态仍是 `unreviewed`），重标照样会覆盖它，这类改动请配合 `.autolabel/history/` 快照。`_human_reviewed` 不区分「谁改的」，将来若要区分人工与 VLM 自动接受需要另加字段。`qc` 的统计与优先清单目前只覆盖骨骼库，提示词库的标记在 `prompt --status` 与提示词复核页各看各的。
+- **防回归测试**：`tests/test_label_pipeline.py`（新建 8 条，用假后端，不依赖权重）——人工接受 + 手改的标签文件与状态在 `imgsz` 变更后都保持原样、只有未碰过的另一张被重标；`--force` 仍按字面意思连人工一起重标；只到 `edited` 的同样受保护；索引头指纹被人为改回旧值（模拟中断）时已标好的仍跳过、`total == 0`；全是人工图时输出那句解释；`odd_aspect` 在 16:9 横屏不误报、在竖屏不漏报且同样像素比例结论一致；conf=0.02 的杂点判 `v=0` 后不再把框撑到 0.95 处；两模型融合后框中心落在两路中间、不再触发 `odd_aspect`。
+
+校验：`342 passed, 1 skipped`（跳过项缺 ffmpeg，约 43 秒）、`ruff check --select E4,E7,E9,F` 全绿；`models/bus.jpg` 真实权重端到端复跑（`flip_tta` 开与关）通过，关键点全部落在框内。
+
+
+## 2026-10-18 14:20 — 合理性检查：错参数当场拦、路径打错不再「导入成功」，报错不再甩 Python 栈
+
+这是「合理性检查」五轮里的第一轮，对象是**命令行这一层**：参数填得合不合理、错了以什么姿态告诉你。五处都实测复现过再动手。**测试 317 → 334**（新增 `tests/test_cli_validation.py` 17 条：取值范围 8 + 合法写法不被误挡 2 + 导入源校验 4 + 错误收口 2 + 坐标格式 1；跳过项仍是缺 ffmpeg 的那条）。
+
+- **① 数值参数没有取值范围（`autolabel/cli.py`）**：`--val-ratio 1.5`、`--conf 5`、`--imgsz 0`、`--jpeg-quality 101`、`--port 70000` 全部**静默接受**——`argparse` 只写了 `type=float`，只管「能不能转成数字」，不管「这个数讲不讲理」。最难发现的是阈值类：`--conf 5` 会一路跑完 8000 张、一个框都不产出（阈值高到永远达不到），用户等到最后才看见空报告，一小时显卡白烧。新增八个语义化校验器 `_positive_int` / `_non_negative_int` / `_positive_float` / `_non_negative_float` / `_fraction`（0~1 不含两端）/ `_unit_interval`（0~1 含端点）/ `_quality`（1~100）/ `_port`（1~65535），按语义挂到约 30 处 `add_argument(type=...)`，越界直接 argparse 中文报错、退出码 2。两类边界特意留着：`--limit 0` / `--render 0` 的 0 是「不限制」的实义、`--start 0` 是最常见写法，所以它们走 `_non_negative_*` 而不是 `_positive_*`；`--max-empty-ratio` 允许 0（不要负样本）所以用 `_unit_interval`。另外 `argparse` 的 `type` 不作用于 `default`，内置默认值不经过校验、不会被自己新加的规则挡掉。
+- **② 路径打错却「导入成功」（`cmd_import`）**：`autolabel import <数据集> <打错的路径>` 实测打印「[ok] 扫描 0 · 导入 0」、退出码 0，还在批次表里**留下一个 0 张的空批次**——`batches` 里从此多一行看着像有一批数据、其实什么都没有的东西。新增 `_missing_sources()`（先展开 `~` 与相对路径再判存在）：逐条 `[warn] 路径不存在，跳过: ...`；**全部**不存在直接 `FileNotFoundError` 退出 1，并提示「相对路径请写成绝对路径或先 cd 到上级目录」。同时把**建批次挪到导入之后**：入库为 0 张就只打印「扫描 N 张，没有新图入库（完全重复 X · 近似重复 Y · 失败 Z，已入库的要重标用 `label --force`）」并返回 0，不再产生空批次。部分路径写错仍然继续导能用的那些。
+- **③ `auto` 空跑到底（`cmd_auto`）**：`auto` 是「导入 → 标注 → QC → 坐标」一条链，源不存在 / 一张都没进来时它照跑不误，最后交出一堆空文件，退出码还是 0。改成源全缺当场失败；`imported` 为空则把批次 `finish_batch(..., "failed", ...)` 收尾再抛 `ValueError`——批次状态里留下「没有可导入的图片」的说明，而不是一个永远 `running` 的半成品。
+- **④ 报错甩 Python 栈（`main()`）**：`status` / `qc` / `coords` / `export` 指到一个不存在的数据集，以及 `batches --delete b_ghost`，实测都是八行 Traceback，真正有用的「数据集没初始化」埋在最后一行英文里。`main()` 兜住 `FileNotFoundError` / `NotADirectoryError` / `ValueError` / `KeyError` → 一行 `[error] 中文说明` 进 stderr、退出码 1；这类错误的特点是**用户自己就能改对**，栈只是噪音。想排查栈本身（怀疑是软件的锅）用 `AUTOLABEL_TRACEBACK=1`，原样再抛一次。`KeyboardInterrupt` 仍回 130 不变。
+- **⑤ `coords --formats xml` 假装成功（`autolabel/coords.py`）**：命令行给「导出成功」但一个文件都没生成，网页端 `/api/coords?format=xml` 却是规规矩矩的 400——同一个参数两个口径。加 `KNOWN_FORMATS` 并在 `write_coordinate_files()` 校验，未知格式抛 `ValueError("未知坐标格式: xml（可选 csv、long、jsonl）")`，空选择也顺手挡掉（`--formats ""` 以前同样静默产出 0 个文件）。
+- **这一轮查过但干净的**：`--seed` 为负仍然合法（`random.Random` 接受任意整数，切分哈希也一样有效），不强加非负限制；`--device` 传错值由 torch 报错、错误文案本身够直白；`--model` 权重缺失走的是下载逻辑而不是静默降级；子命令的 `--lib` 一律 `choices=[all,pose,objects]`，没有漏网的自由字符串；`pool --limit` / `label --limit` / `prompt --limit` 三个同名参数的默认值（30 / 0 / 0）与各自 help 对得上。
+- **已知边界**：校验只看类型和范围，不看语义组合——`--start 300 --duration 5` 落在一个 10 秒的视频上仍然抽不到帧（这属于素材与参数的关系，只有 ffprobe 之后才知道），现在的表现是「导入 0 张 → 批次 failed」而不是静默；`--formats csv,,jsonl` 里的空段会被 `strip()` 后丢掉，不报错。`_missing_sources()` 只在命令行入口判存在，`import_images()` 被网页上传路径直接调用时不经过它（那条路径的源是刚落盘的临时文件，本来不存在打错的问题）。
+- **防回归测试**：`tests/test_cli_validation.py`（新建 17 条）——8 种越界写法逐个确认退出码 2 且错误行含参数名；`--val-ratio 0.25` / `--seed -3` / `--render 0` / `--limit 0` / `--start 0` 这些合法写法确认没被误挡（`--start` 那条断言的是「报的是文件不存在、不是参数不合法」）；路径打错退出 1 且**批次数量不变**；重复导入退出 0 且提示「没有新图入库」且不新增批次；部分路径错时新图照常入库（`[ok] 扫描 1 · 导入 1`）；`auto` 无图可导时退出 1、末批状态为 `failed`；未知坐标格式报错且带上可选值。`tests/conftest.py` 把导入源目录拆成 `source_dir` 独立 fixture（`dataset` 依赖它），行为不变，方便别的测试复用同一批合成图。
+
+校验：`334 passed, 1 skipped`（跳过项缺 ffmpeg，43 秒）、`ruff check --select E4,E7,E9,F` 全绿。
+
+
 ## 2026-10-18 12:50 — 合理性检查：验证集不再换人、超限上传说人话、抽帧有超时、索引写入不再互相抹
 
 按「这软件自己讲不讲理」把读写路径过了一遍，修掉四处会真实咬人的问题，另外给队列缩略图开了一条小图通道。**测试 304 → 317**（新增 13 条：切分稳定性 2、上传 3、ffmpeg 超时 4、索引并发 1、缩略图 5；跳过项仍是缺 ffmpeg 的那条）。

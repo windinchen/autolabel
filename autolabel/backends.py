@@ -349,14 +349,14 @@ class PoseBackend:
         import cv2
 
         bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        persons = self._predict(bgr)
+        # 先定可见性、再定框：_predict 里的 v 还是占位的「全可见」，直接拿它扩框会把
+        # conf 低到该判 v=0 的杂点也圈进包围盒——框被撑大，还与落盘标签里的 v 自相矛盾。
+        persons = [assign_visibility(p, self.settings) for p in self._predict(bgr)]
         if self.settings.flip_tta:
-            mirrored = self._predict(cv2.flip(bgr, 1), flipped=True)
+            mirrored = [assign_visibility(p, self.settings)
+                        for p in self._predict(cv2.flip(bgr, 1), flipped=True)]
             persons = fuse_flips(persons, mirrored, image.shape[1], image.shape[0], self.settings)
-        persons = [finalize_box(p, image.shape[1], image.shape[0], self.settings) for p in persons]
-        for p in persons:
-            assign_visibility(p, self.settings)
-        return persons
+        return [finalize_box(p, image.shape[1], image.shape[0], self.settings) for p in persons]
 
 
 class PoseEnsemble:

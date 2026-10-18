@@ -615,6 +615,15 @@ function onKeyDown(e) {
     }
   }
   if (["INPUT", "SELECT", "TEXTAREA"].includes(e.target.tagName)) return;
+  if (e.metaKey || e.ctrlKey) {
+    // ⌘/Ctrl 加字母是浏览器与系统的（全选、收藏、页内查找、下载、书签栏、切标签页…），
+    // 以前这些组合会顺手翻页、改关键点可见性、甚至跳去模型页。只按直觉接住撤销。
+    if ((e.key === "z" || e.key === "Z") && !e.shiftKey && !e.altKey) {
+      e.preventDefault();
+      undoItem();;
+    }
+    return;
+  }
   switch (e.key) {
     case " ": state.spaceDown = true; e.preventDefault(); break;
     case "ArrowRight": case "ArrowDown": case "d": selectIndex(state.idx + 1); break;

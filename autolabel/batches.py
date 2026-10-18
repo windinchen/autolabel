@@ -298,14 +298,11 @@ def _reconcile_lib(root: str, lib: str, tombstones: set,
             if rel in tombstones:
                 continue
             referenced.append(rel)
-    orphans = []
-    for rel in referenced:
-        if idx.get(rel) is not None:
-            continue
-        # 另一个库已经认领了这张图：只有"两边都没记"才算需要恢复的孤儿
-        if (load_index_or_none(root, _other(lib)) or _EmptyIndex()).get(rel) is not None:
-            continue
-        orphans.append(rel)
+    # 对面库的索引读一次就够：以前每扫到一张图就重新解析一遍它的 index.json，
+    # 1500 张的库光启动对账就要 1 秒、两万张要几分钟（实测是 O(N^2)）。
+    other_idx = load_index_or_none(root, _other(lib)) or _EmptyIndex()
+    orphans = [rel for rel in referenced
+               if idx.get(rel) is None and other_idx.get(rel) is None]
     one["missing"] = [rel for rel in idx.items if not os.path.exists(resolve_image(root, rel))]
     batches = load_batches(root, lib)
     running = [row for row in batches if row.get("status") == STATUS_RUNNING]
@@ -910,6 +907,10 @@ def _maybe_remove_pool(root: str, lib: str, rel: str) -> int:
     return removed
 
 
+DELETE_SNAPSHOT_KEEP = 200
+DELETE_SNAPSHOT_PRUNE_MARGIN = 25
+
+
 def _write_snapshot(root: str, snapshot: dict) -> str:
     folder = deleted_dir(root)
     os.makedirs(folder, exist_ok=True)
@@ -921,7 +922,31 @@ def _write_snapshot(root: str, snapshot: dict) -> str:
         tail += 1
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(snapshot, fh, ensure_ascii=False, indent=2)
+    _prune_snapshots(folder)
     return path
+
+
+def _prune_snapshots(folder: str) -> int:
+    """删除快照只留最近 ``DELETE_SNAPSHOT_KEEP`` 份，返回清掉的份数。
+
+    快照是删错图之后的补救材料，但在界面上逐张删两万张就会攒出两万个小文件，
+    而启动对账只回头看最近 20 份（见 ``_kept_file_tombstones``）。留出余量再
+    一次清一批，免得每次删除都去动整个目录。
+    """
+    try:
+        names = sorted(name for name in os.listdir(folder) if name.endswith(".json"))
+    except OSError:
+        return 0
+    if len(names) <= DELETE_SNAPSHOT_KEEP + DELETE_SNAPSHOT_PRUNE_MARGIN:
+        return 0
+    removed = 0
+    for name in names[:len(names) - DELETE_SNAPSHOT_KEEP]:
+        try:
+            os.remove(os.path.join(folder, name))
+            removed += 1
+        except OSError:
+            pass
+    return removed
 
 
 def _regenerate(root: str) -> dict:

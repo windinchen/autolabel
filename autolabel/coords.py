@@ -20,6 +20,7 @@ import tempfile
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .dataset import label_path_for, load_index, now_str
+from .export import export_stem
 from .yolo_pose import COCO17_KEYPOINTS, COCO17_SKELETON, parse_label_file, person_sanity_flags
 
 WIDE_FILE = "coords.csv"
@@ -29,6 +30,7 @@ META_FILE = "meta.json"
 SUMMARY_FILE = "summary.json"
 
 DEFAULT_FORMATS = ("csv", "long", "jsonl")
+KNOWN_FORMATS = DEFAULT_FORMATS
 
 # 宽表里关键点列之外的固定列
 BASE_COLUMNS = [
@@ -112,7 +114,8 @@ def collect_records(
             persons = parse_label_file(label, num_kpt)
         width = int(item.get("width", 0) or 0)
         height = int(item.get("height", 0) or 0)
-        stem = os.path.splitext(os.path.basename(rel))[0]
+        # 与导出目录用同一套文件名规则，否则导出时带过来的 split 列会对不上
+        stem = export_stem(rel)
         objects: List[dict] = []
         for pi, person in enumerate(persons):
             x1, y1, x2, y2 = person.xyxy(width, height)
@@ -242,6 +245,12 @@ def write_coordinate_files(
     names = ["".join(c if c.isalnum() or c in "-_" else "_" for c in n) or f"kp{i}"
              for i, n in enumerate(meta["keypoint_names"])]
     want = {f.strip().lower() for f in formats if f.strip()}
+    # 未知格式以前被静默忽略：命令行写 --formats xml 会「导出成功」但一个文件都没有
+    unknown = sorted(want - set(KNOWN_FORMATS))
+    if unknown:
+        raise ValueError(f"未知坐标格式: {'、'.join(unknown)}（可选 {'、'.join(KNOWN_FORMATS)}）")
+    if not want:
+        raise ValueError(f"至少要选一种坐标格式（可选 {'、'.join(KNOWN_FORMATS)}）")
     files: Dict[str, str] = {}
     rows_wide = rows_long = 0
     if "csv" in want:

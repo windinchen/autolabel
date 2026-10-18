@@ -10,6 +10,7 @@ import io
 import os
 import re
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence
@@ -20,6 +21,8 @@ from .batches import attach_items, batch_name, create_batch, display_name, finis
 from .library import LIB_OBJECTS, LIB_POSE
 
 UPLOAD_CHUNK = 1 << 20  # 上传落盘时的分块大小：1 MB
+# 上次进程被打断时留下的上传临时文件，超过这个小时数就在启动时清掉
+STALE_UPLOAD_HOURS = 24
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".flv", ".wmv",
@@ -36,6 +39,36 @@ class UploadTooLarge(ValueError):
 
 class JobCancelled(Exception):
     """任务被用户在界面上「清除」，用于从流水线阶段提前退出。"""
+
+
+def prune_stale_uploads(root: str, max_age_hours: float = STALE_UPLOAD_HOURS) -> dict:
+    """清掉上一次进程遗留的上传临时文件，返回 ``{"files": 份数, "bytes": 字节数}``。
+
+    上传的原始文件先落在 ``.autolabel/uploads/``，任务成功后逐个删除；进程中途被打断
+    （Ctrl+C、崩溃、重启电脑）时没人再管它们，一次视频上传就是几百 MB，而且界面上
+    完全看不见。只动超过 ``max_age_hours`` 没被碰过的文件，另一个还在跑着的复核服务
+    刚收下的文件不受影响。
+    """
+    report = {"files": 0, "bytes": 0}
+    folder = uploads_dir(root)
+    if not os.path.isdir(folder):
+        return report
+    deadline = time.time() - max(0.0, float(max_age_hours)) * 3600.0
+    try:
+        entries = list(os.scandir(folder))
+    except OSError:
+        return report
+    for entry in entries:
+        try:
+            stat = entry.stat()
+            if not entry.is_file(follow_symlinks=False) or stat.st_mtime >= deadline:
+                continue
+            os.remove(entry.path)
+        except OSError:
+            continue
+        report["files"] += 1
+        report["bytes"] += int(stat.st_size)
+    return report
 
 
 def lib_for_kind(kind: str) -> str:

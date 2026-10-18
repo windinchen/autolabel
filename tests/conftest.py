@@ -25,9 +25,8 @@ def isolated_model_paths(tmp_path, monkeypatch):
 
 
 @pytest.fixture()
-def dataset(tmp_path):
-    """两张合成图片构成的最小数据集。"""
-    root = tmp_path / "ds"
+def source_dir(tmp_path):
+    """导入用的源目录：两张合成图 + 一张字节级完全相同的副本（名字排最后）。"""
     source = tmp_path / "src"
     source.mkdir()
     for i, (w, h) in enumerate([(640, 480), (400, 300)]):
@@ -37,8 +36,15 @@ def dataset(tmp_path):
         Image.fromarray(arr).save(source / f"img{i}.jpg")
     # 字节级完全相同的第三张（名字排在最后，保证 img0/img1 先入库），用于验证精确去重
     (source / "zz_dup.jpg").write_bytes((source / "img0.jpg").read_bytes())
+    return str(source)
+
+
+@pytest.fixture()
+def dataset(source_dir, tmp_path):
+    """两张合成图片构成的最小数据集。"""
+    root = tmp_path / "ds"
     init_dataset(str(root), name="pytest")
-    stats = import_images(str(root), [str(source)], dedupe="exact")
+    stats = import_images(str(root), [source_dir], dedupe="exact")
     # 两个库都引用同一批素材：这才是分库之后最常见的真实状态
     adopt_from_pool(str(root), [rel for _src, rel in stats["imported_files"]], lib="objects")
     return str(root)
