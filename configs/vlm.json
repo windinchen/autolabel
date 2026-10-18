@@ -40,17 +40,15 @@
       "key_ref": "vlm:vlm_6b46d0b9",
       "last_test": {
         "ok": true,
-        "message": "连接正常，可见 3 个模型：Qwen3.8-Flash-Next-Uncensored-oQ6e-mtp、GLM-5.3-Flash-UNCENSORED-oQ4e-mtp、Qwen3-VL-8B-Instruct-bf16",
-        "latency_ms": 19,
+        "message": "连接正常，可见 1 个模型：Qwen3.8-Flash-Next-Uncensored-oQ6e-mtp",
+        "latency_ms": 49,
         "models": [
-          "Qwen3.8-Flash-Next-Uncensored-oQ6e-mtp",
-          "GLM-5.3-Flash-UNCENSORED-oQ4e-mtp",
-          "Qwen3-VL-8B-Instruct-bf16"
+          "Qwen3.8-Flash-Next-Uncensored-oQ6e-mtp"
         ],
-        "checked_at": "2026-10-17 19:01:15"
+        "checked_at": "2026-10-18 18:23:38"
       }
     }
   ],
   "default": "vlm_6b46d0b9",
-  "updated_at": "2026-10-17 19:01:15"
+  "updated_at": "2026-10-18 18:23:38"
 }

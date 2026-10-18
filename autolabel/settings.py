@@ -33,6 +33,11 @@ DEVICE_LABELS = {item["value"]: item["label"] for item in DEVICE_CHOICES}
 
 DEFAULTS = {"device": "auto", "half": False}
 
+#: 启动参数 / 环境变量覆盖：想"一个实例跑一块卡"就在起服务时带上 ``review --device cuda``，
+#: 它只影响这一个进程，不改家目录里那份设置，两个实例各用各的卡互不干扰。
+ENV_DEVICE = "AUTOLABEL_DEVICE"
+ENV_HALF = "AUTOLABEL_HALF"
+
 #: 同一次服务里只探测一次：import torch 不算便宜，每次开菜单都探测会白等。
 _probe_cache: Optional[dict] = None
 
@@ -54,23 +59,44 @@ def normalize(raw: Optional[dict]) -> dict:
     return {"device": device, "half": half}
 
 
-def load() -> dict:
-    """读设置；文件不存在或写坏了都回默认值，不抛错。"""
+def env_override() -> dict:
+    """本进程的环境变量覆盖（``AUTOLABEL_DEVICE`` / ``AUTOLABEL_HALF``），没设就是空。"""
+    out: Dict[str, object] = {}
+    raw_device = os.environ.get(ENV_DEVICE, "").strip()
+    if raw_device:
+        out["device"] = normalize({"device": raw_device})["device"]
+    raw_half = os.environ.get(ENV_HALF, "").strip()
+    if raw_half in ("0", "1", "true", "false", "yes", "no"):
+        out["half"] = raw_half.lower() in ("1", "true", "yes")
+    return out
+
+
+def load(*, ignore_env: bool = False) -> dict:
+    """读设置；文件不存在或写坏了都回默认值，不抛错。
+
+    默认把环境变量（启动参数）叠上去，那是本进程真正该用的值；``ignore_env=True``
+    只拿文件里那份——存盘时必须用它，否则一次保存就把用户真正的选择
+    换成了启动参数里的临时值。
+    """
     merged = dict(DEFAULTS)
     try:
         with open(path(), "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, json.JSONDecodeError):
-        return merged
-    if isinstance(data, dict):
-        merged["device"] = data.get("device", merged["device"])
-        merged["half"] = data.get("half", merged["half"])
-    return normalize(merged)
+        merged = normalize(merged)
+    else:
+        if isinstance(data, dict):
+            merged["device"] = data.get("device", merged["device"])
+            merged["half"] = data.get("half", merged["half"])
+        merged = normalize(merged)
+    if not ignore_env:
+        merged.update(env_override())
+    return merged
 
 
 def save(patch: Optional[dict] = None) -> dict:
     """改几项存回去（只认 device / half），返回存好之后的完整设置。"""
-    next_settings = normalize({**load(), **(patch or {})})
+    next_settings = normalize({**load(ignore_env=True), **(patch or {})})
     wanted = {k: v for k, v in (patch or {}).items() if v is not None}
     if "device" in wanted:
         asked = str(wanted["device"]).strip().lower()
@@ -220,14 +246,18 @@ def label_defaults() -> dict:
 
 def payload(probe: bool = False) -> dict:
     """给界面「系统设置」和 ``autolabel settings`` 共用的一份数据。"""
-    saved = load()
+    saved = load(ignore_env=True)      # 面板里选中的是文件里那份
+    running = load()                   # 本实例真正会用的那份（可能来自启动参数）
     devices = detect() if probe else {}
-    effective, note = (resolve(saved["device"]) if probe else (saved["device"], ""))
+    effective, note = (resolve(running["device"]) if probe else (running["device"], ""))
+    override = env_override()
     return {
         "saved": saved,
+        "env": {k: DEVICE_LABELS.get(v, v) if k == "device" else v for k, v in override.items()},
         "devices": devices,
         "choices": [dict(item) for item in DEVICE_CHOICES],
-        "effective": {"device": effective, "half": saved["half"], "note": note},
+        "effective": {"device": effective, "half": running["half"], "note": note,
+                      "from_env": bool(override)},
         "path": path(),
     }
 
@@ -252,9 +282,15 @@ def describe(raw: Optional[dict] = None) -> str:
         lines.append(f"  · 识别到 {'、'.join(names)}")
     if data["effective"]["note"]:
         lines.append(f"[降级] {data['effective']['note']}")
+    if data["env"]:
+        got = "、".join(
+            (DEVICE_LABELS.get(v, v) if k == "device" else ("开" if v else "关"))
+            for k, v in sorted(data["env"].items()))
+        lines.append(f"  · 本进程被启动参数覆盖为 {got}（只影响这一个实例，不改上面的文件值）")
     lines.append("命令行 --device / --config 写明的值优先于这里")
     return "\n".join(lines)
 
 
-__all__ = ["DEFAULTS", "DEVICE_CHOICES", "DEVICE_LABELS", "DEVICE_VALUES", "describe",
-           "detect", "label_defaults", "load", "normalize", "path", "payload", "resolve", "save"]
+__all__ = ["DEFAULTS", "DEVICE_CHOICES", "DEVICE_LABELS", "DEVICE_VALUES", "ENV_DEVICE",
+           "ENV_HALF", "describe", "detect", "env_override", "label_defaults", "load",
+           "normalize", "path", "payload", "resolve", "save"]

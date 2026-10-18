@@ -1,5 +1,19 @@
 # 变更记录
 
+## 2026-10-18 19:10 — 工作台改走本地 HTTPS，多卡可以一块卡开一个实例
+
+从「双击打开网页却提示不安全 / 录不了摄像头 / 想用上第二块显卡只能改全局设置」这三件事出发。版本 `1.2.2 → 1.2.3`（按约定 +0.01）。
+
+- **① 新增 `autolabel/ca.py` + `autolabel ca` 命令**：本地 HTTPS 证书一条命令搞定——签一张十年根证书 + 一张两年服务器证书（备用名称带 `localhost` / `autolabel.local` / `127.0.0.1` / `::1`），再把根证书写进**当前用户**的信任域。不带 `-d` 就不要管理员密码，也不再弹「Chrome 想修改受限制的系统根证书」那种授权框。`--status` 报证书位置 / 覆盖地址 / 剩余天数 / 系统认不认（拿 `security verify-cert` 真验一次，不看列表猜），`--force` 重签，`--uninstall` 卸载。
+- **② 修了 macOS 自带 LibreSSL 挖的坑**：它的 `x509` 只认 `-extfile` 不认 `-config`，签出来的证书没有 SAN，浏览器直接判「地址不合法」；`req` 读配置文件里的中文 CN 还会二次编码，钥匙串里显示成一串乱码、按名字删都删不掉。现在根证书名改成 ASCII（`AutoLabel Local Dev Root CA`），签名改用 `-extfile`，并且**签完立刻 `openssl verify` 验链**，链不过直接报错，不会丢一张坏证书给浏览器。卸载改成**按指纹删**——按中文名 `security delete-certificate -c` 匹配不到。
+- **③ `review` 默认走 HTTPS**：`certs/` 里有证书就自动加载，启动日志写 `已启用 HTTPS（摄像头可用）`；`--ssl-cert` / `--ssl-key` 自带证书，`--no-ssl` 退回 HTTP（并说清代价是摄像头会被浏览器关掉）。这一步真正的动因是浏览器只在「安全网页」里开放 `getUserMedia`——HTTP 页面点录制必然「权限被拒绝」，而新版浏览器还会自动把 `http://` 升级成 `https://`，纯 HTTP 服务反而回一句「您的浏览器不支持此网站」，看着像服务挂了。
+- **④ 一个实例一块卡**：`review --device cuda:1` / `--half` / `--no-half` 只给这一个进程指定算力（落到 `AUTOLABEL_DEVICE` / `AUTOLABEL_HALF`），**不写回** `~/.autolabel/settings.json`。多卡机器 `--port 8765 --device cuda:0` 与 `--port 8766 --device cuda:1` 各开一个窗口，谁也不抢谁。这台 M3 上先按 `--device cuda` 试了一遍：降级照常工作，标注没失败。
+- **⑤ 顺手抓到一个会吃掉用户选择的真 bug**：`save()` 原来是 `{**load(), **patch}` 合并，而 `load()` 现在带上了环境变量覆盖——于是被 `--device` 钉住的实例只要在界面里随手改一下半精度，就把文件里用户真正存的设备**冲成了启动参数里那个**。改成 `load(ignore_env=True)` 再合并，并补了回归测试。
+- **⑥ 面板把「谁说了算」写出来**：系统设置顶部多出「推理设备被启动参数指定为 NVIDIA 显卡（CUDA）：这个实例以它为准，在这里改动只对其它实例生效」。不写这句，用户在面板里换了显卡却没换卡，只能靠猜。`/api/settings` 相应加了 `env{device?,half?}` 与 `effective.from_env`，面板里选中的仍是文件里那份（`saved`），实际用的那份在 `effective`。
+- **⑦ 启动器 `运行工作台.command` 跟上**：缺证书自己补、走 `https://localhost:8765/`、支持 `PORT=8766 DEVICE=cuda ./运行工作台.command datasets/vidtest` 开第二个实例；端口被占用就说一句「已经在跑了」并直接把现成的页面打开。
+- **⑧ 文档口径拉齐**：`README.md` 新增「打开工作台（HTTPS 与摄像头）」整节，并把三处 `http://127.0.0.1:8765` 改成 `https://localhost:8765`；`02-命令行参考.md` 补 `ca` 行与 `### autolabel ca`、`review` 的新参数与说明；`01` / `04` 同步地址与 HTTPS 原委；`06` 补 `env` / `from_env`；`07-常见问题.md` 新增 5 条（摄像头没反应、浏览器不支持此网站、授权弹窗、换了显卡没换过来、两块卡同时干活）。
+- **测试 435 → 456 条**（+21，跳过 1 项仍为缺 ffmpeg）：新增 `tests/test_ca.py` 12 条（真跑 `openssl verify` 验链、SAN 覆盖、CA 与叶子的 basicConstraints 区分、幂等与 `--force`、私钥权限、天数计算、无钥匙串时卸载不算失败、**真做 TLS 握手**确保证书能被客户端接受）；`tests/test_settings.py` +9 条（启动参数只覆盖本进程不落盘、半精度、坏值回退、`--device`/`--no-ssl` 的 CLI 映射、面板提示、**上面 ⑤ 的回归**）。`ruff` 全绿，5 个 JS 文件 `node --check` 全过。
+
 ## 2026-10-18 17:40 — 系统设置：推理算力可选 CUDA，外观设置归口到一处
 
 需求是「现在推理走 Apple Silicon 的 MPS，要加 CUDA，做个可选项放到系统配置里；顺便把白天晚上、字号这些全收进系统设置菜单」。版本 `1.2.1 → 1.2.2`（按约定 +0.01）。

@@ -34,3 +34,9 @@ env/
 build/
 dist/
 *.egg-info/
+
+# 本地双击启动器（每人环境不同，不进仓库）
+运行工作台.command
+
+# 本地 HTTPS 证书与私钥（autolabel ca 现签，机器各一套）
+certs/

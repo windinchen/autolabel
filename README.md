@@ -83,7 +83,8 @@ python3 -m autolabel init    $D --name 演示集
 python3 -m autolabel import  $D models/bus.jpg models/zidane.jpg
 python3 -m autolabel label   $D --model yolo11n-pose.pt --render-qc 4
 python3 -m autolabel qc      $D --render 10
-python3 -m autolabel review  $D          # 自动打开 http://127.0.0.1:8765
+python3 -m autolabel ca                    # 只做一次：签本地 HTTPS 证书（摄像头需要）
+python3 -m autolabel review  $D          # 自动打开 https://localhost:8765
 python3 -m autolabel export  $D --val-ratio 0.2 --coco
 ```
 
@@ -272,6 +273,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 │   ├── cli.py            命令行入口与参数
 │   ├── version.py        版本号唯一来源 + 开发者/仓库地址 + 与 GitHub 发布版比对
 │   ├── settings.py       系统设置：推理设备（CUDA / MPS / CPU）与半精度，存 ~/.autolabel/settings.json
+│   ├── ca.py             本地 HTTPS 证书：签发、装进当前用户钥匙串、状态与卸载
 │   ├── backends.py       YOLO-pose 推理、翻转融合、多模型共识、可见性判定
 │   ├── models.py         模型目录/统一清单/备注/默认值/本地登记/下载记录 + 多模态配置与连通性验证
 │   ├── secrets.py        API Key 集中存放（~/.autolabel/secrets.json），配置里只留引用名
@@ -283,7 +285,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 │   ├── fields.py         提示词标注字段登记表（.autolabel/fields.json，class_id 永不复用）
 │   ├── prompt.py         提示词标注（拼提示词、回复解析、质量标记、坐标与 detection 数据集导出）
 │   ├── library.py        两个标注库的底座（库名/路径/素材池引用与认领/老布局迁移）
-│   ├── review.py         四个页面的 HTTP 服务与标签落盘（姿态 + 检测框两套）
+│   ├── review.py         四个页面的 HTTP/HTTPS 服务与标签落盘（姿态 + 检测框两套）
 │   ├── upload.py         上传与后台标注任务队列
 │   ├── qc.py             统计、优先级排序、报告与叠加图
 │   ├── export.py         train/val 划分、data.yaml、COCO JSON
@@ -292,7 +294,8 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 │   ├── thumbs.py         队列缩略图缓存（`.autolabel/thumbs/`，长缓存）
 │   ├── image_utils.py    读图、dHash、骨架绘制
 │   └── static/           前端：portal 工作台 / app 姿态标注 / objects 提示词标注 / models 模型管理 / common 共用件
-├── tests/                373 项测试（含端到端与回归）
+├── tests/                456 项测试（含端到端与回归）
+├── certs/                本地 HTTPS 证书与私钥（`autolabel ca` 生成，已 gitignore）
 ├── configs/default.yaml  参数模板
 ├── configs/vlm.json      多模态大模型配置（不含明文 Key，建议不入库）
 ├── configs/models.json   模型登记表（备注/默认值/本地登记/下载记录，本机状态，不入库）
@@ -320,11 +323,22 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 | `status` | 数据集概览 |
 | `reset` | 退回复核状态（`--keep-approved` 保留已接受的） |
 | `version` | 看版本号 / 开发者 / 与 GitHub 比对（`--check` 立刻联网重查）、升版本号（`--bump [patch|minor|major]`，日常只 +0.01） |
+| `ca` | 本地 HTTPS 证书：签发 + 设为受信任（摄像头要 HTTPS）、`--status` 只看状态、`--force` 重签、`--uninstall` 卸载 |
 | `settings` | 看 / 改系统设置：`--device auto\|cuda\|mps\|cpu`、`--half` / `--no-half`、`--reset`（附这台机器的算力探测结果） |
 | `fields` | 管理提示词标注的字段：`--add 字段名=描述提示词`、`--set-label 字段名=显示名`、`--delete 字段名`（`--drop-boxes` 连带删框） |
 | `prompt` | 提示词标注：`--vlm` 选多模态配置、`--fields` 选字段、`--limit` 试跑、`--overwrite` 重标、`--status` 看进度、`--coords` / `--export` 出坐标与训练集 |
 | `batches` | 按批次查看两个库的已标注数据（`--lib all\|pose\|objects`），`--delete <批次ID>` 整批删除图片与记录，`--delete-images images/a.jpg --mode lib\|purge` 按张删（`--keep-files` 只删记录，`--force` 强删中断遗留的批次） |
 | `models` | 模型管理：`--browse` 浏览可下载目录与中文说明、`--info` 看详情、`--download-weight` 补下、`--note ID=说明` 写备注、`--default` 设默认、`--register` / `--forget` 登记或注销本地模型、`--dataset` 判兼容性、`--delete-weight --yes` 删除、`--add-vlm` / `--test-vlm` / `--default-vlm` / `--delete-vlm` 管多模态配置 |
+
+## 打开工作台（HTTPS 与摄像头）
+
+- **为什么是 HTTPS**：浏览器只在「安全网页」里开放摄像头和麦克风，HTTP 页面点录制只会拿到「权限被拒绝」。现在的浏览器还会自动把 `http://` 升级成 `https://`，纯 HTTP 服务反而会出现「浏览器不支持此网站」。
+- **只做一次**：`autolabel ca` 签一张本地证书，并把根证书写进**当前用户**的钥匙串——不要管理员密码、不弹「修改受限制的系统根证书」那种授权框。之后 `review` 自动用它，什么都不用带。
+- **地址**：`https://localhost:8765/`。想用 `https://autolabel.local:8765/` 得自己在 `/etc/hosts` 加一行 `127.0.0.1 autolabel.local`（证书里已经带上这个名字了），不加也完全能用。
+- **不想敲命令**：双击项目根目录的 `运行工作台.command`，缺证书它自己补、起服务、开浏览器，一条都不用记。
+- **多卡机器开多个实例**：`PORT=8766 DEVICE=cuda ./运行工作台.command datasets/vidtest`，或命令行 `review --port 8766 --device cuda`。启动参数只喂给这一个实例，不去改家目录那份全局设置，两块卡各跑各的互不干扰。
+- **`--no-ssl` 退回 HTTP**：浏览、改标签都正常，只是录不了像；除非在排查证书问题，一般用不着。
+- **同网段设备访问**：`review --host 0.0.0.0` 之后手机能用 `https://这台机器的IP:8765/`，但得把 `certs/ca.pem` 装到那台设备上，否则浏览器照样拦。
 
 ## 系统设置与推理算力
 
@@ -332,10 +346,12 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 - **两半存的地方不一样是有意的**：外观是「我这台电脑怎么看」，存浏览器 `localStorage`，所以换浏览器要重设；推理算力决定标注算在哪，存 `~/.autolabel/settings.json`，换浏览器打开同一个数据集也认这份。都不写进数据集目录，跟着数据集走会出现「四个数据集四份设置」。
 - **命令行等价**：`autolabel settings` 看当前设置与这台机器的算力探测结果；`autolabel settings --device cuda --half` 改；`--reset` 回默认。改完界面刷新即见，不用重启服务。
 - **优先级**：命令行 `--device` > YAML `--config` 里写明的 > 系统设置 > 内置默认（`auto`）。家目录里那份设置不会盖掉你在命令行明确写的东西。
+- **一个实例一块卡**：`review --device cuda`（配套 `--half` / `--no-half`）只给这一个进程指定算力，等价于给它设 `AUTOLABEL_DEVICE`，**不写回** `~/.autolabel/settings.json`。系统设置面板顶部会写明「推理设备被启动参数指定为…」，免得你在面板里改了却没换卡还找不到原因。
 - **不可用就降级，不硬崩**：选了这台机器没有的设备，标注不失败，跑之前打一行中文说明退到了哪一档（`[warn] NVIDIA 显卡（CUDA）不可用（这个 PyTorch 不带 CUDA…），本次改用 Apple 加速（MPS）`）。多卡写 `--device 1` 会核对卡号，没有第 2 张就退回系统设置并说明。
 - **换设备不会让已标好的图重跑**：`device` 与 `half` 只是快慢不同的性能项，特意不计入断点续跑的参数指纹；`--imgsz`、`--conf` 这些真正改结果的参数照旧会触发重标。
 - **半精度只在 CUDA 上提速**：CPU / MPS 上会挡下来并说明，比让你在 ultralytics 的英文警告里自己猜快慢原因省事。
 - **不联网也能用**：探测只读本机 torch，不发任何请求；设置文件读写都在本地。
+- **界面偏好和算力分两处存是有意的**：外观在浏览器本地，跟着浏览器走；算力在这台机器的设置文件里，跟着机器走。两边都不进数据集目录。
 
 ## 版本管理与更新提示
 

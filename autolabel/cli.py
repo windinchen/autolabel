@@ -11,6 +11,7 @@ import unicodedata
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .backends import BackendSettings
+from .settings import DEVICE_VALUES
 from . import __version__
 from .dataset import (
     STATUS_APPROVED,
@@ -196,10 +197,62 @@ def cmd_qc(args: argparse.Namespace) -> int:
 
 
 def cmd_review(args: argparse.Namespace) -> int:
-    from .review import serve
+    from . import settings as settings_module
+    from .review import local_cert_paths, serve
 
+    # 起服务时指定的算力只对这个实例生效，不去作家目录里的全局设置，
+    # 这样"一个实例跑一块卡"可行，多卡机器上开两个实例互不干扰
+    if args.device:
+        os.environ[settings_module.ENV_DEVICE] = args.device
+    if args.half is not None:
+        os.environ[settings_module.ENV_HALF] = "1" if args.half else "0"
+    cert = args.ssl_cert or ""
+    key = args.ssl_key or ""
+    if args.no_ssl:
+        cert = key = ""
+    elif cert and not key:
+        key = cert.replace(".pem", "-key.pem")
+    elif not cert:
+        cert, key = local_cert_paths()
     serve(args.dataset, host=args.host, port=args.port, open_browser=not args.no_browser,
-          max_upload_mb=args.max_upload_mb)
+          max_upload_mb=args.max_upload_mb, cert=cert, key=key)
+    return 0
+
+
+def cmd_ca(args: argparse.Namespace) -> int:
+    from . import ca
+
+    if not ca.openssl_available():
+        print("[error] 找不到 openssl 命令（macOS 自带，Linux 需装 openssl）", file=sys.stderr)
+        return 1
+    if args.uninstall:
+        done = ca.uninstall_trust()
+        print(("[ok] " if done["ok"] else "[error] ") + done["note"])
+        return 0 if done["ok"] else 1
+    if args.status:
+        info = ca.status()
+    else:
+        try:
+            result = ca.issue(force=args.force)
+        except RuntimeError as exc:
+            print(f"[error] {exc}", file=sys.stderr)
+            return 1
+        left = ca.days_left(ca.leaf_cert_path())
+        print(f"[ok] {'已签发' if result['created'] else '沿用已有'}本地证书"
+              f"（约 {left} 天到期）：{ca.leaf_cert_path()}")
+        if not args.no_install:
+            done = ca.install_trust()
+            print(("[ok] " if done["ok"] else "[warn] ") + done["note"])
+        info = ca.status()
+    print(f"     目录: {info['dir']}")
+    print(f"     地址: {', '.join(info['sans']) or '（无）'}")
+    print(f"     有效期: {info['days_left']} 天"
+          + ("（快到期，建议 autolabel ca --force 重签）" if info["expires_soon"] else ""))
+    print("     钥匙串信任: " + ("✓ 已设为受信任根证书" if info["trusted"] else "✗ 未信任，浏览器仍会提示不安全"))
+    if info["trusted"]:
+        print("     打开 https://localhost:8765/ 即可，摄像头可用")
+    else:
+        print("     若浏览器仍拦：完全退出浏览器再打开（它会缓存证书状态）")
     return 0
 
 
@@ -1171,6 +1224,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=_port, default=8765)
     p.add_argument("--no-browser", action="store_true")
     p.add_argument("--max-upload-mb", type=_positive_int, default=1024, help="网页上传单文件大小上限")
+    p.add_argument("--ssl-cert", default="",
+                   help="HTTPS 证书；不给就自动用 certs/ 里的本地证书（跑过 autolabel ca 就有）")
+    p.add_argument("--ssl-key", default="", help="HTTPS 私钥，默认按证书名猜同目录的 -key.pem")
+    p.add_argument("--no-ssl", action="store_true",
+                   help="退回 HTTP。能用，但浏览器会关掉摄像头，还可能被自动升级成 HTTPS 而打不开")
+    p.add_argument("--device", choices=list(DEVICE_VALUES),
+                   help="这个实例的推理算力，覆盖系统设置（想一机多卡就多用 --port 起几个实例）")
+    half_group = p.add_mutually_exclusive_group()
+    half_group.add_argument("--half", action="store_true", default=None,
+                            help="这个实例开半精度（只有 NVIDIA 显卡提速）")
+    half_group.add_argument("--no-half", dest="half", action="store_false",
+                            help="这个实例关半精度")
     p.set_defaults(func=cmd_review)
 
     p = sub.add_parser("version", help="看版本号 / 开发者 / 与 GitHub 比对 / 升版本")
@@ -1180,13 +1245,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_version)
 
     p = sub.add_parser("settings", help="看/改系统设置：推理设备（CUDA / Apple 加速 / CPU）、半精度")
-    p.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], help="推理用哪块算力")
+    p.add_argument("--device", choices=list(DEVICE_VALUES), help="推理用哪块算力")
     half_group = p.add_mutually_exclusive_group()
     half_group.add_argument("--half", action="store_true", default=None, help="开半精度（只有 NVIDIA 显卡提速）")
     half_group.add_argument("--no-half", dest="half", action="store_false", help="关半精度")
     p.add_argument("--reset", action="store_true", help="恢复默认（自动选择 + 关半精度）")
     p.add_argument("--json", action="store_true", help="连探测结果一起打 JSON")
     p.set_defaults(func=cmd_settings)
+
+    p = sub.add_parser("ca", help="生成本地 HTTPS 证书并设为受信任（摄像头要 HTTPS）")
+    p.add_argument("--status", action="store_true", help="只看状态，不签发不装信任")
+    p.add_argument("--force", action="store_true", help="重新签发（证书过期或换域名时用）")
+    p.add_argument("--no-install", action="store_true", help="只签发，不写入钥匙串")
+    p.add_argument("--uninstall", action="store_true", help="从钥匙串移除本项目根证书")
+    p.set_defaults(func=cmd_ca)
 
     p = sub.add_parser("export", help="导出 YOLO 训练数据集（train/val + data.yaml）")
     add_dataset(p)

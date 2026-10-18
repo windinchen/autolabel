@@ -357,3 +357,108 @@ def test_frontend_reads_the_device_list_from_the_server():
     assert '"/api/settings"' in common
     assert "saveSettings({ device:" in common
     assert "NVIDIA GeForce" not in common, "前端不该写死显卡型号"
+
+
+# ------------------------------------------------------------------ 一个实例一块卡
+
+def test_launch_flag_overrides_without_touching_the_file(probe_off, monkeypatch):
+    """``review --device`` 只改这个进程：文件里那份得保持原样。"""
+    system.save({"device": "mps"})
+    before = open(system.path(), encoding="utf-8").read()
+    monkeypatch.setenv(system.ENV_DEVICE, "cuda")
+    assert system.load()["device"] == "cuda"
+    assert system.env_override() == {"device": "cuda"}
+    monkeypatch.delenv(system.ENV_DEVICE)   # 只撤自己这条，undo() 会连 conftest 的隔离一起撤
+    assert open(system.path(), encoding="utf-8").read() == before
+    assert system.load()["device"] == "mps"
+    assert system.env_override() == {}
+
+
+def test_launch_flag_covers_half_precision_too(probe_off, monkeypatch):
+    monkeypatch.setenv(system.ENV_HALF, "1")
+    assert system.load()["half"] is True
+    monkeypatch.setenv(system.ENV_HALF, "0")
+    assert system.load()["half"] is False
+
+
+def test_a_bogus_launch_value_falls_back_instead_of_crashing(probe_off, monkeypatch):
+    monkeypatch.setenv(system.ENV_DEVICE, "to-the-moon")
+    assert system.load()["device"] == system.DEFAULTS["device"]
+    monkeypatch.setenv(system.ENV_DEVICE, "cuda:1")     # 命令行常见的多卡写法
+    assert system.load()["device"] == "cuda"
+
+
+def test_api_and_cli_say_the_override_is_not_the_saved_value(server, probe_off, monkeypatch):
+    """面板里选中的是文件那份，实际用的是启动参数那份：两条都得说清楚。"""
+    base, _store = server
+    system.save({"device": "mps"})
+    monkeypatch.setenv(system.ENV_DEVICE, "cuda")
+    status, data = get(base, "/api/settings")
+    assert status == 200
+    assert data["saved"]["device"] == "mps", "面板别把启动参数显示成用户存的选择"
+    assert data["effective"]["device"] == "cuda" and data["effective"]["from_env"] is True
+    assert data["env"]["device"] == system.DEVICE_LABELS["cuda"]
+    text = system.describe()
+    assert "启动参数" in text and "NVIDIA" in text
+    monkeypatch.delenv(system.ENV_DEVICE)   # 只撤自己这条，undo() 会连 conftest 的隔离一起撤
+    assert "启动参数" not in system.describe()
+
+
+def test_saving_never_clobbers_the_choice_with_the_launch_flag(probe_off, monkeypatch):
+    """回归：被启动参数覆盖成 cuda 时随手保存一次，曾把文件里存的 mps 改成 cuda。"""
+    system.save({"device": "mps"})
+    monkeypatch.setenv(system.ENV_DEVICE, "cuda")
+    system.save({})                        # 界面里切半精度就会走这条
+    monkeypatch.delenv(system.ENV_DEVICE)   # 只撤自己这条，undo() 会连 conftest 的隔离一起撤
+    assert system.load()["device"] == "mps", open(system.path(), encoding="utf-8").read()
+
+
+def test_review_cli_maps_the_flag_onto_the_instance_env(tmp_path, monkeypatch):
+    from autolabel.cli import main
+    import autolabel.review as review
+
+    monkeypatch.delenv(system.ENV_DEVICE, raising=False)
+    monkeypatch.delenv(system.ENV_HALF, raising=False)
+    seen = {}
+
+    def fake_serve(root, **kwargs):
+        seen.update(kwargs)
+        seen["env"] = (os.environ.get(system.ENV_DEVICE), os.environ.get(system.ENV_HALF))
+
+    monkeypatch.setattr(review, "serve", fake_serve)
+    monkeypatch.setattr(review, "local_cert_paths", lambda: ("", ""))
+    assert main(["review", str(tmp_path), "--device", "cuda", "--no-half", "--no-browser"]) == 0
+    assert seen["env"] == ("cuda", "0"), seen["env"]
+    assert seen["cert"] == "" and seen["key"] == ""
+
+
+def test_review_picks_up_the_local_cert_by_default(tmp_path, monkeypatch):
+    from autolabel.cli import main
+    import autolabel.review as review
+
+    captured = {}
+    monkeypatch.setattr(review, "serve", lambda root, **kw: captured.update(kw))
+    monkeypatch.setattr(review, "local_cert_paths", lambda: ("/tmp/x.pem", "/tmp/x-key.pem"))
+    assert main(["review", str(tmp_path), "--no-browser"]) == 0
+    assert captured["cert"] == "/tmp/x.pem", "有本地证书就该默认走 HTTPS，不然摄像头是灰的"
+
+    assert main(["review", str(tmp_path), "--no-browser", "--no-ssl"]) == 0
+    assert captured["cert"] == "" and captured["key"] == ""
+
+
+def test_review_without_the_flag_leaves_the_instance_env_alone(tmp_path, monkeypatch):
+    from autolabel.cli import main
+    import autolabel.review as review
+
+    monkeypatch.delenv(system.ENV_DEVICE, raising=False)
+    monkeypatch.setattr(review, "serve", lambda root, **kw: None)
+    monkeypatch.setattr(review, "local_cert_paths", lambda: ("", ""))
+    assert main(["review", str(tmp_path), "--no-browser"]) == 0
+    assert system.ENV_DEVICE not in os.environ, "没给 --device 就别污染环境变量"
+
+
+def test_the_override_is_explained_in_the_panel():
+    common = read("common.js")
+    assert 'id="set-env"' in common
+    assert "env.device" in common, "面板没读服务端给的启动参数提示"
+    assert "只对其它实例生效" in common

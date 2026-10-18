@@ -1284,8 +1284,19 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self._send_file(path, ctype)
 
 
+def local_cert_paths() -> tuple:
+    """本地证书存在就用它：摄像头只在"安全网页"里开放，HTTPS 才是常态。"""
+    from . import ca
+
+    cert, key = ca.leaf_cert_path(), ca.leaf_key_path()
+    if os.path.exists(cert) and os.path.exists(key):
+        return cert, key
+    return None, None
+
+
 def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True,
-          max_upload_mb: int = 1024) -> None:
+          max_upload_mb: int = 1024, cert: Optional[str] = None,
+          key: Optional[str] = None) -> None:
     from . import version as versioning
 
     store = ReviewStore(root)
@@ -1303,13 +1314,42 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bo
         print(f"[info] 清理上次遗留的上传临时文件 {stale['files']} 个"
               f"（{stale['bytes'] / 1048576:.1f} MB，超过 24 小时未使用）")
     httpd = ThreadingHTTPServer((host, port), ReviewHandler)
-    url = f"http://{host}:{httpd.server_address[1]}/"
+    port = httpd.server_address[1]
+    secure, scheme, note = False, "http", ""
+    if cert and key:
+        import ssl
+
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        try:
+            context.load_cert_chain(certfile=cert, keyfile=key)
+        except ssl.SSLError as exc:
+            note = f"证书没加载成功（{exc}），本次改用 HTTP，摄像头会不可用"
+        else:
+            httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+            secure, scheme = True, "https"
+    url = f"{scheme}://{host}:{port}/"
     total = len(store.index.items)
     objects_total = len(store.objects_index.items)
     # 用内存里已经读好的两本索引现算，别再为这一行去解析一遍 index.json
     counts = review_counts(list(store.index.items.values()),
                            list(store.objects_index.items.values()))  # noqa: E501
     print(f"[info] 工作台: {url}")
+    from . import settings as system
+
+    saved = system.load()
+    picked, why = system.resolve(saved["device"])
+    from .settings import DEVICE_LABELS
+
+    print(f"[info] 本实例推理设备: {DEVICE_LABELS.get(picked, picked)}（{picked}）"
+          + ("← 被启动参数指定" if system.env_override() else "← 来自系统设置"))
+    if why:
+        print(f"[warn] {why}")
+    if secure:
+        print("[info] 已启用 HTTPS（摄像头可用）· 重签证书：autolabel ca --force")
+    if note:
+        print(f"[warn] {note}")
+    if host in ("0.0.0.0", "::"):
+        print(f"[info] 手机/同网电脑可访问 https://这台机器的IP:{port}/（需把 certs/ca.pem 装到那台设备）")
     print(f"[info] 自动标注 v{versioning.VERSION} · 开发者 {versioning.DEVELOPER} · {versioning.REPO_URL}")
     print(f"[info] 数据集 {store.index.name}：姿态库 {total} 张 · 提示词库 {objects_total} 张，"
           f"等你复核 {counts['pending']} 张（其中 {counts['flagged']} 张"

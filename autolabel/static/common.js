@@ -173,6 +173,7 @@ function buildSettingsModal() {
     <section>
       <div class="panel-title">推理算力</div>
       <div class="set-note muted small">标注跑在哪块卡上。选了这台机器没有的设备不会报错，跑的时候自动降级并说明原因。</div>
+      <div class="set-note muted small" id="set-env" hidden></div>
       <div id="set-devices"></div>
       <div class="set-row">
         <span class="set-name">半精度加速<span class="muted small">只有 NVIDIA 显卡提速，CPU 上会自动按普通精度跑</span></span>
@@ -238,6 +239,18 @@ function renderDeviceRows() {
   const data = settingsState.data || {};
   const probed = Boolean(data.devices && Object.keys(data.devices).length);
   const picked = settingsSaved().device;
+  const envNote = $("set-env");
+  if (envNote) {
+    // 启动参数指定的算力只属于这一个实例：不写出来，改了这里却没换卡会很费解
+    const env = data.env || {};
+    const parts = [];
+    if (env.device) { parts.push(`推理设备被启动参数指定为「${env.device}」`); }
+    if (typeof env.half === "boolean") { parts.push(`半精度被指定为「${env.half ? "开" : "关"}」`); }
+    envNote.hidden = !parts.length;
+    envNote.textContent = parts.length
+      ? `${parts.join("，")}：这个实例以它为准，在这里改动只对其它实例生效`
+      : "";
+  }
   const rows = (data.choices || []).map((choice) => {
     const facts = settingsDevice(choice.value);
     const row = document.createElement("button");
