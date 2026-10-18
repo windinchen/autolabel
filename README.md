@@ -1,4 +1,4 @@
-# 人体骨骼自动标注系统
+# 自动标注系统（人体骨骼，目标检测，分割）
 
 **开发者 [windinchen](https://github.com/windinchen)** · 源码与发布 <https://github.com/windinchen/autolabel> · 版本号看 `autolabel version`（界面顶栏右侧常驻显示）
 
