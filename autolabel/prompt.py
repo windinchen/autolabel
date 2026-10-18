@@ -771,9 +771,8 @@ def export_detection_dataset(
     类别号会被重映射成连续的 0..N-1：登记表里删过字段时，标签里的 ``class_id``
     可能不连续，而 YOLO 要求 ``names`` 的键从 0 连续递增。
     """
-    import random
-
-    from .export import _place, content_fingerprint, find_reusable_export, unique_export_dir
+    from .export import (_place, content_fingerprint, find_reusable_export, rank_for_split,
+                         split_val_set, unique_export_dir)
 
     records, meta = collect_object_records(root, exclude_status=exclude_status)
     used = sorted({obj["cls"] for rec in records for obj in rec["objects"]})
@@ -784,13 +783,14 @@ def export_detection_dataset(
 
     labeled = [rec for rec in records if rec["objects"]]
     empty = [rec for rec in records if not rec["objects"]]
-    rng = random.Random(seed)
-    rng.shuffle(labeled)
-    rng.shuffle(empty)
+    # 与姿态库同一套稳定划分，理由见 export.split_val_set()
+    labeled = rank_for_split(labeled, seed, key=lambda rec: rec["image"])
+    empty = rank_for_split(empty, seed, key=lambda rec: rec["image"])
     keep_empty = int(len(labeled) * max_empty_ratio / max(1e-6, 1 - max_empty_ratio)) if labeled else len(empty)
     empty = empty[:max(0, keep_empty)]
 
     selected = labeled + empty
+    val_set = split_val_set([rec["image"] for rec in selected], val_ratio, seed)
     fingerprint = content_fingerprint(
         [(rec["image"], "\n".join(
             "{}:{:.6f},{:.6f},{:.6f},{:.6f}".format(
@@ -805,12 +805,6 @@ def export_detection_dataset(
         reused = find_reusable_export(root, fingerprint, kind="detect")
         if reused is not None:
             return reused
-    if len(selected) < 2:
-        val_n = 0
-    else:
-        val_n = max(1, min(len(selected) - 1, int(round(len(selected) * val_ratio))))
-    val_set = {rec["image"] for rec in selected[:val_n]}
-
     tag = tag or now_str().replace(" ", "_").replace(":", "")
     if out:
         out_root = os.path.abspath(out)

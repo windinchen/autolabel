@@ -10,6 +10,7 @@ import os
 import shutil
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import TYPE_CHECKING, List, Optional, Sequence
 from urllib.parse import parse_qs, unquote, urlparse
@@ -59,6 +60,7 @@ from .models import (
     vlm_choices,
 )
 from .pipeline import image_level_flags
+from .thumbs import THUMB_CACHE_CONTROL, build_thumbnail, prune_thumbs
 from .qc import COCO17_SKELETON, FLAG_HINTS, dataset_stats, flagged_items, review_priority
 from .batches import (
     MODULE_NAMES,
@@ -115,7 +117,9 @@ class ReviewStore:
 
     def __init__(self, root: str, jobs: Optional[JobStore] = None):
         self.root = os.path.abspath(root)
-        self.lock = threading.Lock()
+        # 可重入：改索引时要在同一把锁里再走一遍「重新对齐磁盘」（见 ``_mutate``），
+        # 用普通 Lock 会自己把自己锁死
+        self.lock = threading.RLock()
         # 老布局（两套状态混在一份索引里）先迁成分库布局，重复调用无副作用
         self.migration = migrate(self.root)
         # 先按磁盘对账，再读索引：上次跑到一半被打断的导入不能悄悄丢掉素材
@@ -168,6 +172,36 @@ class ReviewStore:
                 self.index = idx
             else:
                 self.objects_index = idx
+
+    def _sync_locked(self) -> None:
+        """按磁盘重建内存索引并记下时间戳；调用方必须已经握着 ``self.lock``。"""
+        self._reload_locked()
+        self._index_stamp = self._disk_stamp()
+
+    @contextmanager
+    def _mutate(self, resync: bool = False):
+        """改索引的标准姿势：一把锁里完成「对齐磁盘 → 改 → 落盘」。
+
+        以前的写法是 ``self.reload()``（拿锁再放锁）之后再来一句
+        ``with self.lock:`` 改+存。两次拿锁之间的空隙里，另一个页面或后台线程
+        可能已经改过索引，手里的内存副本就成了旧值——整份文件按旧副本写回去，
+        对方刚删掉/刚标的记录会一起被抹掉（索引是整表覆盖写，没有字段级合并）。
+        删除走的也是整表覆盖，所以删除必须挤进同一把锁，否则「删 20 张、
+        刷新又全回来」。
+
+        :param resync: 块内改用 batches/dataset 的助手直接落盘时置 True，
+            收尾再按磁盘对齐一次——内存索引不知道别人刚删了什么
+        """
+        with self.lock:
+            self._sync_locked()
+            try:
+                yield self
+            finally:
+                if resync:
+                    self._sync_locked()
+                else:
+                    # 块里刚写过盘，时间戳必须跟上，否则下一次读会白解析一遍
+                    self._index_stamp = self._disk_stamp()
 
     # --- 读取 ---
     def dataset_payload(self) -> dict:
@@ -280,15 +314,15 @@ class ReviewStore:
 
     # --- 写入 ---
     def write_item(self, image_rel: str, objects: List[dict], status: Optional[str] = None) -> dict:
-        self.reload()  # 后台标注可能刚写入新图/新字段，先对齐磁盘状态再改
-        item = self.index.get(image_rel)
-        if item is None:
-            raise KeyError(image_rel)
-        item = dict(item)
-        h = int(item.get("height") or 0)
-        w = int(item.get("width") or 0)
-        persons = persons_from_payload(objects, w, h)
-        with self.lock:
+        # 后台标注可能刚写入新图/新字段，锁内先对齐磁盘状态再改
+        with self._mutate():
+            item = self.index.get(image_rel)
+            if item is None:
+                raise KeyError(image_rel)
+            item = dict(item)
+            h = int(item.get("height") or 0)
+            w = int(item.get("width") or 0)
+            persons = persons_from_payload(objects, w, h)
             label = label_path_for(self.root, image_rel)
             self._backup(image_rel, label)
             write_label_file(label, persons)
@@ -314,8 +348,7 @@ class ReviewStore:
     def set_status(self, image_rel: str, status: str) -> dict:
         if status not in VALID_STATUS:
             raise ValueError(f"非法状态: {status}")
-        self.reload()
-        with self.lock:
+        with self._mutate():
             self.index.upsert(image_rel, status=status, reviewed_at=now_str())
             self.index.save()
         return {"ok": True, "image": image_rel, "status": status}
@@ -346,18 +379,18 @@ class ReviewStore:
         rels = [str(rel) for rel in (image_rels or []) if str(rel).strip()]
         if not rels:
             raise ValueError("没有选择要添加的图片")
-        batch = create_batch(self.root, name=make_batch_name("pool", [
-            os.path.basename(rel) for rel in rels], batch_name_text),
-            kind="pool", source="ui", uploads=[os.path.basename(rel) for rel in rels],
-            lib=lib)
-        stats = adopt_from_pool(self.root, rels, lib)
-        if stats["added_items"]:
-            attach_items(self.root, batch["id"], stats["added_items"], lib=lib)
-        finish_batch(self.root, batch["id"], "done",
-                     f"从素材池添加 {stats['added']} 张"
-                     + (f"，已在库中 {stats['already']} 张" if stats["already"] else "")
-                     + (f"，池里查无 {len(stats['missing'])} 张" if stats["missing"] else ""))
-        self.reload()
+        with self._mutate(resync=True):
+            batch = create_batch(self.root, name=make_batch_name("pool", [
+                os.path.basename(rel) for rel in rels], batch_name_text),
+                kind="pool", source="ui", uploads=[os.path.basename(rel) for rel in rels],
+                lib=lib)
+            stats = adopt_from_pool(self.root, rels, lib)
+            if stats["added_items"]:
+                attach_items(self.root, batch["id"], stats["added_items"], lib=lib)
+            finish_batch(self.root, batch["id"], "done",
+                         f"从素材池添加 {stats['added']} 张"
+                         + (f"，已在库中 {stats['already']} 张" if stats["already"] else "")
+                         + (f"，池里查无 {len(stats['missing'])} 张" if stats["missing"] else ""))
         return {"ok": True, "batch_id": batch["id"], "lib": lib, **stats}
 
     def batches_payload(self) -> dict:
@@ -381,9 +414,9 @@ class ReviewStore:
         """
         live = {str(job.get("batch_id")) for job in self.jobs.snapshot()
                 if not job.get("finished") and job.get("batch_id")}
-        result = delete_images(self.root, image_rels, lib=lib, mode=mode,
-                               keep_files=keep_files, active_ids=live)
-        self.reload()
+        with self._mutate(resync=True):
+            result = delete_images(self.root, image_rels, lib=lib, mode=mode,
+                                   keep_files=keep_files, active_ids=live)
         return result
 
     def run_prompt_upload_job(self, payload: dict) -> dict:
@@ -424,9 +457,8 @@ class ReviewStore:
         # 只有真正在跑的任务才算「标注中」；服务重启留下的僵尸批次允许直接删
         live = {str(job.get("batch_id")) for job in self.jobs.snapshot()
                 if not job.get("finished") and job.get("batch_id")}
-        with self.lock:
+        with self._mutate(resync=True):
             result = _delete_batches(self.root, batch_ids, keep_files=keep_files, active_ids=live)
-            self._reload_locked()
         return result
 
     # --- 提示词标注：字段表 + 检测框读写 ---
@@ -444,7 +476,9 @@ class ReviewStore:
                             color=str(payload.get("color") or ""))
 
     def remove_field(self, wanted: str, drop_boxes: bool = False) -> dict:
-        return delete_field(self.root, wanted, drop_boxes=drop_boxes)
+        # drop_boxes 会把该字段的框从所有图里抹掉并重写提示词索引，同样要进锁
+        with self._mutate(resync=True):
+            return delete_field(self.root, wanted, drop_boxes=drop_boxes)
 
     def prompt_summary_payload(self) -> dict:
         summary = prompt_summary(self.root)
@@ -479,33 +513,32 @@ class ReviewStore:
     def write_prompt_item(self, image_rel: str, objects: List[dict],
                           status: Optional[str] = None) -> dict:
         """把前端画好的框写回 ``prompt_labels/``（YOLO detection 5 列）。"""
-        self.reload()
-        item = self.objects_index.get(image_rel)
-        if item is None:
-            raise KeyError(image_rel)
-        width = int(item.get("width") or 0)
-        height = int(item.get("height") or 0)
-        registry = {int(field.get("class_id", -1)): field for field in list_fields(self.root)}
-        detections: List[Detection] = []
-        for raw in objects or []:
-            cls = int(raw.get("cls", -1))
-            if cls not in registry:
-                names = "、".join(field.get("name", "") for field in registry.values()) or "（还没有字段）"
-                raise ValueError(f"类别号 {cls} 不在字段表里；当前可用类别：{names}")
-            detection = Detection(cls=cls, cx=_clamp01(float(raw.get("cx", 0.5))),
-                                  cy=_clamp01(float(raw.get("cy", 0.5))),
-                                  w=max(0.0, min(1.0, float(raw.get("w", 0.0)))),
-                                  h=max(0.0, min(1.0, float(raw.get("h", 0.0)))),
-                                  score=float(raw.get("score") or 0.0),
-                                  flags=[str(f) for f in (raw.get("flags") or [])])
-            if detection.w <= 0 or detection.h <= 0:
-                raise ValueError("框的宽高必须大于 0")
-            detections.append(detection)
-        per_box = box_flags(detections, width, height, list(registry))
-        manual_indices = [index for index, raw in enumerate(objects or [])
-                          if "manual" in (raw.get("flags") or [])]
-        scores = [detection.score for detection in detections]
-        with self.lock:
+        with self._mutate():
+            item = self.objects_index.get(image_rel)
+            if item is None:
+                raise KeyError(image_rel)
+            width = int(item.get("width") or 0)
+            height = int(item.get("height") or 0)
+            registry = {int(field.get("class_id", -1)): field for field in list_fields(self.root)}
+            detections: List[Detection] = []
+            for raw in objects or []:
+                cls = int(raw.get("cls", -1))
+                if cls not in registry:
+                    names = "、".join(field.get("name", "") for field in registry.values()) or "（还没有字段）"
+                    raise ValueError(f"类别号 {cls} 不在字段表里；当前可用类别：{names}")
+                detection = Detection(cls=cls, cx=_clamp01(float(raw.get("cx", 0.5))),
+                                      cy=_clamp01(float(raw.get("cy", 0.5))),
+                                      w=max(0.0, min(1.0, float(raw.get("w", 0.0)))),
+                                      h=max(0.0, min(1.0, float(raw.get("h", 0.0)))),
+                                      score=float(raw.get("score") or 0.0),
+                                      flags=[str(f) for f in (raw.get("flags") or [])])
+                if detection.w <= 0 or detection.h <= 0:
+                    raise ValueError("框的宽高必须大于 0")
+                detections.append(detection)
+            per_box = box_flags(detections, width, height, list(registry))
+            manual_indices = [index for index, raw in enumerate(objects or [])
+                              if "manual" in (raw.get("flags") or [])]
+            scores = [detection.score for detection in detections]
             self._backup(image_rel, prompt_label_path_for(self.root, image_rel),
                          backup_path=self._prompt_backup_path(image_rel),
                          history_dir=self._prompt_history_dir(image_rel))
@@ -531,8 +564,7 @@ class ReviewStore:
     def set_prompt_status(self, image_rel: str, status: str) -> dict:
         if status not in VALID_STATUS:
             raise ValueError(f"非法状态: {status}")
-        self.reload()
-        with self.lock:
+        with self._mutate():
             self.objects_index.upsert(image_rel, prompt_status=status,
                                       prompt_reviewed_at=now_str())
             self.objects_index.save()
@@ -716,8 +748,7 @@ class ReviewStore:
         if kind == "prompt":
             return self.undo_prompt(image_rel)
         history = self._history_dir(image_rel)
-        self.reload()
-        with self.lock:
+        with self._mutate():
             snaps = sorted(os.listdir(history)) if os.path.isdir(history) else []
             if not snaps:
                 backup = self._backup_path(image_rel)
@@ -739,8 +770,7 @@ class ReviewStore:
     def undo_prompt(self, image_rel: str) -> dict:
         """把检测框回滚到上一次快照：删错的框删多了也能救回来。"""
         history = self._prompt_history_dir(image_rel)
-        self.reload()
-        with self.lock:
+        with self._mutate():
             label = prompt_label_path_for(self.root, image_rel)
             snaps = sorted(os.listdir(history)) if os.path.isdir(history) else []
             if snaps:
@@ -928,6 +958,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self._send_download(name, body, ctype)
             elif path.startswith("/image/"):
                 self._send_image(unquote(path[len("/image/"):]))
+            elif path.startswith("/thumb/"):
+                # 队列缩略图走小图 + 长缓存，主图仍旧用 /image/ 看全分辨率
+                self._send_image(unquote(path[len("/thumb/"):]), thumb=True)
             else:
                 self._send_json({"error": "not found"}, status=404)
         except FileNotFoundError as exc:
@@ -1074,20 +1107,24 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._send_json({"error": f"{type(exc).__name__}: {exc}"}, status=500)
 
     def _handle_upload(self, parsed, length: int) -> None:
-        """原始字节上传（无 multipart 解析）：文件名走 ?name= 查询参数。"""
-        from .upload import save_upload
+        """原始字节上传（无 multipart 解析）：文件名走 ?name= 查询参数。
+
+        交给 ``save_upload_stream`` 分块落盘：超限/类型不支持时它也会把请求体读干净，
+        这里才允许回 413/400，否则浏览器看到的是断链而不是中文提示。
+        """
+        from .upload import UploadTooLarge, save_upload_stream
 
         if length <= 0:
             self._send_json({"error": "缺少文件内容"}, status=400)
             return
-        if length > self.max_upload_mb * 1024 * 1024:
-            self._send_json({"error": f"单个文件超过 {self.max_upload_mb} MB 上限"}, status=413)
-            return
         query = parse_qs(parsed.query)
         name = unquote(query.get("name", [""])[0])
         try:
-            data = self.rfile.read(length)
-            info = save_upload(self.store.root, name, data, max_mb=self.max_upload_mb)
+            info = save_upload_stream(self.store.root, name, self.rfile, length,
+                                      max_mb=self.max_upload_mb)
+        except UploadTooLarge:
+            self._send_json({"error": f"单个文件超过 {self.max_upload_mb} MB 上限"}, status=413)
+            return
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
             return
@@ -1110,13 +1147,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_file(self, path: str, ctype: str) -> None:
+    def _send_file(self, path: str, ctype: str, cache: str = "no-store") -> None:
         with open(path, "rb") as fh:
             body = fh.read()
         # 页面/图片用内联渲染，只有坐标下载才带 attachment 头
-        self._send_download("", body, ctype)
+        self._send_download("", body, ctype, cache=cache)
 
-    def _send_download(self, name: str, body: bytes, ctype: str) -> None:
+    def _send_download(self, name: str, body: bytes, ctype: str,
+                       cache: str = "no-store") -> None:
         from urllib.parse import quote
 
         self.send_response(200)
@@ -1124,14 +1162,20 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         if name:
             self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(name)}")
-        self.send_header("Cache-Control", "no-store")
+        # 只有缩略图允许缓存：它的文件名里编了内容指纹，图片一换 URL 就变
+        self.send_header("Cache-Control", cache)
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_image(self, image_rel: str) -> None:
+    def _send_image(self, image_rel: str, thumb: bool = False) -> None:
         path = resolve_image(self.store.root, image_rel)
         if not os.path.exists(path):
             raise FileNotFoundError(image_rel)
+        if thumb:
+            small = build_thumbnail(self.store.root, path, image_rel)
+            if small:
+                self._send_file(small, "image/jpeg", cache=THUMB_CACHE_CONTROL)
+                return
         ctype = "image/jpeg"
         if path.lower().endswith(".png"):
             ctype = "image/png"
@@ -1145,6 +1189,10 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bo
     store = ReviewStore(root)
     ReviewHandler.store = store
     ReviewHandler.max_upload_mb = max_upload_mb
+    # 缩略图缓存只增不减：删掉的图没人认领，启动时清一次久未访问的
+    pruned = prune_thumbs(store.root)
+    if pruned:
+        print(f"[info] 清理缩略图缓存 {pruned} 张（超过 30 天未使用）")
     httpd = ThreadingHTTPServer((host, port), ReviewHandler)
     url = f"http://{host}:{httpd.server_address[1]}/"
     total = len(store.index.items)

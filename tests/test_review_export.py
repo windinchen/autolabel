@@ -1,8 +1,12 @@
 import json
 import os
+import threading
+import time
 
+import numpy as np
 import pytest
 import yaml
+from PIL import Image
 
 from _helpers import idx_names, write_label
 from test_prompt_web import add_fields, get, post
@@ -115,6 +119,42 @@ def test_qc_flags_drive_priority(dataset):
     assert os.path.exists(os.path.join(dataset, "qc", "flags.csv"))
 
 
+def test_deleting_while_saving_does_not_resurrect_images(dataset, monkeypatch):
+    """删除与保存必须共用一把锁：索引是整表覆盖写，后写的会抹掉对方全部改动。
+
+    把落笔动作拖慢 0.4 秒，让删除正好插进「保存方读完索引、还没写回」的空隙；
+    修复前删掉的那张会连同整批删除一起被旧副本盖回来。
+    """
+    keep, doomed = sorted(idx_names(dataset))[:2]
+    store = rv.ReviewStore(dataset)
+    payload = store.read_item(keep)["objects"]
+    real_write = rv.write_label_file
+
+    def slow_write(path, persons):
+        time.sleep(0.4)
+        return real_write(path, persons)
+
+    monkeypatch.setattr(rv, "write_label_file", slow_write)
+    errors: list = []
+
+    def saver():
+        try:
+            store.write_item(keep, payload, status="approved")
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    thread = threading.Thread(target=saver)
+    thread.start()
+    time.sleep(0.1)  # 保存方已经读过索引，正在写标签
+    store.delete_images([doomed], lib="pose", mode="purge")
+    thread.join(timeout=30)
+
+    assert not errors, errors
+    assert ds.load_index(dataset).get(doomed) is None  # 删掉的图没有诈尸
+    assert ds.load_index(dataset).get(keep)["status"] == ds.STATUS_APPROVED  # 保存的改动也没丢
+    assert store.index.get(doomed) is None  # 内存副本跟上了磁盘，不会刷新又冒出来
+
+
 def test_export_splits_and_writes_data_yaml(dataset):
     names = seed(dataset, first_only=False)
     idx = ds.load_index(dataset)
@@ -177,6 +217,76 @@ def test_export_val_never_eats_whole_dataset(dataset):
                               seed=1, mode="copy")
     assert result["train_images"] >= 1 and result["val_images"] >= 1
 
+
+
+def split_map(result):
+    """导出结果里的「哪张图进了哪个划分」。"""
+    with open(os.path.join(result["out"], "manifest.json"), encoding="utf-8") as fh:
+        return {row["image"]: row["split"] for row in json.load(fh)["split"]}
+
+
+def test_export_split_never_moves_images_when_dataset_grows(tmp_path):
+    """加素材重导不许让已经分好的帧搬家：上一版算指标的帧不能这一版变成训练帧。
+
+    早先是整表 shuffle 后取前 N 张，名次取决于「这次一共有多少张」——实测多导 9 张，
+    原本在 val 的 ``b.jpg`` 就掉进了 train，两次训练的指标既互相污染也没法比。
+    """
+    root = tmp_path / "growing"
+    src = tmp_path / "frames"
+    src.mkdir()
+    ds.init_dataset(str(root), name="增长")
+
+    def add(count, start):
+        for i in range(start, start + count):
+            Image.fromarray(np.full((60, 80, 3), (i % 200) + 1, np.uint8)).save(src / f"g{i:04d}.jpg")
+        imported = ds.import_images(str(root), [str(src)], dedupe="exact")
+        index = ds.load_index(str(root))
+        for _path, rel in imported["imported_files"]:
+            write_label(str(root), rel, [SAMPLE])
+            index.upsert(rel, objects=1, score=0.8, status="approved")
+        index.save()
+
+    add(40, 0)
+    first = split_map(ex.export_dataset(str(root), out=str(root / "exports" / "a"),
+                                        val_ratio=0.25, mode="copy"))
+    val_first = {name for name, split in first.items() if split == "val"}
+    train_first = {name for name, split in first.items() if split == "train"}
+    assert len(first) == 40 and 4 <= len(val_first) <= 16, f"25% 的划分飘了：{len(val_first)}/40"
+
+    add(60, 40)
+    second = split_map(ex.export_dataset(str(root), out=str(root / "exports" / "b"),
+                                         val_ratio=0.25, mode="copy"))
+    assert len(second) == 100
+    dropped = {name for name in val_first if second.get(name) != "val"}
+    promoted = {name for name in train_first if second.get(name) != "train"}
+    assert not dropped, f"这些帧从 val 掉进了 train：{sorted(dropped)[:5]}"
+    assert not promoted, f"这些训练帧被踢进了 val：{sorted(promoted)[:5]}"
+    assert {n for n, s in second.items() if s == "val"} >= val_first, "val 只能新增，不能重排"
+
+
+def test_export_split_is_seed_dependent_and_repeatable(tmp_path):
+    """同一个种子两次导出划分完全一致；换种子应换个分法（否则 seed 参数是摆设）。"""
+    root = tmp_path / "stable"
+    src = tmp_path / "frames"
+    src.mkdir()
+    ds.init_dataset(str(root), name="可复现")
+    for i in range(24):
+        Image.fromarray(np.full((60, 80, 3), (i % 200) + 1, np.uint8)).save(src / f"s{i:03d}.jpg")
+    imported = ds.import_images(str(root), [str(src)], dedupe="exact")
+    index = ds.load_index(str(root))
+    for _path, rel in imported["imported_files"]:
+        write_label(str(root), rel, [SAMPLE])
+        index.upsert(rel, objects=1, score=0.8, status="approved")
+    index.save()
+
+    a = split_map(ex.export_dataset(str(root), out=str(root / "exports" / "a"), val_ratio=0.25,
+                                   seed=7, mode="copy"))
+    b = split_map(ex.export_dataset(str(root), out=str(root / "exports" / "b"), val_ratio=0.25,
+                                   seed=7, mode="copy"))
+    c = split_map(ex.export_dataset(str(root), out=str(root / "exports" / "c"), val_ratio=0.25,
+                                   seed=11, mode="copy"))
+    assert a == b, "同种子同素材的划分必须一模一样"
+    assert {n for n, s in a.items() if s == "val"} != {n for n, s in c.items() if s == "val"}
 
 def test_video_showinfo_timestamps():
     from autolabel.video import _parse_showinfo_times

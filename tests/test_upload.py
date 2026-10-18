@@ -110,6 +110,53 @@ def test_upload_respects_size_cap(server):
         ReviewHandler.max_upload_mb = original
 
 
+def test_oversized_upload_reports_limit_instead_of_broken_pipe(server, dataset):
+    """超限请求必须把请求体读干净再回 413。
+
+    只回状态码就断开的话，客户端还在往 socket 里塞剩下几 MB，
+    看到的是 Broken pipe / 网络错误，用户根本不知道是体积超限。
+    """
+    base, _store = server
+    original = ReviewHandler.max_upload_mb
+    ReviewHandler.max_upload_mb = 1
+    try:
+        payload = jpeg_bytes(7) * 40  # 约 2.3 MB，明确超过下面设的 1 MB 上限
+        assert len(payload) > 2 * 1024 * 1024  # 明确超过 1 MB 上限
+        status, _headers, body = upload(base, "big.mp4", payload)
+        assert status == 413, body
+        assert "上限" in json.loads(body)["error"]
+    finally:
+        ReviewHandler.max_upload_mb = original
+
+    uploads = os.path.join(dataset, ".autolabel", "uploads")
+    assert os.listdir(uploads) == []  # 半截文件已清掉
+    status, _headers, body = call(base, "/api/dataset")  # 连接状态没被打乱
+    assert status == 200, body
+    assert len(json.loads(body)["items"]) == 2
+
+
+def test_multi_megabyte_upload_is_written_whole(server, dataset):
+    """流式落盘后字节数必须和上传内容完全一致（边读边写最容易掉尾）。"""
+    base, _store = server
+    payload = jpeg_bytes(11) * 40  # 跨过分块边界，验证尾块没有掉
+    status, _headers, body = upload(base, "clip.mp4", payload)
+    assert status == 200, body
+    info = json.loads(body)
+    assert info["bytes"] == len(payload)
+    stored = os.path.join(dataset, ".autolabel", "uploads", info["stored"])
+    assert os.path.getsize(stored) == len(payload)
+
+
+def test_oversized_unsupported_type_still_drains_body(server):
+    """类型不支持时也要读完请求体，否则下一个请求会读到上一个的尾巴。"""
+    base, _store = server
+    status, _headers, body = upload(base, "payload.exe", b"MZ" * (2 << 20))
+    assert status == 400, body
+    assert "不支持" in json.loads(body)["error"]
+    status, _headers, body = call(base, "/api/dataset")
+    assert status == 200, body
+
+
 def test_submit_missing_upload_file_returns_404(server):
     base, _store = server
     status, _headers, body = call(base, "/api/jobs", data=json.dumps(

@@ -149,7 +149,7 @@ function renderFilmstrip() {
       + (it.status === "rejected" ? " rejected" : "");
     div.title = it.image + "\n优先级 " + it.priority + "\n" + it.flags.map(flagLabel).join("、");
     const img = document.createElement("img");
-    img.src = "/image/" + encodeURIComponent(it.image);
+    img.src = "/thumb/" + encodeURIComponent(it.image);
     img.loading = "lazy";
     div.appendChild(img);
     const meta = document.createElement("span");

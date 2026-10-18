@@ -46,7 +46,7 @@ yolo detect train
 
 ```bash
 python3 -m pip install -r requirements.txt   # 已有 torch/ultralytics 可跳过
-python3 -m pytest tests -q                    # 303 项测试，约 54 秒
+python3 -m pytest tests -q                    # 317 项测试，约 43 秒
 # 其中 5 项端到端用例需要 models/yolo11n-pose.pt 与 models/bus.jpg，缺权重时会自动跳过（`-rs` 可看到原因）
 ```
 
@@ -143,7 +143,7 @@ class_id cx cy w h  x1 y1 v1  x2 y2 v2 ... x17 y17 v17
 - **启动对账**：启动时先按库自动 `migrate`（老布局升级；纯姿态数据集这种「没有提示词条目可搬」的老目录也会顺手补一本空的 `.autolabel/objects/index.json`，否则复核服务会因缺索引起不来），再逐库对账——导入/标注中途被打断时（重启服务、Ctrl+C、断电），已落盘但没进索引的图片会补回它自己库的索引并挂到那个批次上，无人认领的"标注中"批次判定为**已中断**，工作台顶部写清补回多少张；某库还在标注时另一个库不会抢走它的孤儿素材，`--keep-files` 保留的文件不会被误当成孤儿。
 - **模型管理**（独立页 `/models`，快捷键 `M`，详见 `demo_docs/08-模型管理.md`）：**模型目录**列出 13 档可下载模型（YOLO11 / YOLOv8 / YOLO26 各档的中文说明、参数规模、mAP、预计体积、关键点集、适合场景），带中文备注说明与「设为默认」，行内直接下载并留完整下载记录（URL、镜像、SHA256 是否一致、字节数、耗时）；**权重文件**区块管就绪状态、半截残留与勾选删除（不误删正被任务占用的）；**多模态大模型**区块配置本地（Ollama / LM Studio / vLLM / OpenAI 兼容）或云端（OpenAI、阿里云 DashScope 等）服务，保存前一键连通性验证。API Key 明文单独存 `~/.autolabel/secrets.json`，配置文件里只有引用名、界面永远显示掩码。配好的多模态配置会出现在上传弹层的模型下拉框里，选中即用大模型标骨骼（命令行 `--vlm <配置名>`），结果打 `vlm_labeled` 标记进人工复核清单
 
-上传细节：文件先落到 `.autolabel/uploads/`（任务成功后清理），单文件默认上限 1024 MB，可用 `review --max-upload-mb` 调整；后台同一时刻只跑一个标注任务，任务进行期间接受/驳回按钮会暂时锁住，完成后列表自动刷新；点 **清除任务** 可中途取消。命令行导入用 `--batch-name "十月聚会"` 自定义批次名，方便日后整批管理。
+上传细节：文件按 1 MB 分块边收边写进 `.autolabel/uploads/`（任务成功后清理，不会整份进内存），单文件默认上限 1024 MB，可用 `review --max-upload-mb` 调整——超限时服务端会把请求体读干净再回 413，界面显示体积上限而不是「网络错误」；焦点队列拉的是 `.autolabel/thumbs/` 里的 320px 小图（可随手删的缓存），主图仍是全分辨率；后台同一时刻只跑一个标注任务，任务进行期间接受/驳回按钮会暂时锁住，完成后列表自动刷新；点 **清除任务** 可中途取消。命令行导入用 `--batch-name "十月聚会"` 自定义批次名，方便日后整批管理。
 
 状态字段：`unreviewed`（未复核）→ `edited`（人工改过）/ `approved`（接受）/ `rejected`（驳回），界面上统一显示中文（两个库共用 `common.js` 里的一份词表），导出默认排除 `rejected`，加 `--only-approved` 只导出确认过的样本。界面筛选默认「待复核」= 未复核 **+ 已修改**，改过但没接受的帧不会从队列里消失。
 
@@ -196,7 +196,7 @@ python3 -m autolabel prompt $D --export                          # 提示词：�
 yolo pose train data=$D/exports/<时间戳>/data.yaml model=yolo11s-pose.pt epochs=100 imgsz=640
 ```
 
-默认剔除 `rejected`、按 2:1 切 train/val 且至少留 1 张验证图；接口是 `POST /api/export`（`scope=reviewed|approved|all`），没有骨骼标签时直接返回人话提示而不是空目录。
+默认剔除 `rejected`、按 2:1 切 train/val 且至少留 1 张验证图；**验证集成员按 `(seed, 相对路径)` 哈希定**，后来补图不会把老验证图换进训练集，两次导出的指标可以对比。接口是 `POST /api/export`（`scope=reviewed|approved|all`），没有骨骼标签时直接返回人话提示而不是空目录。
 标签没改动时重复点导出会直接复用最近一份（提示「标签没有变化，已复用上次导出」），不会堆重复目录。产物路径不会只闪一次：模块页顶栏下面与门户导出行常驻「上次导出（时间）路径 · N 训练 / M 验证」，附 **在访达中显示**、**复制路径** 与 **复制训练命令**（来自 `GET /api/dataset` 的 `exports_recent`，扫 `exports/` 取最近 8 份）；导出成功后后端还会调系统文件管理器自动打开一次目录（`POST /api/export/reveal`，只认 `exports/` 下的路径）。细节见 `demo_docs/03-坐标文件说明.md`。
 
 ## 坐标文件导出
@@ -256,10 +256,11 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 │   ├── qc.py             统计、优先级排序、报告与叠加图
 │   ├── export.py         train/val 划分、data.yaml、COCO JSON
 │   ├── coords.py         CSV / 长表 / JSONL 坐标文件导出
-│   ├── video.py          ffmpeg 抽帧
+│   ├── video.py          ffmpeg 抽帧（带超时，坏文件不再挂死后台）
+│   ├── thumbs.py         队列缩略图缓存（`.autolabel/thumbs/`，长缓存）
 │   ├── image_utils.py    读图、dHash、骨架绘制
 │   └── static/           前端：portal 工作台 / app 姿态标注 / objects 提示词标注 / models 模型管理 / common 共用件
-├── tests/                303 项测试（含端到端与回归）
+├── tests/                317 项测试（含端到端与回归）
 ├── configs/default.yaml  参数模板
 ├── configs/vlm.json      多模态大模型配置（不含明文 Key，建议不入库）
 ├── configs/models.json   模型登记表（备注/默认值/本地登记/下载记录，本机状态，不入库）

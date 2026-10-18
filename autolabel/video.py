@@ -10,11 +10,36 @@ import tempfile
 from typing import List, Optional, Tuple
 
 
+# ffprobe 只是读元信息，正常不到 1 秒；卡住基本等于文件损坏或挂载盘失联
+PROBE_TIMEOUT = 60
+# 抽帧超时下限/上限（秒）：真实长视频要留够时间，但绝不能无限占住后台任务线程
+FFMPEG_TIMEOUT_MIN = 300.0
+FFMPEG_TIMEOUT_MAX = 3600.0
+
+
 def ffmpeg_bin() -> str:
     path = shutil.which("ffmpeg")
     if not path:
         raise RuntimeError("未找到 ffmpeg，请先安装（brew install ffmpeg）")
     return path
+
+
+def ffmpeg_timeout(span: float = 0.0) -> float:
+    """本次抽帧的超时秒数：按要处理的片段长度推导，可用环境变量覆盖。
+
+    默认给「片段时长的 4 倍 + 5 分钟」，低配 CPU 上跑 4K 长视频也够；
+    ``AUTOLABEL_FFMPEG_TIMEOUT`` 设为正数时直接用它（调试/大机器逃生阀）。
+    """
+    override = str(os.environ.get("AUTOLABEL_FFMPEG_TIMEOUT") or "").strip()
+    if override:
+        try:
+            wanted = float(override)
+        except ValueError:
+            wanted = 0.0
+        if wanted > 0:
+            return wanted
+    span = max(0.0, float(span or 0.0))
+    return min(FFMPEG_TIMEOUT_MAX, max(FFMPEG_TIMEOUT_MIN, FFMPEG_TIMEOUT_MIN + span * 4))
 
 
 def probe_video(path: str) -> dict:
@@ -28,7 +53,11 @@ def probe_video(path: str) -> dict:
            "-show_entries", "stream=width,height,nb_frames,avg_frame_rate,duration",
            "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1", path]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True,
+                             stdin=subprocess.DEVNULL, timeout=PROBE_TIMEOUT).stdout
+    except subprocess.TimeoutExpired:
+        print(f"[warn] ffprobe 超过 {PROBE_TIMEOUT} 秒未返回，跳过元信息读取: {os.path.basename(path)}")
+        return info
     except subprocess.CalledProcessError as exc:
         print(f"[warn] ffprobe 失败: {exc.stderr.strip()[:200]}")
         return info
@@ -119,7 +148,15 @@ def _run_ffmpeg(
     cmd += ["-frames:v", str(int(max_frames)), "-q:v", "2", "-start_number", "0",
             os.path.join(tmp, "%06d.jpg")]
     print("[info] ffmpeg: " + " ".join(cmd[-6:]))
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    limit = ffmpeg_timeout((duration or 0.0) if duration else (info.get("duration") or 0.0))
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=limit)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"抽帧超过 {int(limit)} 秒被中止，视频可能损坏或过长；"
+            "可用环境变量 AUTOLABEL_FFMPEG_TIMEOUT 放宽上限（单位秒）"
+        ) from None
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg 抽帧失败: {proc.stderr.strip()[:400]}")
     frames = sorted(f for f in os.listdir(tmp) if f.lower().endswith(".jpg"))

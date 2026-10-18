@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 import re
 import threading
@@ -18,6 +19,8 @@ from .batches import attach_items, batch_name, create_batch, display_name, finis
 
 from .library import LIB_OBJECTS, LIB_POSE
 
+UPLOAD_CHUNK = 1 << 20  # 上传落盘时的分块大小：1 MB
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".flv", ".wmv",
               ".mts", ".m2ts", ".ts", ".mpg", ".mpeg", ".3gp"}
@@ -25,6 +28,10 @@ VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".flv", ".wmv",
 _SAFE = re.compile(r"[^0-9A-Za-z._\u4e00-\u9fff-]+")
 
 DEFAULT_MAX_UPLOAD_MB = 1024
+
+
+class UploadTooLarge(ValueError):
+    """上传体积超过单文件上限；请求体已经读干净，可以安全地回 413。"""
 
 
 class JobCancelled(Exception):
@@ -61,18 +68,76 @@ def save_upload(root: str, name: str, data: bytes, max_mb: int = DEFAULT_MAX_UPL
     """把上传字节写入 uploads 目录，返回带唯一名的存储信息。"""
     if not data:
         raise ValueError("空文件")
-    if len(data) > max_mb * 1024 * 1024:
-        raise ValueError(f"文件超过 {max_mb} MB 上限")
+    return save_upload_stream(root, name, io.BytesIO(data), len(data), max_mb=max_mb)
+
+
+def save_upload_stream(root: str, name: str, source, length: int,
+                       max_mb: int = DEFAULT_MAX_UPLOAD_MB) -> dict:
+    """边读边写把上传落盘，最多消费 ``length`` 字节后返回。
+
+    两条硬性约定，缺一条就会带来线上故障：
+
+    1. **必须把 length 字节读干净**（哪怕已经判定超限或类型不支持）才允许返回或抛错。
+       HTTP/1.1 复用连接时，残留在 socket 里的请求体会被下一个请求当成请求行，
+       客户端只能看到 ``Broken pipe``，界面上就只剩「网络错误」。
+    2. **不能整份进内存**：浏览器一次拖几十条录像很常见，整份 read 会带来和模型
+       抢内存的瞬时尖峰，所以这里分块读写。
+    """
+    if length <= 0:
+        raise ValueError("空文件")
     safe = safe_upload_name(name)
     ext = os.path.splitext(safe)[1].lower()
     kind = kind_for(ext)
     if not kind:
+        _drain(source, length)
         raise ValueError(f"不支持的文件类型: {ext or safe}（图片 {sorted(IMAGE_EXTS)} / 视频 {sorted(VIDEO_EXTS)}）")
+    limit = max(0, int(max_mb)) * 1024 * 1024
     stored = f"{uuid.uuid4().hex[:8]}_{safe}"
     path = os.path.join(uploads_dir(root), stored)
-    with open(path, "wb") as fh:
-        fh.write(data)
-    return {"ok": True, "stored": stored, "name": safe, "kind": kind, "bytes": len(data)}
+    received = 0
+    too_large = False
+    try:
+        with open(path, "wb") as fh:
+            while received < length:
+                chunk = source.read(min(UPLOAD_CHUNK, length - received))
+                if not chunk:
+                    break  # 客户端提前断开，剩下的按中断处理
+                received += len(chunk)
+                if too_large:
+                    continue
+                if received > limit:
+                    too_large = True
+                    continue
+                fh.write(chunk)
+    except OSError as exc:
+        raise ValueError(f"保存上传文件失败: {exc}") from exc
+    finally:
+        if received < length:
+            _drain(source, length - received)
+    if received != length:
+        _discard(path)
+        raise ValueError(f"上传中断：收到 {received} / {length} 字节")
+    if too_large:
+        _discard(path)
+        raise UploadTooLarge(f"文件超过 {max_mb} MB 上限")
+    return {"ok": True, "stored": stored, "name": safe, "kind": kind, "bytes": received}
+
+
+def _drain(source, length: int) -> None:
+    """丢弃请求体里剩余的字节，保证连接可以安全复用。"""
+    remaining = max(0, int(length))
+    while remaining > 0:
+        chunk = source.read(min(UPLOAD_CHUNK, remaining))
+        if not chunk:
+            return
+        remaining -= len(chunk)
+
+
+def _discard(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 @dataclass

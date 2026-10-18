@@ -100,6 +100,11 @@ def deleted_dir(root: str) -> str:
     return os.path.join(meta_dir(root), "deleted")
 
 
+def thumbs_dir(root: str) -> str:
+    """队列缩略图缓存目录：可随时删，缺了就地重新生成。"""
+    return os.path.join(meta_dir(root), "thumbs")
+
+
 # --- 每个库一份 ------------------------------------------------------------ #
 
 def index_path(root: str, lib: Optional[str] = LIB_POSE) -> str:

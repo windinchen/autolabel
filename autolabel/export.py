@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import random
 import time
 import shutil
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -54,14 +53,15 @@ def export_dataset(
         else:
             populated.append((rel, item))
 
-    rng = random.Random(seed)
-    rng.shuffle(populated)
-    rng.shuffle(empty)
+    # 划分只认每张图自己的哈希名次，不整表 shuffle，理由见 split_val_set()
+    populated = rank_for_split(populated, seed)
+    empty = rank_for_split(empty, seed)
     keep_empty = int(len(populated) * max_empty_ratio / max(1e-6, 1 - max_empty_ratio)) if populated else len(empty)
     empty = empty[:max(0, keep_empty)]
     skipped.extend((rel, "背景图超出比例上限") for rel, _ in empty[max(0, keep_empty):])
 
     selected = populated + empty
+    val_set = split_val_set([rel for rel, _item in selected], val_ratio, seed)
     fingerprint = content_fingerprint(
         [(rel, _read_label(root, rel)) for rel, _item in selected],
         params=json.dumps({"val_ratio": val_ratio, "seed": seed,
@@ -73,13 +73,6 @@ def export_dataset(
         reused = find_reusable_export(root, fingerprint, kind="pose")
         if reused is not None:
             return reused
-    # 至少留 1 张验证图，否则 `yolo pose train` 的 val 阶段是空的，拿不到 pose 指标
-    if len(selected) < 2:
-        val_n = 0
-    else:
-        val_n = max(1, min(len(selected) - 1, int(round(len(selected) * val_ratio))))
-    val_set = {rel for rel, _ in selected[:val_n]}
-
     tag = tag or now_str().replace(" ", "_").replace(":", "")
     if out:
         out_root = os.path.abspath(out)
@@ -154,6 +147,42 @@ def export_dataset(
     return {"out": out_root, **counts, "skipped": len(skipped),
             "train_images": counts["train"], "val_images": counts["val"],
             "coords": coord_out}
+
+
+def split_bucket(seed: int, rel: str) -> int:
+    """单张图的划分桶（0..999999）：只由 ``seed`` + 相对路径决定，与别的数据无关。"""
+    digest = hashlib.sha256(f"{seed}|{rel}".encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % 1_000_000
+
+
+def split_val_set(images: Sequence[str], val_ratio: float, seed: int) -> set:
+    """按每张图自己的哈希桶决定 val，而不是把整表 shuffle 后取前 N 张。
+
+    整表 shuffle 的名次取决于「这次一共有多少张」：素材越标越多、每次重导一次，
+    上一版还在 val 的这帧就可能掉进 train——同一帧既被训练又被用来算指标，
+    两次的指标也就没法比较。哈希桶只跟 (seed, 相对路径, val_ratio) 有关，
+    数据集再怎么长，已定过划分的图都不搬家（val 只会新增，不会来回翻）。
+
+    代价是 val 张数会围绕 ``val_ratio`` 小幅波动（小数据集更明显），
+    换来的是划分可复现、可增量。仍然保住两条老保证：至少 1 张 val
+    （否则 ``yolo pose train`` 的 val 阶段是空的、拿不到指标）、至少 1 张 train。
+    """
+    pool = list(images)
+    if len(pool) < 2 or float(val_ratio) <= 0:
+        return set()
+    cut = max(1, min(999_999, int(round(float(val_ratio) * 1_000_000))))
+    ranked = sorted(pool, key=lambda rel: (split_bucket(seed, rel), rel))
+    val = {rel for rel in ranked if split_bucket(seed, rel) < cut}
+    if not val:
+        val = {ranked[0]}
+    if len(val) == len(ranked):
+        val.discard(ranked[-1])
+    return val
+
+
+def rank_for_split(items, seed: int, key=lambda item: item[0]):
+    """按划分桶排序：让 manifest 顺序与背景图抽样也稳定（姿态库传元组，提示词库传字典）。"""
+    return sorted(items, key=lambda item: (split_bucket(seed, key(item)), str(key(item))))
 
 
 def unique_export_dir(path: str) -> str:

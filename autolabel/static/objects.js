@@ -191,7 +191,7 @@ function renderFilmstrip() {
       + "\n框 " + (it.prompt_objects === null || it.prompt_objects === undefined ? "未标" : it.prompt_objects)
       + "\n" + (it.prompt_flags || []).map(flagLabel).join("、");
     const img = document.createElement("img");
-    img.src = "/image/" + encodeURIComponent(it.image);
+    img.src = "/thumb/" + encodeURIComponent(it.image);
     img.loading = "lazy";
     const meta = document.createElement("span");
     meta.className = "thumb-meta";
