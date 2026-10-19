@@ -87,11 +87,13 @@ const extOf = (name) => {
 const isVideo = (f) => VIDEO_EXTS.includes(extOf(f.name)) || /^video\//.test(f.type);
 const isImage = (f) => IMAGE_EXTS.includes(extOf(f.name)) || /^image\//.test(f.type);
 
+// 模块清单只有一个来源：顶栏标签、「⋯」菜单里的跳转都从这儿渲染，icon 也给同一份。
+// 左侧竖条不再放模块跳转（理由见 ensureMenuModules 上方那段），省得五页各写一份、图标各撞各的。
 const MODULES = [
-  { id: "pose", href: "/pose", name: "姿态标注", desc: "人体骨骼关键点复核" },
-  { id: "objects", href: "/objects", name: "提示词标注", desc: "大模型按你写的描述找物品" },
-  { id: "detect", href: "/detect", name: "目标检测标注", desc: "本地 YOLO 权重按自带类别出框" },
-  { id: "models", href: "/models", name: "模型管理", desc: "搜模型、下载权重、多模态配置" },
+  { id: "pose", href: "/pose", name: "姿态标注", desc: "人体骨骼关键点复核", icon: "ic-pose" },
+  { id: "objects", href: "/objects", name: "提示词标注", desc: "大模型按你写的描述找物品", icon: "ic-prompt" },
+  { id: "detect", href: "/detect", name: "目标检测标注", desc: "本地 YOLO 权重按自带类别出框", icon: "ic-boxes" },
+  { id: "models", href: "/models", name: "模型管理", desc: "搜模型、下载权重、多模态配置", icon: "ic-cube" },
 ];
 
 // 状态词只在界面层统一，写回后端的仍是 approved / edited 这些原值；两页共用一份，避免各写各的
@@ -605,52 +607,35 @@ function bindModalKeys() {
   }, true);
 }
 
-/** 左侧竖条里补上缺的模块入口。
+/** 「⋯」菜单里的模块跳转：各页只留一个 #menu-modules 占位，链接按 MODULES 生成。
  *
- *  竖条是各页写死的 HTML，加一个二级模块就要改五个文件，漏掉的那页等于没有入口
- *  （上次加提示词标注时模型管理页就漏了）。这里按 MODULES 兜底补齐：
- *  页面自己写好了就不动，缺了才插到「提示词标注」后面，位置和各页保持一致。
- */
-function ensureRailModules() {
-  const rail = $("rail");
-  if (!rail) { return; }
-  for (const item of MODULES) {
-    if (rail.querySelector('a[href="' + item.href + '"]')) { continue; }
-    const link = document.createElement("a");
-    link.className = "iconbtn";
-    link.href = item.href;
-    link.title = item.name + " · " + item.desc;
-    link.innerHTML = '<svg class="ic"><use href="#ic-boxes"/></svg>';
-    const anchor = rail.querySelector('a[href="/objects"]') || rail.querySelector("a[href]");
-    if (anchor) { anchor.after(link); } else { rail.prepend(link); }
-  }
-}
-
-/** 「⋯」菜单里的模块跳转写死在各页 HTML 里，新增加一个库时在这里补齐：
+ *  以前每页自己写死，加一个库就得改五个文件，漏掉的那页等于没有入口；模型管理页
+ *  还因为只写了两条，多出来的那条被兜底代码插到了「关于」底下。现在插入位置由
+ *  HTML 里的占位说了算，各页顺序一致。
  *
- *  否则哪页的 HTML 还没来得及改，用户从那页就跳不去新模块。已有同 href 的不重复加。
+ *  左侧竖条同时也不再挂模块跳转：那边曾经凭空多出几枚和别页同形的方框图标、
+ *  而且永远不亮，五枚一样的框摆在那儿，反而看不出自己在哪一页。模块入口只留
+ *  顶栏中文标签（好认）和这里两处，竖条只管本页自己的弹层。
  */
 function ensureMenuModules() {
-  const menu = $("more-menu");
-  if (!menu) { return; }
+  const host = $("menu-modules");
+  if (!host) { return; }
   const page = document.body.dataset.page || "";
-  const missing = MODULES.filter((item) => item.id !== page
-    && !menu.querySelector('a[href="' + item.href + '"]'));
-  if (!missing.length) { return; }
-  const anchor = $("btn-settings") || menu.lastElementChild;
-  if (!anchor) { return; }
+  host.innerHTML = "";
+  const items = MODULES.filter((item) => item.id !== page);
+  if (!items.length) { return; }
   const label = document.createElement("div");
   label.className = "menu-label";
-  label.textContent = "其他模块";
-  anchor.before(label);
-  for (const item of missing) {
+  label.textContent = "去别的模块";
+  host.append(label);
+  for (const item of items) {
     const link = document.createElement("a");
     link.className = "menu-item";
     link.href = item.href;
     link.title = item.desc;
-    link.innerHTML = '<svg class="ic"><use href="#ic-boxes"/></svg>';
+    link.innerHTML = '<svg class="ic"><use href="#' + (item.icon || "ic-boxes") + '"/></svg>';
     link.append(document.createTextNode(item.name));
-    anchor.before(link);
+    host.append(link);
   }
 }
 
@@ -671,7 +656,6 @@ function initNav() {
   }
   const brand = $("nav-portal");
   if (brand) brand.href = "/";
-  ensureRailModules();
   ensureMenuModules();
   bindConfirmBox();
   bindModalKeys();

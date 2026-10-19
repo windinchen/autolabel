@@ -33,10 +33,15 @@
   <symbol id="ic-boxes" viewBox="0 0 16 16"><rect x="2" y="3.2" width="12" height="9.6" rx="1.4"/><path d="M5.6 10.4 7.4 7.6l1.8 2.2 1.4-2 1.4 2.6"/></symbol>
   <symbol id="ic-cube" viewBox="0 0 16 16"><path d="M8 1.8 14 5v6l-6 3.2L2 11V5l6-3.2ZM2 5l6 3.2L14 5M8 8.2v6"/></symbol>
   <symbol id="ic-key" viewBox="0 0 16 16"><rect x="1.6" y="4" width="12.8" height="8" rx="1.4"/><path d="M4.2 6.6h.01M6.6 6.6h.01M9 6.6h.01M11.4 6.6h.01M4.2 9.4h7.6"/></symbol>
+  <symbol id="ic-run" viewBox="0 0 16 16"><path d="M5 3.2 12.6 8 5 12.8V3.2Z"/></symbol>
   <symbol id="ic-target" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2.4M8 12.8v2.4M.8 8h2.4M12.8 8h2.4"/></symbol>
   <symbol id="ic-undo" viewBox="0 0 16 16"><path d="M3 7.4h6.4a3.2 3.2 0 0 1 0 6.4H5.6M3 7.4l2.8-2.8M3 7.4l2.8 2.8"/></symbol>
   <symbol id="ic-check" viewBox="0 0 16 16"><path d="m3.2 8.4 3.2 3.2 6.4-7.2"/></symbol>
   <symbol id="ic-cross" viewBox="0 0 16 16"><path d="M3.6 3.6l8.8 8.8M12.4 3.6l-8.8 8.8"/></symbol>  <symbol id="ic-refresh" viewBox="0 0 16 16"><path d="M13.4 8a5.4 5.4 0 1 1-1.6-3.8"/><path d="M12.2 1.4v2.9H9.3"/></symbol>  <symbol id="ic-gear" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.3"/><path d="M8 1.3v2.1M8 12.6v2.1M1.3 8h2.1M12.6 8h2.1M3.3 3.3l1.5 1.5M11.2 11.2l1.5 1.5M12.7 3.3l-1.5 1.5M4.8 11.2l-1.5 1.5"/></symbol>
+  <symbol id="ic-pose" viewBox="0 0 16 16"><circle cx="8" cy="3" r="1.7"/><path d="M8 4.7v4.2M4.6 6.6h6.8M8 8.9 5.6 13.8M8 8.9l2.4 4.9"/></symbol>
+  <symbol id="ic-prompt" viewBox="0 0 16 16"><path d="M2.1 2.1h5.6l6.2 6.2a1.3 1.3 0 0 1 0 1.85l-3.95 3.95a1.3 1.3 0 0 1-1.85 0L2.1 7.7V2.1Z"/><path d="M5.2 5.2h.01"/></symbol>
+  <symbol id="ic-home" viewBox="0 0 16 16"><path d="M2.3 7.1 8 2.4l5.7 4.7v6.1a1 1 0 0 1-1 1H3.3a1 1 0 0 1-1-1V7.1Z"/><path d="M6.3 13.9V9.4h3.4v4.5"/></symbol>
+  <symbol id="ic-list" viewBox="0 0 16 16"><path d="M6.4 4.1h7.4M6.4 8h7.4M6.4 11.9h7.4M2.6 4.1h.01M2.6 8h.01M2.6 11.9h.01"/></symbol>
 </svg>
 
 <header>
@@ -57,6 +62,9 @@
         搜帧或命令<span class="kbd">⌘K</span>
       </button>
     </div>
+    <button class="btn" id="btn-run" title="把库里已经有的图批量跑一遍姿态标注，不用重传素材（G）">
+      <svg class="ic"><use href="#ic-run"/></svg>批量姿态标注
+    </button>
     <button class="btn primary" id="btn-upload" title="导入图片 / 目录 / 视频（W）">
       <svg class="ic"><use href="#ic-upload"/></svg>导入素材
     </button>
@@ -93,6 +101,8 @@
         <button class="menu-item" id="btn-export-yolo"
           title="导出 YOLO 标准训练集：images/{train,val} + labels/{train,val} + data.yaml，可直接 yolo pose train（已驳回的默认剔除）">
           YOLO 训练集</button>
+        <div class="menu-sep"></div>
+        <div id="menu-modules"></div>
         <div class="menu-label">关于</div>
         <div class="menu-field muted small"><span>版本</span><span class="mono" id="about-version">—</span></div>
         <div class="menu-field muted small"><span>开发者</span><a id="about-dev"
@@ -128,11 +138,9 @@
   <div id="rail">
     <button class="iconbtn on" id="rail-queue" title="焦点队列"><svg class="ic"><use href="#ic-target"/></svg></button>
     <button class="iconbtn" id="rail-upload" title="导入素材（W）"><svg class="ic"><use href="#ic-upload"/></svg></button>
+    <button class="iconbtn" id="rail-run" title="批量姿态标注（G）"><svg class="ic"><use href="#ic-run"/></svg></button>
     <button class="iconbtn" id="rail-batches" title="批次管理（B）"><svg class="ic"><use href="#ic-layers"/></svg></button>
-    <span class="sep"></span>
-    <a class="iconbtn" href="/objects" title="提示词标注（O）"><svg class="ic"><use href="#ic-boxes"/></svg></a>
-    <a class="iconbtn" href="/models" title="模型管理（M）"><svg class="ic"><use href="#ic-cube"/></svg></a>
-    <span class="sep"></span>
+    <span class="rail-spacer"></span>
     <button class="iconbtn" id="rail-help" title="快捷键速查（?）"><svg class="ic"><use href="#ic-key"/></svg></button>
   </div>
 
@@ -240,6 +248,7 @@
         <div><span>⌥S</span><span>系统设置（外观 + 推理参数）</span></div>
       <div><span>B</span><span>批次管理</span></div>
       <div><span>W</span><span>导入素材</span></div>
+      <div><span>G</span><span>批量姿态标注（库里已有的图，不用重传）</span></div>
       <div><span>O</span><span>提示词标注页</span></div>
       <div><span>M</span><span>模型管理页</span></div>
     </div>
@@ -297,6 +306,41 @@
     </div>
     <div class="progress"><div id="up-bar" class="bar"></div></div>
     <div id="up-log" class="mono"></div>
+  </div>
+</div>
+
+<div id="run-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title">批量姿态标注<span class="muted small"> · 库里已经有的图直接跑权重，不需要重传素材</span></div>
+    <div class="param-row">
+      <label class="muted small">权重 / 大模型
+        <select id="run-model"></select>
+      </label>
+      <label class="muted small">置信度阈值
+        <input type="number" id="run-conf" value="0.25" min="0.01" max="0.95" step="0.05">
+      </label>
+      <label class="muted small">范围
+        <select id="run-scope">
+          <option value="unlabeled" selected>只标还没标过的</option>
+          <option value="all">整个姿态库</option>
+          <option value="filtered">当前筛选结果</option>
+        </select>
+      </label>
+      <label class="muted small">最多张数 <input type="number" id="run-limit" value="0" min="0" max="5000"
+             title="0 = 不限"></label>
+      <label class="muted small" title="勾了才会重标已标过的图，连人工接受过的也一起覆盖">
+        <input type="checkbox" id="run-overwrite"> 覆盖已标注的骨骼
+      </label>
+    </div>
+    <div class="muted small" id="run-model-note">权重下拉框的选项和「导入素材」里那一份同源，来自「模型管理」（按 <span class="mono">M</span> 配置）；分辨率与算力走「系统设置」，这里不重复设</div>
+    <div class="btn-row">
+      <button id="run-start" class="primary">开始标注</button>
+      <button id="run-clear-jobs" class="danger" disabled>清除任务</button>
+      <button id="run-export" title="标完导出 yolo pose 训练集">导出数据集</button>
+      <button id="run-close">关闭</button>
+    </div>
+    <div class="progress"><div id="run-bar" class="bar"></div></div>
+    <div id="run-log" class="mono"></div>
   </div>
 </div>
 

@@ -56,6 +56,7 @@ async function boot() {
   initNav();
   initShell();
   initUpload();
+  initRun();
   initBatches();
   initExports();
   window.addEventListener("keyup", (e) => { if (e.code === "Space") state.spaceDown = false; });
@@ -616,6 +617,7 @@ function onKeyDown(e) {
     case "]": cycleObject(1); break;
     case "b": case "B": openBatches(true); break;
     case "w": case "W": openUpload(true); break;
+    case "g": case "G": openRun(true); break;
     case "m": case "M": location.href = "/models"; break;
     case "o": case "O": location.href = "/objects"; break;
     case "0": case "1": case "2": setVisibility(parseInt(e.key, 10)); break;
@@ -748,6 +750,115 @@ function jumpFlagged(dir) {
 
 window.addEventListener("beforeunload", (e) => { if (state.dirty) { e.preventDefault(); e.returnValue = ""; } });
 boot();
+
+// --------------------------------------------------------------------------- //
+// 批量姿态标注：库里已经有的图直接跑权重
+//
+//  姿态页原来只有「导入素材」这一个能触发自动标注的口子。勾了「只入库不标注」
+//  传进来的图、或者换了档更重的权重想把库里重标一遍的，以前只能把素材整批重传，
+//  而重传会重新走一遍去重与抽帧，慢且容易和已复核的标签打架。
+//  提示词标注与目标检测标注两页早就有同形状的批量面板，这里补齐第三个。
+// --------------------------------------------------------------------------- //
+const run = { poll: null };
+
+function runLog(msg, isErr) {
+  appendLog("run-log", msg, isErr);
+}
+
+function openRun(open) {
+  const modal = $("run-modal");
+  if (!modal) { return; }
+  modal.classList.toggle("hidden", !open);
+  if (!open) { return; }
+  syncRunModels();
+}
+
+/** 权重下拉框和「导入素材」那一份同源：同一个数据集里不该出现两套可选项。 */
+function syncRunModels() {
+  const source = $("up-model");
+  const target = $("run-model");
+  if (!source || !target) { return; }
+  const previous = target.value;
+  target.innerHTML = source.innerHTML;
+  const keep = Array.from(target.options).find((o) => o.value === previous && !o.disabled);
+  if (keep) { target.value = previous; }
+  else if (source.value && Array.from(target.options).some((o) => o.value === source.value)) {
+    target.value = source.value;
+  }
+  const chosen = target.selectedOptions[0];
+  const note = $("run-model-note");
+  if (note && chosen && chosen.dataset.ready === "0") {
+    note.textContent = `${chosen.value} 的权重还没下全：任务开跑时会先下载，期间进度条不走，属正常`;
+  }
+}
+
+function runTargets() {
+  const scope = $("run-scope").value;
+  if (scope === "all") { return { images: [], note: "整个姿态库" }; }
+  if (scope === "filtered") {
+    return { images: state.list.map((row) => row.image), note: `当前筛选的 ${state.list.length} 张` };
+  }
+  return { images: [], note: "还没标过的那些（已标过且参数没变的自动跳过）" };
+}
+
+async function startRun() {
+  if (up.busy) { toast("已有任务在跑，先等它结束或点「清除任务」", true); return; }
+  const scope = $("run-scope").value;
+  const targets = runTargets();
+  if (scope === "filtered" && !targets.images.length) {
+    toast("当前筛选结果为空：换个筛选条件或改选「整个姿态库」", true);
+    return;
+  }
+  const chosen = $("run-model").selectedOptions[0];
+  const modelValue = $("run-model").value;
+  const vlmProfile = String(modelValue).indexOf("vlm:") === 0 ? modelValue.slice(4) : "";
+  if (chosen && chosen.dataset.ready === "0") {
+    runLog(vlmProfile
+      ? `提示：这条多模态配置最近一次连通性测试没通过，任务可能报连不上，先到「模型管理」点「测试」看看原因`
+      : `提示：${modelValue} 的权重还没下载完，首个任务会先下载权重，期间进度条不走，属正常`);
+  }
+  const conf = clamp(readNumber("run-conf", 0.25), 0.01, 0.95);
+  const limit = Math.round(readNumber("run-limit", 0));
+  const overwrite = $("run-overwrite").checked;
+  const ok = await confirmBox({
+    title: "批量姿态标注",
+    body: `权重 ${vlmProfile ? "多模态大模型 " + ((chosen && chosen.textContent) || modelValue) : modelValue}`
+      + ` · 置信度 ${conf} · 范围：${targets.note}`
+      + (limit ? ` · 最多 ${limit} 张` : "")
+      + (overwrite
+        ? "。已勾「覆盖已标注的骨骼」：已标过的会被重新生成，人工接受过 / 改过的也会一起覆盖。"
+        : "。没勾覆盖：已标过的、人工接受过的都原样留着，只补没标过的。"),
+    okLabel: "开始标注",
+  });
+  if (!ok) { return; }
+  if (state.dirty) await save(true);
+  let job;
+  try {
+    job = await postJson("/api/pose/run", {
+      // 权重原样送，含 vlm: 前缀：和「导入素材」那条共用一份参数，
+      // 同一批图两次标注的参数指纹才对得上，「只补没标过的」才不会整批重标
+      model: modelValue, vlm_profile: vlmProfile,
+      images: targets.images, conf, limit, overwrite,
+    });
+  } catch (err) {
+    runLog(`启动失败：${err.message}`, true);
+    toast(`启动失败：${err.message}`, true);
+    return;
+  }
+  runLog(`任务 ${job.id} 已启动 · ${job.file_count} 张`);
+  toast(`批量姿态标注已启动（${job.file_count} 张）`);
+  startJobPolling();
+}
+
+function initRun() {
+  if (!$("run-modal")) { return; }
+  $("btn-run").onclick = () => openRun(true);
+  $("run-close").onclick = () => openRun(false);
+  $("run-start").onclick = () => startRun();
+  $("run-clear-jobs").onclick = clearJobs;
+  $("run-export").onclick = () => exportYoloDataset($("run-export"));
+  $("run-model").onchange = syncRunModels;
+}
 
 // --------------------------------------------------------------------------- //
 // 上传素材（图片 / 图片目录 / 视频）+ 后台标注任务进度
@@ -928,7 +1039,9 @@ async function pollJobs() {
   }
   up.warm = true;
   setBusy(active.length > 0, active.length ? active[active.length - 1] : null);
-  $("up-bar").style.width = jobPercent(active) >= 0 ? (60 + jobPercent(active) * 0.4) + "%" : "100%";
+  const percent = jobPercent(active) >= 0 ? (60 + jobPercent(active) * 0.4) + "%" : "100%";
+  $("up-bar").style.width = percent;
+  if ($("run-bar")) { $("run-bar").style.width = percent; }
   if (!active.length) {
     stopJobPolling();
     $("up-start").disabled = up.files.length === 0;
@@ -960,7 +1073,7 @@ function setBusy(busy, job) {
     $("job-strip-text").textContent = (cancelling ? "取消中 · " : "")
       + `后台标注进行中 · 任务 ${job.id}${extra} · ${job.message}（期间请先别改标注，完成后列表会自动刷新）`;
   }
-  for (const id of ["strip-clear-jobs", "up-clear-jobs"]) {
+  for (const id of ["strip-clear-jobs", "up-clear-jobs", "run-clear-jobs"]) {
     const el = $(id);
     if (!el) continue;
     el.disabled = !busy || cancelling;
@@ -1540,6 +1653,7 @@ function initShell() {
       draw();
     },
     onUpload: () => openUpload(true),
+    onRun: () => openRun(true),
     onBatches: () => openBatches(true),
   });
   $("btn-batches").addEventListener("click", () => openMenu(false));
@@ -1559,6 +1673,7 @@ function poseCommands() {
     { label: "新增目标（拖框）", run: toggleAdd },
     { label: "适应窗口", key: "Z", run: () => { fitView(); draw(); } },
     { label: "导入素材", key: "W", run: () => openUpload(true) },
+    { label: "批量姿态标注（库里已有的图）", key: "G", run: () => openRun(true) },
     { label: "从素材池添加", run: () => openPool(true, POSE_LIB) },
     { label: "批次管理", key: "B", run: () => openBatches(true) },
     { label: "导出坐标 CSV", run: () => downloadHref("/api/coords?format=csv") },

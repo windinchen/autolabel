@@ -898,7 +898,8 @@ def batch_name(kind: str, names: Sequence[str], override: str = "") -> str:
     if override:
         return str(override)[:80]
     names = [str(n) for n in names if n]
-    label = {"video": "视频", "prompt": "提示词标注", "prompt_upload": "提示词素材",
+    label = {"video": "视频", "pose": "批量姿态标注", "prompt": "提示词标注",
+             "prompt_upload": "提示词素材",
              "detect": "目标检测标注", "detect_upload": "检测素材",
              "pool": "素材池"}.get(kind, "图片")
     count = len(names) or 1

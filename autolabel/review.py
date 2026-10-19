@@ -852,6 +852,41 @@ class ReviewStore:
         return detect.add_model_classes(self.root, str(payload.get("model") or ""),
                                         list(names) or None, str(payload.get("device") or ""))
 
+    def run_pose_job(self, payload: dict) -> dict:
+        """提交一次批量姿态标注：本库已有的图 → YOLO-pose 权重 → ``labels/``。
+
+        补的是姿态页一个一直缺的口子：以前只有「导入素材」会触发自动标注，
+        勾了「只入库不标注」传进来的图、或换了权重想重标的，只能把素材整批重传。
+        """
+        payload = payload or {}
+        self._refresh_if_changed()
+        images = [str(rel) for rel in (payload.get("images") or []) if str(rel).strip()]
+        if not images:
+            images = [rel for rel, _ in self.index.ordered_items()]
+        limit = int(self._number(payload, "limit", 0, 0, None, "标注张数上限", integer=True))
+        conf = None
+        if payload.get("conf") not in (None, ""):
+            conf = self._number(payload, "conf", 0.25, 0.0, 1.0, "置信度阈值")
+        if limit > 0:
+            images = images[:limit]
+        if not images:
+            raise ValueError(f"姿态库里还没有图片，先在「{lib_name(LIB_POSE)}」页导入素材")
+        params = {"overwrite": bool(payload.get("overwrite")),
+                  "model": str(payload.get("model") or ""),
+                  "batch_name": str(payload.get("batch_name") or "")[:80],
+                  "only": list(images)}
+        # 多模态标注骨骼是「导入素材」那条早就有的路子，这里得跟着走：
+        # 下拉框选中的 vlm:xxx 原样留在 model 里（参数指纹要和导入那条对上），
+        # vlm_profile 单独交给任务层解析成配置 ID，缺了这个就退回去加载 yolo 权重然后报缺文件。
+        if str(payload.get("vlm_profile") or "").strip():
+            params["vlm_profile"] = str(payload.get("vlm_profile")).strip()
+        if conf is not None:
+            params["conf"] = conf
+        if payload.get("device"):
+            params["device"] = str(payload.get("device"))
+        job = self.jobs.submit("pose", images, params)
+        return job.payload()
+
     def run_detect_job(self, payload: dict) -> dict:
         """提交一次批量检测：本库已有的图 → 本地权重 → ``detect_labels/``。"""
         payload = payload or {}
@@ -1664,6 +1699,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/prompt/undo":
                 self._send_json(self.store.undo_prompt(
                     image, normalize(payload.get("lib") or LIB_OBJECTS)))
+            elif parsed.path == "/api/pose/run":
+                self._send_json(self.store.run_pose_job(payload), status=202)
             elif parsed.path == "/api/detect/run":
                 self._send_json(self.store.run_detect_job(payload), status=202)
             elif parsed.path == "/api/detect/probe":

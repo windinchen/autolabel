@@ -1,4 +1,4 @@
-"""新壳层的界面契约：四个页面必须是同一套壳层、状态词只有一份、筛选项都得真的能筛、
+"""新壳层的界面契约：五个页面必须是同一套壳层、状态词只有一份、筛选项都得真的能筛、
 门户不许把实现细节当主词。
 
 这些都是 UI 重构里真踩过的坑：状态词表只写在姿态页导致提示词页整页报错，
@@ -338,7 +338,7 @@ def test_third_module_is_named_detection_labeling_everywhere():
     library = read_repo_file("library.py")
 
     assert 'name: "目标检测标注"' in common, "左侧导航与顶栏用的就是 MODULES 里这个名字"
-    assert 'name: "目标检测标注"' in objects and 'runLabel: "批量检测"' in objects
+    assert 'name: "目标检测标注"' in objects and 'runLabel: "批量目标检测标注"' in objects
     assert "<title>目标检测标注</title>" in detect_html
     assert '"批量目标检测"' not in objects + detect_html + portal
     assert 'LIB_NAMES = {' in library and 'LIB_DETECT: "目标检测标注"' in library
@@ -385,6 +385,12 @@ def test_catalog_refresh_is_wired_end_to_end():
     assert "async function refreshCatalog()" in source
     assert 'postJson("/api/modelhub/refresh"' in source
     assert 'renderCatalogSource();' in source
+    # 按钮里是「图标 + 两个 span」：整块 textContent 一写图标就没了，只能改内层那两个
+    assert 'id="model-catalog-refresh-text"' in html and 'id="model-catalog-refresh-time"' in html
+    refresh = source.split("async function refreshCatalog()", 1)[1].split("\n}", 1)[0]
+    assert "button.textContent =" not in refresh, "整块写 textContent 会把按钮里的图标抹掉"
+    assert "function paintCatalogRefresh()" in source and "paintCatalogRefresh();" in source
+    assert "核对于 " in source, "按钮上要写清上次核对的时间，不然没人知道该不该点"
     assert '"/api/modelhub/refresh"' in review and "refresh_model_catalog" in review
     assert "更新模型目录" in source, "命令面板也得找得到这件事"
 
@@ -399,3 +405,74 @@ def test_pose_dropdown_only_offers_pose_weights():
     assert "all.filter((r) => r.ready && r.compatible !== false)" in body
     for other in ("detect", "segment", "obb", "classify"):
         assert other not in body, f"姿态页的下拉框不该认识「{other}」权重"
+
+
+# --------------------------------------------------------------------------- //
+# 最左边那一竖条：只管本页动作，模块跳转只有一处代码在生成
+# --------------------------------------------------------------------------- //
+PAGES = ("portal.html", "review.html", "objects.html", "detect.html", "models.html")
+MODULE_HREFS = ('href="/"', 'href="/pose"', 'href="/objects"', 'href="/detect"', 'href="/models"')
+
+
+def rail_block(html):
+    block = re.search(r'<div id="rail">.*?\n  </div>', html, re.S)
+    assert block, "页面里没有左侧竖条"
+    return block.group(0)
+
+
+def test_module_jumps_are_generated_in_one_place_with_one_placeholder_per_page():
+    """模块跳转只由 MODULES 渲染，各页在「⋯」菜单里留一个占位。
+
+    以前每页自己写死一排，加一个库要改五个文件：模型管理页就漏过目标检测，
+    兜底代码又把补出来的那条插到「关于」底下，顺序和各页都不一样。
+    """
+    common = read("common.js")
+    assert "ensureRailModules" not in common, "竖条补图标的老路已废，不许引回来"
+    for page in PAGES:
+        assert '<div id="menu-modules"></div>' in read(page), f"{page} 缺模块跳转占位"
+
+
+def test_rail_holds_only_this_pages_own_actions():
+    """竖条不再挂模块跳转：五枚同形图标并排放，反而看不出自己在哪一页。
+
+    工作台那张「导入素材」是发起动作的捷径，不是模块定位，留着。
+    """
+    for page in PAGES:
+        rail = rail_block(read(page))
+        for href in MODULE_HREFS:
+            assert href not in rail, f"{page} 的竖条里还留着模块跳转 {href}"
+        assert "rail-spacer" in rail, f"{page} 的竖条没把帮助钉在底部"
+    assert 'href="/pose?upload=1"' in rail_block(read("portal.html"))
+
+
+def test_icons_say_one_thing_each():
+    """同一枚图标在不同页不许表示两件不同的事：类别管理和批次管理不能共用一摞纸。"""
+    for page in ("objects.html", "detect.html"):
+        rail = rail_block(read(page))
+        assert 'id="rail-fields" title="字段管理（1）"' in rail or \
+               'id="rail-fields" title="类别管理（1）"' in rail, page
+        assert "#ic-list" in rail, f"{page} 的类别/字段管理还在用批次那摞纸"
+        assert "#ic-layers" not in rail, f"{page} 的竖条里批次图标串场了"
+
+
+def test_selected_state_uses_the_right_language():
+    """天蓝说「你在这／选中的是这个」，琥珀说「这步该做／开关开着」，底色差一档在白天主题下等于没选。"""
+    css = read("app.css")
+    tab = re.search(r"\.nav-module\.active \{([^}]*)\}", css)
+    assert tab, "找不到顶栏当前模块的样式"
+    assert "--sky" in tab.group(1), "顶栏当前模块要用选中色，别只把底色调深一档"
+    toggle = re.search(r"\.iconbtn\.on \{([^}]*)\}", css)
+    assert toggle and "--amber" in toggle.group(1), "开关态的琥珀描边没了，28px 的小块亮不起来"
+    assert "border-color" in toggle.group(1)
+
+
+def test_pose_page_got_the_batch_panel_the_other_two_already_had():
+    """三个标注页都要能对着「库里已有的图」直接批量标注，快捷键同一枚 G。"""
+    html = read("review.html")
+    for anchor in ('id="btn-run"', 'id="rail-run"', 'id="run-modal"', 'id="run-scope"',
+                   'id="run-start"', 'id="run-log"', "批量姿态标注"):
+        assert anchor in html, f"review.html 缺 {anchor}"
+    source = read("app.js")
+    assert 'postJson("/api/pose/run"' in source and "function initRun()" in source
+    assert 'case "g": case "G": openRun(true)' in source
+    assert "initRun();" in source, "面板没接线的话按 G 只会静悄悄什么也不做"

@@ -27,7 +27,7 @@ const LIB_CONFIG = {
     name: "目标检测标注", fieldWord: "类别", classTable: "本库类别表",
     items: "detect_items", classes: "detect_classes", labelDir: "detect_labels/",
     runUrl: "/api/detect/run", uploadUrl: "/api/detect/upload",
-    runLabel: "批量检测", manageLabel: "类别管理",
+    runLabel: "批量目标检测标注", manageLabel: "类别管理",
     exportKind: "yolo_detect", emptyImage: "目标检测库还没有图片",
     note: "目标检测标注 = 本机 YOLO 权重按它自带的类别表（COCO-80 等）出框：不联网、单张几十毫秒，"
       + "类别由权重决定；要标权重不认识的东西，去「提示词标注」让多模态大模型按你写的描述找。",
@@ -1174,7 +1174,7 @@ function fieldLog(msg, isErr) {
 
 // --------------------------------------------------------------------------- //
 // 目标检测专属：本机权重 → 它自带的类别表 → 导进本库类别表
-// 界面顺序就是这里的调用顺序：先挑权重，再勾它认识的类别，「批量检测」只吃本库这张表。
+// 界面顺序就是这里的调用顺序：先挑权重，再勾它认识的类别，「批量目标检测标注」只吃本库这张表。
 // 这一节在提示词标注页是彻底的空操作（页面上没有 #cls-* / #*-model 这些元素）。
 // --------------------------------------------------------------------------- //
 
@@ -1351,7 +1351,8 @@ function renderProbeResult(data) {
       + "再把词换成更常见的英文写法（普通权重还得换开放词表权重）。";
   } else if (data.suggested_conf) {
     foot.textContent = `已经有词能出框；检不出框的词最高 ${data.missed_best}：把置信度降到 `
-      + data.suggested_conf + " 就一起标得出来，下面两个按钮照顺序点。";
+      + data.suggested_conf + " 就一起标得出来。先点「导入类别表」，再点「按建议阈值去标注」"
+      + "——后者会连这一档权重一起带进批量面板，不用你回去重选。";
   } else {
     foot.textContent = `${usable.length} 个词都已经能出框：导入类别表就能直接开跑。`;
   }
@@ -1384,14 +1385,45 @@ async function importProbedWords() {
   if (button) { button.disabled = false; }
 }
 
-/** 按建议阈值去标注：把算好的阈值填进批量面板并摊开它，省得用户回去手动改。 */
+/** 按建议阈值去标注：把**试词用的那一档权重**和算好的阈值一起带进批量面板。
+ *
+ *  只带阈值是不够的：试词用的是弹层里的 `probe-model`，批量面板用的是 `run-model`，
+ *  两个下拉框各存各的。实测就翻车在这儿——拿 `yolov8x-worldv2.pt` 试出「降到 0.12
+ *  就检得出」，点这个按钮后批量面板还停在 `yolo11n.pt`，阈值改了也白改，跑完一个
+ *  框都没有，看起来就像按钮坏了。
+ */
 function applyProbeSuggestion() {
   const data = probe.data || {};
+  const suggested = Number(data.suggested_conf) || 0;
+  const probed = String(data.model || ($("probe-model") || {}).value || "").trim();
   openProbe(false);
+  if (!suggested) {
+    // 没有"被阈值挡住"的词就没什么可降的：说一句清楚话，别默默打开面板当没事发生
+    toast("这些词不是被阈值挡住的：这个按钮只会降置信度。一个分都没给的词，"
+      + "要换更常见的英文写法，或换开放词表权重", true);
+    openRun(true);
+    return;
+  }
+  const panel = $("run-model");
+  const before = panel ? panel.value : "";
+  modelState.conf = clamp(suggested, 0.01, 0.95);
   const conf = $("run-conf");
-  if (conf && data.suggested_conf) { conf.value = Math.max(0.01, Number(data.suggested_conf)); }
+  if (conf) { conf.value = modelState.conf; }
+  // 先改下拉框再开面板：`loadModelChoices()` 里是「下拉框现值优先」，
+  // 只改 modelState 会被异步回来的那次重画冲回上次用的那一档
+  if (panel && probed) {
+    if ([...panel.options].some((row) => row.value === probed)) { panel.value = probed; }
+  }
+  if (probed) { modelState.model = probed; }
   openRun(true);
-  if (data.suggested_conf) { toast(`置信度已调到 ${data.suggested_conf}，勾好类别就能开跑`); }
+  const landed = panel ? panel.value : "";
+  if (landed !== probed) {
+    toast(`试的是 ${probed}，但它不在批量面板的可选权重里（现在还是 ${landed || "未选"}）：`
+      + "先去「模型管理」下全这一档，否则这一轮还是白跑", true);
+    return;
+  }
+  toast(`已按 ${probed} 去标${before && before !== probed ? `（原先选的是 ${before}）` : ""}`
+    + ` · 置信度降到 ${modelState.conf}，勾好类别就能开跑`);
 }
 
 /** 取本机权重清单（不加载模型，几百毫秒），顺带把上次用的权重/类别/阈值回填回来。 */
@@ -1679,7 +1711,7 @@ async function importModelClasses() {
   }
   const lost = data.not_in_model || [];
   modelState.result = `新增 ${data.added || 0} / 复用 ${data.updated || 0}`
-    + (data.open_vocab ? ` · 词表已备好（${data.vocab.length} 个词），去「批量检测」开跑`
+    + (data.open_vocab ? ` · 词表已备好（${data.vocab.length} 个词），去「批量目标检测标注」开跑`
       : ` / 该权重认不出 ${lost.length}` + (lost.length ? `（${lost.join("、")}）` : ""))
     + ((data.skipped || []).length ? ` · 还有 ${data.skipped.length} 个没进表：${data.skipped.join("、")}` : "")
     + ` · 本库类别表现有 ${data.fields.length} 个，下一个类别号 ${data.next_class_id}`;
@@ -1692,7 +1724,7 @@ async function importModelClasses() {
 }
 
 // --------------------------------------------------------------------------- //
-// 批量提示词标注 / 批量检测（走任务队列，可清除）
+// 批量提示词标注 / 批量目标检测标注（走任务队列，可清除）
 // --------------------------------------------------------------------------- //
 function openRun(open) {
   openModal("run-modal", open);

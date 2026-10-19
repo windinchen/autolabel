@@ -286,3 +286,97 @@ def test_an_unsupported_extension_is_still_refused(dataset):
 
     with pytest.raises(ValueError, match="不支持的文件类型"):
         up.save_upload(dataset, "报告.pdf", b"%PDF-1.4 fake")
+
+
+def test_pose_run_route_takes_a_picked_subset(server, dataset, monkeypatch):
+    """「批量姿态标注」：库里已有的图直接跑权重，圈了哪几张就只标哪几张。
+
+    这条补的是姿态页一直缺的口子——以前只有「导入素材」会触发自动标注，
+    勾了「只入库不标注」传进来的图想补标，只能把素材整批重传。
+    """
+    from test_prompt_web import post
+    from autolabel.upload import Job
+
+    base, store = server
+    images = [row["image"] for row in store.dataset_payload()["items"]]
+    assert len(images) >= 2
+    submitted = []
+
+    def fake_submit(kind, files, params=None):
+        submitted.append((kind, list(files), dict(params or {})))
+        return Job(id="posejob", kind=kind, files=list(files), params=dict(params or {}))
+
+    monkeypatch.setattr(store.jobs, "submit", fake_submit)
+    status, job, _ = post(base, "/api/pose/run",
+                          {"model": "yolo11n-pose.pt", "conf": 0.3, "overwrite": True,
+                           "images": images[:1]})
+    assert status == 202, job
+    assert job["kind"] == "pose" and job["file_count"] == 1
+    assert submitted[0][0] == "pose"
+    assert submitted[0][1] == images[:1]
+    assert submitted[0][2]["only"] == images[:1]
+    assert submitted[0][2]["conf"] == 0.3 and submitted[0][2]["overwrite"] is True
+
+
+def test_pose_run_forwards_the_multimodal_profile(server, dataset, monkeypatch):
+    """选多模态标骨骼时，vlm_profile 必须单独进任务参数。
+
+    少了它任务会去加载一个叫 vlm:xxx 的 YOLO 权重然后报缺文件；model 里那份
+    原样保留是有意的：和「导入素材」那条同一份参数，断点续跑用的指纹才对得上。
+    """
+    from test_prompt_web import post
+
+    base, store = server
+    profile = {"id": "p-1", "name": "本机多模态", "kind": "local", "model": "qwen-vl",
+               "base_url": "http://127.0.0.1:9/v1", "api_key": "", "enabled": True}
+    monkeypatch.setattr("autolabel.models.find_profile", lambda wanted: profile)
+    started = []
+    monkeypatch.setattr(store.jobs, "_run", lambda job: started.append(job))
+    status, ack, _ = post(base, "/api/pose/run", {"model": "vlm:p-1", "vlm_profile": "p-1"})
+    assert status == 202, ack
+    assert ack["vlm_profile"] == "p-1" and ack["vlm_name"] == "本机多模态"
+    assert started and started[0].params["vlm_profile"] == "p-1"
+    assert started[0].params["model"] == "vlm:p-1"
+
+
+def test_pose_run_refuses_images_that_are_not_in_the_lib(server, dataset):
+    """界面传上来的一张图早被删了：当场说清楚，别开一个跑完什么也没发生的任务。"""
+    from test_prompt_web import post
+
+    base, _store = server
+    status, body, _ = post(base, "/api/pose/run", {"model": "yolo11n-pose.pt",
+                                                   "images": ["images/没了.jpg"]})
+    assert status == 400, body
+    assert "没有收到文件" in body["error"]
+
+
+def test_pose_job_stages_and_batch_read_like_the_other_two_panels(dataset, monkeypatch):
+    """任务的阶段、批次名、产出口径要和提示词 / 目标检测两页的批量面板对得上。"""
+    from autolabel.dataset import load_index
+    from autolabel.upload import Job, JobStore
+
+    store = JobStore(dataset)
+    images = [rel for rel, _ in load_index(dataset).ordered_items()]
+    seen = {}
+
+    def fake_label(job):
+        seen["only"] = list(job.params.get("only") or [])
+        return {"labeled": len(seen["only"]), "people": len(seen["only"]), "flagged": 0,
+                "failed": 0, "skipped_human": 0}
+
+    monkeypatch.setattr(store, "_label", fake_label)
+    monkeypatch.setattr(store, "_qc", lambda job: "reports/qc.md")
+    monkeypatch.setattr(store, "_coords", lambda job: "exports/coords")
+    picked = images[:1]
+    job = Job(id="pose1", kind="pose", files=picked,
+              params={"only": picked, "model": "yolo11n-pose.pt"})
+    store._start_batch(job)
+    store._run_pose(job)
+    assert job.finished and job.ok, job.error
+    assert seen["only"] == picked, "圈定范围没传到流水线"
+    assert job.result["labeled"] == 1 and job.result["coords"] == "exports/coords"
+    mine = [row for row in load_batches(dataset) if row["id"] == job.batch_id]
+    assert len(mine) == 1
+    assert mine[0]["kind"] == "pose" and mine[0]["status"] == "done"
+    assert "批量姿态标注" in mine[0]["name"], mine[0]["name"]
+    assert set(mine[0]["items"]) == set(picked), "批次挂的图要和圈定的那批一致"

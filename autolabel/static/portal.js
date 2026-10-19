@@ -149,7 +149,7 @@ function nextActions(ds, values) {
   }
   if (values.detect_unreviewed) {
     acts.push({ icon: "ic-boxes", chip: "检测标注", title: "有 " + values.detect_unreviewed + " 帧本机权重出的框没复核",
-      sub: "本地图已入库的，点批量检测几十秒就出一轮",
+      sub: "本地图已入库的，点批量目标检测标注几十秒就出一轮",
       href: "/detect", go: "去复核" });
   }
   if (!acts.length) {

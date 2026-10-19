@@ -538,6 +538,7 @@ function renderCatalog() {
 /** 目录是从哪一版官方清单来的、多久没核对过了：这句话决定用户要不要点「更新目录」。 */
 function renderCatalogSource() {
   const line = $("model-catalog-source");
+  paintCatalogRefresh();
   if (!line) return;
   const info = modelState.hub.catalog;
   if (!info) { line.textContent = ""; return; }
@@ -554,12 +555,29 @@ function renderCatalogSource() {
     + (info.added ? `，其中 ${info.added} 档是刷新时补进来的` : "") + "。";
 }
 
+/** 按钮上写清「上次核对是什么时候」：光一个「更新目录」没人知道现在这份目录新不新、值不值得点。 */
+function paintCatalogRefresh() {
+  const text = $("model-catalog-refresh-text");
+  const stamp = $("model-catalog-refresh-time");
+  if (!text || !stamp) { return; }
+  const info = modelState.hub.catalog || {};
+  text.textContent = "更新目录";
+  // now_str() 是 "YYYY-MM-DD HH:MM:SS"，按钮上只要 "10-19 23:12" 这一截
+  const fetched = String(info.fetched_at || "");
+  stamp.textContent = info.refreshed && fetched.length >= 16 ? "核对于 " + fetched.slice(5, 16) : "从未核对";
+}
+
 /** 「更新目录」：让后端去官方 release 取最新档位与体积，回来把目录和权重列表一起重画。 */
 async function refreshCatalog() {
   if (modelState.refreshing) return;
   modelState.refreshing = true;
   const button = $("model-catalog-refresh");
-  if (button) { button.disabled = true; button.textContent = "核对中…"; }
+  const text = $("model-catalog-refresh-text");
+  const stamp = $("model-catalog-refresh-time");
+  // 只改内层那两个 span：整个 button.textContent 一写，里头的图标就没了
+  if (button) { button.disabled = true; button.classList.add("busy"); }
+  if (text) { text.textContent = "核对中…"; }
+  if (stamp) { stamp.textContent = ""; }
   let data = null;
   let failure = "";
   try {
@@ -567,8 +585,9 @@ async function refreshCatalog() {
   } catch (err) {
     failure = String(err && err.message || "");
   }
-  if (button) { button.disabled = false; button.textContent = "更新目录"; }
+  if (button) { button.disabled = false; button.classList.remove("busy"); }
   modelState.refreshing = false;
+  paintCatalogRefresh();     // 失败也要把按钮恢复原样，否则一直停在「核对中…」
   if (!data) {
     toast(failure.includes("not found")
       ? "更新目录失败：这个服务还是旧版本，重启后才有该接口"

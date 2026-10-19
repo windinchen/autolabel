@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 import time
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 
@@ -91,6 +91,7 @@ def label_dataset(
     verbose: bool = True,
     progress: Optional["Callable[[int, int], None]"] = None,
     should_stop: Optional["Callable[[], bool]"] = None,
+    only: Optional[Sequence[str]] = None,
 ) -> dict:
     """对数据集内图片批量推理并写标签。
 
@@ -99,8 +100,11 @@ def label_dataset(
     :param render_qc: 额外渲染前 N 张带骨架叠加图的 QC 预览
     :param progress: 每完成一张回调 (已完成, 总数)，供上传界面的进度条使用
     :param should_stop: 每张前检查，返回 True 就停下来（用于界面「清除任务」）
+    :param only: 只标这批图（界面「批量姿态标注」圈定的那批）。留空 = 扫全库，
+        命令行与上传任务不传这个参数，行为一点不变
     """
     idx = load_index(root)
+    wanted = {str(rel) for rel in only} if only is not None else None
     # 逐图改动先攒在这里，落盘前与磁盘上的索引合并：复核界面在标注期间也能写索引，
     # 直接整体覆盖会把用户在标注过程中点的“接受/驳回”抹掉。
     updates: Dict[str, dict] = {}
@@ -131,6 +135,8 @@ def label_dataset(
     targets: List[tuple] = []
     skipped_human = 0
     for rel, item in idx.ordered_items():
+        if wanted is not None and str(rel) not in wanted:
+            continue
         if only_missing and _human_reviewed(item) and os.path.exists(label_path_for(root, rel)):
             skipped_human += 1
             continue

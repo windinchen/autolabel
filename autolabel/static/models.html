@@ -63,6 +63,10 @@
   <symbol id="ic-key" viewBox="0 0 16 16"><rect x="1.6" y="4" width="12.8" height="8" rx="1.4"/><path d="M4.2 6.6h.01M6.6 6.6h.01M9 6.6h.01M11.4 6.6h.01M4.2 9.4h7.6"/></symbol>
   <symbol id="ic-target" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2.4M8 12.8v2.4M.8 8h2.4M12.8 8h2.4"/></symbol>
   <symbol id="ic-check" viewBox="0 0 16 16"><path d="m3.2 8.4 3.2 3.2 6.4-7.2"/></symbol>  <symbol id="ic-refresh" viewBox="0 0 16 16"><path d="M13.4 8a5.4 5.4 0 1 1-1.6-3.8"/><path d="M12.2 1.4v2.9H9.3"/></symbol>  <symbol id="ic-gear" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.3"/><path d="M8 1.3v2.1M8 12.6v2.1M1.3 8h2.1M12.6 8h2.1M3.3 3.3l1.5 1.5M11.2 11.2l1.5 1.5M12.7 3.3l-1.5 1.5M4.8 11.2l-1.5 1.5"/></symbol>
+  <symbol id="ic-pose" viewBox="0 0 16 16"><circle cx="8" cy="3" r="1.7"/><path d="M8 4.7v4.2M4.6 6.6h6.8M8 8.9 5.6 13.8M8 8.9l2.4 4.9"/></symbol>
+  <symbol id="ic-prompt" viewBox="0 0 16 16"><path d="M2.1 2.1h5.6l6.2 6.2a1.3 1.3 0 0 1 0 1.85l-3.95 3.95a1.3 1.3 0 0 1-1.85 0L2.1 7.7V2.1Z"/><path d="M5.2 5.2h.01"/></symbol>
+  <symbol id="ic-home" viewBox="0 0 16 16"><path d="M2.3 7.1 8 2.4l5.7 4.7v6.1a1 1 0 0 1-1 1H3.3a1 1 0 0 1-1-1V7.1Z"/><path d="M6.3 13.9V9.4h3.4v4.5"/></symbol>
+  <symbol id="ic-list" viewBox="0 0 16 16"><path d="M6.4 4.1h7.4M6.4 8h7.4M6.4 11.9h7.4M2.6 4.1h.01M2.6 8h.01M2.6 11.9h.01"/></symbol>
 </svg>
 
 <header>
@@ -88,12 +92,10 @@
         <div class="menu-label">当前默认</div>
         <div class="menu-field muted small" id="model-default-note"></div>
         <div class="menu-sep"></div>
-        <div class="menu-label">跳到</div>
-        <a class="menu-item" href="/"><svg class="ic"><use href="#ic-layers"/></svg>工作台总览</a>
-        <a class="menu-item" href="/pose"><svg class="ic"><use href="#ic-target"/></svg>姿态标注<span class="kbd k">P</span></a>
-        <a class="menu-item" href="/objects"><svg class="ic"><use href="#ic-boxes"/></svg>提示词标注<span class="kbd k">O</span></a>
+        <a class="menu-item" href="/" title="回到工作台总览"><svg class="ic"><use href="#ic-home"/></svg>工作台总览</a>
+        <button class="menu-item" id="model-refresh" title="重新扫一遍权重目录：手动拷进来的权重靠它冒出来"><svg class="ic"><use href="#ic-check"/></svg>重新读取权重<span class="kbd k">R</span></button>
         <div class="menu-sep"></div>
-        <button class="menu-item" id="model-refresh"><svg class="ic"><use href="#ic-check"/></svg>重新读取权重<span class="kbd k">R</span></button>
+        <div id="menu-modules"></div>
         <div class="menu-label">关于</div>
         <div class="menu-field muted small"><span>版本</span><span class="mono" id="about-version">—</span></div>
         <div class="menu-field muted small"><span>开发者</span><a id="about-dev"
@@ -119,13 +121,7 @@
 
 <div class="shell-row">
   <div id="rail">
-    <a class="iconbtn" href="/" title="工作台"><svg class="ic"><use href="#ic-layers"/></svg></a>
-    <a class="iconbtn" href="/pose?upload=1" title="导入素材"><svg class="ic"><use href="#ic-upload"/></svg></a>
-    <span class="sep"></span>
-    <a class="iconbtn" href="/pose" title="姿态标注"><svg class="ic"><use href="#ic-target"/></svg></a>
-    <a class="iconbtn" href="/objects" title="提示词标注"><svg class="ic"><use href="#ic-boxes"/></svg></a>
-    <a class="iconbtn on" href="/models" title="模型管理"><svg class="ic"><use href="#ic-cube"/></svg></a>
-    <span class="sep"></span>
+    <span class="rail-spacer"></span>
     <button class="iconbtn" id="rail-help" title="本页操作说明（?）"><svg class="ic"><use href="#ic-key"/></svg></button>
   </div>
 
@@ -150,8 +146,10 @@
                   aria-checked="true"><span></span></button>
           <span class="muted small">只看已下载</span>
         </label>
-        <button id="model-catalog-refresh" type="button"
-                title="联网核对官方最新发布：出新档位、体积有变动就一并补进来（断网只会说一声，目录不动）">更新目录</button>
+        <button id="model-catalog-refresh" type="button" class="catalog-refresh"
+                title="联网核对官方最新发布：出新档位、体积有变动就一并补进来（断网只会说一声，目录不动）">
+          <svg class="ic"><use href="#ic-refresh"/></svg><span id="model-catalog-refresh-text">更新目录</span><span id="model-catalog-refresh-time" class="catalog-refresh-time"></span>
+        </button>
         <span id="model-catalog-note" class="muted small"></span>
       </div>
       <div class="model-tools" id="model-search-bar">

@@ -130,8 +130,8 @@ def test_detect_page_reuses_objects_script_without_a_fork(server):
     assert 'src="/objects.js"' in objects
     assert "detect.js" not in read_review_py()
     assert not os.path.exists(os.path.join(STATIC, "detect.js"))
-    # 运行按钮与类别面板在检测页换了名字（1.4.10 起模块叫「目标检测标注」，按钮收短成「批量检测」）
-    assert "批量检测" in detect and "批量目标检测" not in detect
+    # 1.4.11 起按钮把名字说全：三个标注页的批量入口同名同形，短一个词就认不出是同一件事
+    assert "批量目标检测标注" in detect and "批量检测" not in detect
     assert "类别管理" in detect
     assert 'id="cls-import"' in detect
 
@@ -208,7 +208,9 @@ def test_navigation_offers_the_third_module_everywhere():
     """门户卡片、左侧导航数据、命令面板与批次筛选都要认得目标检测。"""
     common = read_static("common.js")
     assert 'id: "detect", href: "/detect"' in common
-    assert "ensureMenuModules" in common and "ensureRailModules" in common
+    assert "ensureMenuModules" in common
+    # 模块跳转只有一处代码在生成，五页各留一个占位；左侧竖条不再自己写一排图标
+    assert "ensureRailModules" not in common
     portal = read_static("portal.js")
     block = portal[portal.index("const MODULE_CARDS"):portal.index("function buildStats")]
     assert 'id: "detect", href: "/detect"' in block
@@ -573,3 +575,19 @@ def test_detect_export_writes_its_own_yolo_dataset(server, dataset):
     assert rows[0]["path"] == info["out"]
     # 门户给这一行配的训练命令必须是 detect，不是默认的 pose
     assert "yolo_detect:" in read_static("common.js")
+
+
+def test_probe_suggestion_hands_the_weight_over_to_the_batch_panel():
+    """试词完点「按建议阈值去标注」，得连权重一起搬进批量面板。
+
+    试的是 A 权重、面板却还停在上一轮那档 B：阈值降了照样零个框，
+    用户只能得出「这按钮是坏的」这个结论——这就是这一条守着的坑。
+    """
+    js = read_static("objects.js")
+    body = js.split("function applyProbeSuggestion()", 1)[1].split("\nfunction ", 1)[0]
+    assert 'const panel = $("run-model")' in body
+    assert "panel.value = probed" in body
+    assert body.index("panel.value = probed") < body.rindex("openRun(true)"), \
+        "下拉框现值优先，必须赶在开面板之前改，不然会被异步那次重画冲回去"
+    assert "landed !== probed" in body, "权重搬不过去要说话，不能静悄悄把面板打开"
+    assert "不是被阈值挡住的" in body, "一个分都没给的词没什么可降的，得说清下一步"""

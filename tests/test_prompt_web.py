@@ -104,10 +104,16 @@ def test_module_nav_and_shared_assets_are_served(server):
 
 
 def test_pose_page_no_longer_houses_model_panel(server):
+    """姿态页不藏模型面板，但要去提示词标注的路得留着。
+
+    跳法换了：竖条里那枚图标撤了（五枚同形方框并排，反而看不出自己在哪页），
+    模块跳转只剩顶栏中文标签与「⋯」菜单，两处都由 common.js 按 MODULES 现渲染，
+    所以 HTML 里看得见的是占位，不是写死的 href。
+    """
     _status, body, _ = get(server[0], "/pose")
     text = body.decode("utf-8")
     assert 'id="model-modal"' not in text
-    assert 'href="/objects"' in text
+    assert '<div id="menu-modules"></div>' in text and 'id="nav-modules"' in text
 
 
 def test_unknown_route_returns_json_404(server):

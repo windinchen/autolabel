@@ -240,10 +240,11 @@ class JobStore:
 
     # --- 对外 ---
     def submit(self, kind: str, files: Sequence[str], params: Optional[dict] = None) -> Job:
-        if kind not in ("image", "video", "prompt", "prompt_upload", "detect", "detect_upload"):
+        if kind not in ("image", "video", "pose", "prompt", "prompt_upload",
+                        "detect", "detect_upload"):
             raise ValueError(f"未知任务类型: {kind}")
-        # 只跑标注不入库的那两类，files 是本库索引里的相对路径，不能被 basename 削掉子目录
-        rel_paths = kind in ("prompt", "detect")
+        # 只跑标注不入库的那三类，files 是本库索引里的相对路径，不能被 basename 削掉子目录
+        rel_paths = kind in ("pose", "prompt", "detect")
         if rel_paths:
             files = [str(f).replace("\\", "/") for f in files if str(f).strip()]
             files = self._known_images(files, lib_for_kind(kind))
@@ -362,6 +363,8 @@ class JobStore:
                 self._run_prompt(job)
             elif job.kind == "prompt_upload":
                 self._run_prompt_upload(job)
+            elif job.kind == "pose":
+                self._run_pose(job)
             elif job.kind == "detect":
                 self._run_detect(job)
             elif job.kind == "detect_upload":
@@ -492,6 +495,9 @@ class JobStore:
             job.set_stage("labeling", f"标注中 {done}/{total}", done=done, total=total)
 
         return label_dataset(self.root, settings, verbose=False, progress=progress,
+                             only_missing=not bool(job.params.get("overwrite")),
+                             limit=int(job.params.get("limit") or 0) or None,
+                             only=job.params.get("only") or None,
                              should_stop=lambda: bool(job.cancel_requested))
 
     def _qc(self, job: Job) -> str:
@@ -696,6 +702,38 @@ class JobStore:
         if hint:
             parts.append(hint)
         return "完成：" + "；".join(parts)
+
+    def _run_pose(self, job: Job) -> None:
+        """已入库的图批量跑姿态标注：不导入、不重传，产出只进 ``labels/``。
+
+        姿态页以前只有「导入素材」这一个能触发自动标注的口子：先勾「只入库不标注」
+        传进来的、或换了一档更重的权重想重标的，就只能把素材整批重传一遍。
+        这条把「已入库」和「要标注」拆开，和提示词标注 / 目标检测标注两页的批量面板同一口径。
+        """
+        total = len(job.files)
+        job.ingested = list(job.files)        # 批次要能列出"这批标的是哪几张"
+        self._attach_batch(job)
+        job.set_stage("labeling",
+                      f"{self._load_hint(job)}（本库这批 {total} 张，参数没变且已标过的自动跳过）"
+                      f" 0/{total}", done=0, total=total)
+        labeled = self._label(job)
+        self._check(job)
+        job.set_stage("qc", "生成质量报告")
+        report = self._qc(job)
+        job.set_stage("coords", "生成坐标文件")
+        coords = self._coords(job)
+        job.result = {"labeled": labeled.get("labeled", 0), "people": labeled.get("people", 0),
+                      "flagged": labeled.get("flagged", 0), "failed": labeled.get("failed", 0),
+                      "skipped_human": labeled.get("skipped_human", 0), "report": report,
+                      "coords": coords, "batch_id": job.batch_id,
+                      "model": str(job.params.get("model") or "")}
+        job.set_stage("done",
+                      f"完成：标注 {labeled.get('labeled', 0)} 张 · {labeled.get('people', 0)} 个人"
+                      + (f" · 人工已复核的 {labeled['skipped_human']} 张没动"
+                         if labeled.get("skipped_human") else "")
+                      + (f" · 失败 {labeled['failed']} 张" if labeled.get("failed") else ""))
+        job.finished, job.ok = True, True
+        finish_batch(self.root, job.batch_id, "done", job.message)
 
     def _run_detect(self, job: Job) -> None:
         """已入库的图批量跑目标检测：不导入、不跑姿态，产出只进 ``detect_labels/``。"""

@@ -1,5 +1,7 @@
 """重标不该吃掉人工结果，QC 几何判断要按像素算，框要按真正参与监督的关键点定。"""
 
+import os
+
 import pytest
 
 from autolabel import backends as be
@@ -185,3 +187,18 @@ def test_forced_relabel_with_the_same_params_keeps_the_approval(dataset, fake_ba
     assert stats["verdict_reset"] == 0, stats
     assert stats["skipped_reviewed"] == 1
     assert load_index(dataset).get(rel)["status"] == "approved"
+
+
+def test_only_scope_labels_just_the_picked_images(dataset, fake_backend):
+    """界面「批量姿态标注」圈了哪几张就只标哪几张。
+
+    以前流水线只能扫全库，界面想「只补这 20 张」得先把整个库重跑一遍，
+    一万张的库点一下就是十几分钟，实际上用户只想标刚导进来的那批。
+    """
+    rels = [rel for rel, _ in load_index(dataset).ordered_items()]
+    assert len(rels) >= 2
+
+    stats = label(dataset, only=rels[:1])
+    assert stats["labeled"] == 1
+    assert os.path.exists(label_path_for(dataset, rels[0]))
+    assert not os.path.exists(label_path_for(dataset, rels[1])), "圈定范围外的一张也被标了"
