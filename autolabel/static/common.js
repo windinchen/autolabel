@@ -544,6 +544,42 @@ async function getJson(url) {
   return data;
 }
 
+/** 导入弹层的「归类到」下拉：分类只有素材池那一份，各页导入时挑一个，落池这一刻打上。
+ *
+ *  选项每次都现取：分类可能刚在素材池页被改名或删掉，缓存一份旧清单会让人
+ *  归到一个已经不存在的分类上。取不到就保持原样——宁可少一个可选项，
+ *  也不能让导入按钮因为一次失败的请求变得不能用。
+ */
+async function fillImportCategories(selectId) {
+  const select = document.getElementById(selectId);
+  if (!select) { return; }
+  let rows = null;
+  try {
+    rows = (await getJson("/api/pool?view=picker")).categories || [];
+  } catch (err) {
+    return;
+  }
+  const keep = select.value;
+  select.innerHTML = "";
+  const blank = document.createElement("option");
+  blank.value = "";
+  blank.textContent = "未分类";
+  select.append(blank);
+  for (const row of rows) {
+    const opt = document.createElement("option");
+    opt.value = String(row.id);
+    opt.textContent = row.name || "未命名分类";
+    select.append(opt);
+  }
+  if ([...select.options].some((opt) => opt.value === keep)) { select.value = keep; }
+}
+
+/** 读导入弹层里选中的分类；没选就是空串，后端跳过打分类这一步。 */
+function readImportCategory(selectId) {
+  const select = document.getElementById(selectId || "up-category");
+  return select ? String(select.value || "") : "";
+}
+
 let toastTimer = null;
 function toast(msg, isErr) {
   const el = $("toast");

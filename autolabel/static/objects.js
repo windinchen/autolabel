@@ -2022,6 +2022,7 @@ function openUpload(open) {
     renderModelChoices();
     renderRunFields("up-fields");
     renderUpFiles();
+    fillImportCategories("up-category");
   }
 }
 
@@ -2154,6 +2155,7 @@ async function startUpload() {
       max_frames: Math.round(readNumber("up-max-frames", 600)),
       video_dedupe: $("up-keep-similar").checked ? "none" : "perceptual",
       batch_name: $("up-batch-name").value.trim(),
+      category: readImportCategory("up-category"),
     };
     if (IS_LOCAL) {
       // 目标检测的上传任务吃本机权重：模型 / 类别 / 阈值，和大模型那套参数完全不同

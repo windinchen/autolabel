@@ -44,6 +44,20 @@ class JobCancelled(Exception):
     """任务被用户在界面上「清除」，用于从流水线阶段提前退出。"""
 
 
+def duplicate_note(counts: dict) -> str:
+    """把"传了 255 张怎么只有 169 张"讲明白：重复跳过多少、读不出多少，没有就返回空串。
+
+    以前完成消息里的"已进池 255 张"把被去重跳过的张数也算进去了，界面上看着一张没少，
+    池里却只有 169 个文件——少了东西又不说少了什么，比少进更让人不信任。
+    """
+    parts = []
+    if counts.get("duplicates"):
+        parts.append(f"{counts['duplicates']} 张与已有素材内容相同，没有重复入库")
+    if counts.get("failed"):
+        parts.append(f"{counts['failed']} 个文件读不出图片")
+    return f"（{'，'.join(parts)}）" if parts else ""
+
+
 def prune_stale_uploads(root: str, max_age_hours: float = STALE_UPLOAD_HOURS) -> dict:
     """清掉上一次进程遗留的上传临时文件，返回 ``{"files": 份数, "bytes": 字节数}``。
 
@@ -212,6 +226,8 @@ class Job:
     cancel_requested: bool = False
     batch_id: str = ""
     ingested: List[str] = field(default_factory=list)
+    #: 入库时被去重跳过 / 读不出图片的张数，完成消息要照这个说，不能糊在"入库 N 张"里
+    counts: dict = field(default_factory=dict)
     result: dict = field(default_factory=dict)
     error: str = ""
     created_at: str = field(default_factory=now_str)
@@ -232,7 +248,7 @@ class Job:
                 "stage": self.stage, "message": self.message, "done": self.done, "total": self.total,
                 "finished": self.finished, "ok": self.ok, "result": self.result, "error": self.error,
                 "cancel_requested": self.cancel_requested,
-                "batch_id": self.batch_id,
+                "batch_id": self.batch_id, "counts": self.counts,
                 "model": self.params.get("model"),
                 "vlm_profile": self.params.get("vlm_profile") or "",
                 "vlm_name": self.params.get("vlm_name") or "",
@@ -468,15 +484,33 @@ class JobStore:
             uploads=job.files)
         job.batch_id = batch["id"]
 
+    def _stamp_pool_origin(self, job: Job) -> None:
+        """素材一落池，就在池账本上把「来处 + 分类」两枚章盖好。
+
+        以前只有素材池页自己的导入盖来处，三个模块导入的素材在池账本上是"没有批次"，
+        于是素材池页按批次筛筛不到、按批次删也删不到；分类同理，只能事后框一遍。
+        取消的任务也盖——已经进池的那部分素材是真实存在的，没理由让它没来处没分类。
+        """
+        if not job.ingested:
+            return
+        from . import pool as pool_catalog
+
+        if job.batch_id:
+            pool_catalog.attach_items(self.root, job.batch_id, list(job.ingested))
+        wanted = str(job.params.get("category") or "").strip()
+        if not wanted:
+            return
+        try:
+            pool_catalog.assign(self.root, list(job.ingested), wanted)
+        except ValueError as exc:
+            # 分类刚好在这期间被人删了：素材照样进池，只是这批没分成类，说一声不拦路
+            job.set_stage(job.stage, f"{job.message}（分类没打上：{exc}）")
+
     def _attach_batch(self, job: Job) -> None:
         """把已入库的图片挂到批次上（取消时也只挂实际落盘的那部分）。"""
-        if not (job.batch_id and job.ingested):
-            return
-        if str(job.batch_id).startswith("p_"):
-            from . import pool as pool_catalog
-
-            pool_catalog.attach_items(self.root, job.batch_id, job.ingested)
-            return
+        self._stamp_pool_origin(job)
+        if not (job.batch_id and job.ingested) or str(job.batch_id).startswith("p_"):
+            return  # 池批次在 _stamp_pool_origin 里已经挂好了
         attach_items(self.root, job.batch_id, job.ingested, lib=lib_for_kind(job.kind))
 
     def _ingest(self, job: Job) -> int:
@@ -498,16 +532,25 @@ class JobStore:
                                         dedupe=str(job.params.get("video_dedupe", "perceptual")),
                                         lib=lib_for_kind(job.kind), register=register)
                 imported += int(result["imported"]) + int(result.get("reused") or 0)
+                self._tally(job, result)
                 job.ingested.extend(rel for _src, rel in result.get("imported_files", []))
             self._attach_batch(job)
             return imported
         stats = import_images(self.root, paths, max_side=int(job.params.get("max_side", 1600)),
                               dedupe=str(job.params.get("dedupe", "exact")),
                               lib=lib_for_kind(job.kind), register=register)
+        self._tally(job, stats)
         job.ingested.extend(rel for _src, rel in stats.get("imported_files", []))
         self._attach_batch(job)
-        return (int(stats["imported"]) + int(stats["reused"])
-                + int(stats["skipped_exact"]) + int(stats["skipped_similar"]))
+        return int(stats["imported"]) + int(stats["reused"])
+
+    @staticmethod
+    def _tally(job: Job, stats: dict) -> None:
+        """把去重跳过 / 读取失败的分项累加到任务上，供完成消息原样报出来。"""
+        job.counts["duplicates"] = (int(job.counts.get("duplicates") or 0)
+                                    + int(stats.get("skipped_exact") or 0)
+                                    + int(stats.get("skipped_similar") or 0))
+        job.counts["failed"] = int(job.counts.get("failed") or 0) + int(stats.get("failed") or 0)
 
     def _label(self, job: Job) -> dict:
         from .backends import BackendSettings
@@ -611,7 +654,8 @@ class JobStore:
         self._check(job)
         self._cleanup(job)
         job.result = {"imported": ingested, "batch_id": job.batch_id}
-        job.set_stage("done", f"已进池 {ingested} 张", done=ingested, total=ingested)
+        job.set_stage("done", f"已进池 {ingested} 张{duplicate_note(job.counts)}",
+                     done=ingested, total=max(len(job.files), ingested))
         # finished / ok 必须在这儿落定：以前只写了 stage=done，任务条会一直转，
         # 「还在导入中」的保护还会把这批素材一直拦住不让删
         job.finished, job.ok = True, True
@@ -640,7 +684,8 @@ class JobStore:
         job.result = {"imported": ingested, "labeled": labeled.get("labeled", 0),
                       "people": labeled.get("people", 0), "flagged": labeled.get("flagged", 0),
                       "report": report, "coords": coords, "batch_id": job.batch_id}
-        job.set_stage("done", f"完成：入库 {ingested} 张，标注 {labeled.get('labeled', 0)} 张")
+        job.set_stage("done", f"完成：入库 {ingested} 张{duplicate_note(job.counts)}，"
+                             f"标注 {labeled.get('labeled', 0)} 张")
         job.finished, job.ok = True, True
         finish_batch_any(self.root, job.batch_id, "done", job.message)
 
@@ -656,7 +701,8 @@ class JobStore:
         if not rels:
             self._cleanup(job)
             job.result = {"imported": 0, "labeled": 0, "boxes": 0, "batch_id": job.batch_id}
-            job.set_stage("done", "完成：没有新图入库（可能与已有图片重复，或文件里没有可用图片）")
+            job.set_stage("done", "完成：没有新图入库"
+                         + (duplicate_note(job.counts) or "（可能与已有图片重复，或文件里没有可用图片）"))
             job.finished, job.ok = True, True
             finish_batch_any(self.root, job.batch_id, "done", job.message)
             return
@@ -687,7 +733,8 @@ class JobStore:
                       "protected": stats.get("protected", 0),
                       "unknown_fields": stats.get("unknown_fields", []),
                       "coords": coords, "batch_id": job.batch_id, "fields": names}
-        done = f"完成：入库 {ingested} 张，标注 {stats.get('labeled', 0)} 张，产出 {stats.get('boxes', 0)} 个框"
+        done = (f"完成：入库 {ingested} 张{duplicate_note(job.counts)}，"
+                f"标注 {stats.get('labeled', 0)} 张，产出 {stats.get('boxes', 0)} 个框")
         if stats.get("failed"):
             done += f"（{stats['failed']} 张没答上）"
         job.set_stage("done", done)
@@ -733,9 +780,9 @@ class JobStore:
 
         return str(write_detect_coordinate_files(self.root, tag=f"detect-{job.id}")["out"])
 
-    def _detect_done_text(self, stats: dict, ingested: int = 0) -> str:
-        """完成消息：把"多少张没覆盖"讲清楚，否则用户以为任务没跑。"""
-        parts = [f"入库 {ingested} 张"] if ingested else []
+    def _detect_done_text(self, stats: dict, ingested: int = 0, note: str = "") -> str:
+        """完成消息：把"多少张没覆盖""少掉的张哪去了"讲清楚，否则用户以为任务没跑。"""
+        parts = [f"入库 {ingested} 张{note}"] if ingested else []
         parts.append(f"标注 {stats.get('labeled', 0)} 张，产出 {stats.get('boxes', 0)} 个框")
         if stats.get("protected"):
             parts.append(f"{stats['protected']} 张人工接受过或画过框的图未覆盖（勾「覆盖已有框」可重标）")
@@ -814,7 +861,8 @@ class JobStore:
         if not rels:
             self._cleanup(job)
             job.result = {"imported": 0, "labeled": 0, "boxes": 0, "batch_id": job.batch_id}
-            job.set_stage("done", "完成：没有新图入库（可能与已有图片重复，或文件里没有可用图片）")
+            job.set_stage("done", "完成：没有新图入库"
+                         + (duplicate_note(job.counts) or "（可能与已有图片重复，或文件里没有可用图片）"))
             job.finished, job.ok = True, True
             finish_batch_any(self.root, job.batch_id, "done", job.message)
             return
@@ -845,7 +893,7 @@ class JobStore:
                       "missing_classes": stats.get("missing_classes", []),
                       "model": stats.get("model", model),
                       "coords": coords, "batch_id": job.batch_id, "classes": names}
-        job.set_stage("done", self._detect_done_text(stats, ingested))
+        job.set_stage("done", self._detect_done_text(stats, ingested, duplicate_note(job.counts)))
         job.finished, job.ok = True, True
         finish_batch_any(self.root, job.batch_id, "done", job.message)
 

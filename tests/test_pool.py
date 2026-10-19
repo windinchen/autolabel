@@ -14,11 +14,22 @@ from PIL import Image
 from test_upload import call, jpeg_bytes, upload, wait_job
 
 from autolabel import pool as pool_catalog
-from autolabel.batches import delete_images, reconcile_with_disk
+from autolabel.batches import (
+    attach_items,
+    create_batch,
+    delete_batches,
+    delete_images,
+    finish_batch,
+    list_batches,
+    list_snapshots,
+    reconcile_with_disk,
+    restore_deletion,
+)
 from autolabel.dataset import (
     adopt_from_pool,
     images_dir,
     import_images,
+    label_path_for,
     libs_holding_image,
     load_index,
     pool_items,
@@ -334,3 +345,320 @@ def test_pool_upload_job_pools_without_touching_any_library(server, dataset):
     assert status == 200, body
     assert json.loads(body)["pool_only"] == len(fresh)
     assert not (set(pool_rows(dataset)) & set(fresh))
+
+
+# --------------------------------------------------------------------------- //
+# 导入记录：池批次 + 各模块导入的批次，一屏看全
+# --------------------------------------------------------------------------- //
+def test_pool_batch_view_lists_module_import_batches(server, dataset, fresh_dir):
+    """从模块「从素材池添加」出来的批次也得进批次视图，且不与池批次撞名。
+
+    以前这里只列池账本的批次，于是素材池页一边写着「86 个素材」，
+    批次视图一边说「还没有导入记录」——来处明明记在各库的登记表里，
+    却没地方看，也没法按批退回去。
+    """
+    base = server[0]
+    imported, _stats = import_only(dataset, fresh_dir)
+    status, _headers, body = call(base, "/api/pool/adopt",
+                                 data=json.dumps({"images": imported, "lib": "detect"}).encode(),
+                                 headers=JSON)
+    assert status == 200, body
+    adopted = json.loads(body)["batch_id"]
+
+    data = json.loads(call(base, "/api/pool?view=all")[2])
+    rows = {row["id"]: row for row in data["batches"]}
+    assert adopted in rows, "各模块导入的批次在批次视图里查无此批"
+    row = rows[adopted]
+    assert row["module_name"] == "目标检测标注", row
+    assert not str(row["name"]).startswith("素材池"), \
+        "和池批次撞名，两条并排时分不清哪条是池导入、哪条是模块添加"
+    # items 要给数量：给清单的话界面上会印成「a.jpg,b.jpg 个素材」
+    assert row["items"] == len(imported) and isinstance(row["items"], int), row
+    assert row["in_pool"] == len(imported), row
+    for item in data["all"]:
+        if item["image"] in set(imported):
+            assert item["pool_batch_name"], "来处那列空着"
+
+
+def test_batch_files_endpoint_answers_for_pool_batches(server, dataset, fresh_dir):
+    """点开一个只进了池的批次也要有清单：那批素材本来就不在任何库索引里。"""
+    base = server[0]
+    imported, _stats = import_only(dataset, fresh_dir)
+    batch = pool_catalog.create_batch(dataset, name="只在池里")
+    pool_catalog.attach_items(dataset, batch["id"], imported)
+
+    status, _headers, body = call(base, "/api/batch/files?id=" + batch["id"])
+    assert status == 200, body
+    files = json.loads(body)["files"]
+    assert {row["name"] for row in files} == {os.path.basename(rel) for rel in imported}, files
+    assert all(row["category_name"] for row in files), "清单里连分类都没有，看了等于没看"
+
+
+def test_retiring_a_pool_batch_keeps_the_provenance(dataset, fresh_dir):
+    """「只摘引用」之后素材还在池里，批次行和来处都得留着，只把状态改成已退回。"""
+    imported, _stats = import_only(dataset, fresh_dir)
+    batch = pool_catalog.create_batch(dataset, name="退回但留着来处")
+    pool_catalog.attach_items(dataset, batch["id"], imported)
+    pool_catalog.finish_batch(dataset, batch["id"])
+
+    result = delete_batches(dataset, [batch["id"]], keep_files=True)
+    assert result["files_removed"] == 0, result
+    rows = {row["id"]: row for row in pool_catalog.batches(dataset)}
+    assert batch["id"] in rows, "素材还在池里就把批次行删了：这批素材从此变成「没有批次」"
+    assert rows[batch["id"]]["status"] == pool_catalog.STATUS_RETIRED, rows[batch["id"]]
+    for rel in imported:
+        assert os.path.exists(os.path.join(images_dir(dataset), rel)), "只摘引用不该删文件"
+        assert str(ledger(dataset)[rel].get("batch")) == batch["id"], "来处被抹掉了"
+
+
+def test_purging_a_pool_batch_takes_the_row_and_the_files(dataset, fresh_dir):
+    """勾了「连原图文件一起删」才是真删：文件、账本、批次行一次清干净。"""
+    imported, _stats = import_only(dataset, fresh_dir)
+    batch = pool_catalog.create_batch(dataset, name="连图一起走")
+    pool_catalog.attach_items(dataset, batch["id"], imported)
+    pool_catalog.finish_batch(dataset, batch["id"])
+
+    result = delete_batches(dataset, [batch["id"]], keep_files=False)
+    assert result["files_removed"] >= len(imported), result
+    assert batch["id"] not in {row["id"] for row in pool_catalog.batches(dataset)}
+    for rel in imported:
+        assert not os.path.exists(os.path.join(images_dir(dataset), rel))
+        assert rel not in ledger(dataset)
+
+
+def test_import_can_categorize_on_the_way_in(server, dataset):
+    """导入弹层里选的分类要在落池那一刻打上，不用事后再去框一遍。"""
+    base = server[0]
+    cat = pool_catalog.save_category(dataset, "夜场")["category"]
+    status, _headers, body = upload(base, "night.jpg", jpeg_bytes(777))
+    assert status == 200, body
+    stored = json.loads(body)["stored"]
+
+    status, _headers, body = call(base, "/api/jobs",
+                                 data=json.dumps({"kind": "pool", "files": [stored],
+                                                  "params": {"batch_name": "夜拍",
+                                                             "category": cat["id"]}}).encode(),
+                                 headers=JSON)
+    assert status in (200, 202), body
+    job = wait_job(base, json.loads(body)["id"])
+    assert job["ok"], job
+
+    fresh = sorted(set(ledger(dataset)) - {"img0.jpg", "img1.jpg"})
+    assert fresh, "导入的素材没进池账本"
+    assert all(str(ledger(dataset)[rel].get("category")) == cat["id"] for rel in fresh), \
+        "导入时选的分类没生效"
+
+
+def test_delete_reports_batch_ids_not_dicts(dataset):
+    """删完回给前端的批次清单必须是 ID：整串 dict 印在提示条上没人看得懂。"""
+    rel = sorted(load_index(dataset, "pose").items)[0]
+    batch = create_batch(dataset, name="要清掉的", kind="image", lib="pose")
+    attach_items(dataset, batch["id"], [rel], lib="pose")
+
+    result = delete_images(dataset, [rel], lib="pose", mode="lib")
+    assert batch["id"] in result["batches_updated"], result
+    for item in result["batches_updated"]:
+        assert "{" not in item and "'" not in item, result["batches_updated"]
+
+
+# --------------------------------------------------------------------------- //
+# 批次记录：导入的、标注的一屏看全，删错了还能原样捞回来
+# --------------------------------------------------------------------------- //
+def test_annotation_batches_are_listed_too(server, dataset):
+    """跑过的那轮批量标注要在批次记录里找得到。
+
+    只列导入批次时，用户跑完「批量姿态标注 · 343 人」回到素材池页翻不到这批，
+    只能理解为「系统没记下我干的活」。现在一次列全，用 action 分清导入还是标注。
+    """
+    base = server[0]
+    rel = sorted(load_index(dataset, "pose").items)[0]
+    batch = create_batch(dataset, name="批量姿态标注 2 个", kind="pose", lib="pose")
+    attach_items(dataset, batch["id"], [rel], lib="pose")
+    finish_batch(dataset, batch["id"], "done", "完成：标注 1 张 · 8 个人")
+
+    rows = {row["id"]: row for row in json.loads(call(base, "/api/pool?view=all")[2])["batches"]}
+    assert batch["id"] in rows, "标注批次在批次记录里查无此批"
+    row = rows[batch["id"]]
+    assert row["action"] == "label" and row["action_name"] == "标注", row
+    assert int(row["items"]) >= 1, "标注批次一个素材都没挂上，界面上就是一条空批次"
+
+
+def test_module_import_stamps_the_provenance(server, dataset):
+    """从标注模块导进来的素材也得在池账本上盖来处章。
+
+    以前只有素材池页自己的导入会盖章，模块导入的素材在池账本上是「没有批次」，
+    于是素材池页按批次筛筛不到、按批次删也删不到——用户报的正是这一条。
+    """
+    base = server[0]
+    status, _headers, body = upload(base, "mod.jpg", jpeg_bytes(9001))
+    assert status == 200, body
+    stored = json.loads(body)["stored"]
+    status, _headers, body = call(base, "/api/jobs",
+                                 data=json.dumps({"kind": "image", "files": [stored],
+                                                  "params": {"label": False}}).encode(),
+                                 headers=JSON)
+    assert status in (200, 202), body
+    job = wait_job(base, json.loads(body)["id"])
+    assert job["ok"], job
+
+    fresh = sorted(set(ledger(dataset)) - {"img0.jpg", "img1.jpg"})
+    assert fresh, "模块导入的素材没进池账本"
+    stamps = {str(ledger(dataset)[rel].get("batch") or "") for rel in fresh}
+    assert stamps and "" not in stamps, "模块导入没盖来处章：素材池页按批次筛筛不到"
+    rows = {row["id"]: row for row in pool_catalog.import_records(dataset)}
+    for stamp in stamps:
+        assert stamp in rows, f"来处指向 {stamp}，批次记录里却没这一批"
+        assert rows[stamp]["action"] == "import", rows[stamp]
+
+
+def test_provenance_sticks_to_the_first_import(dataset, fresh_dir):
+    """同一帧被第二个模块再导一次，不该把「它从哪来」改成后面那次。"""
+    imported, _stats = import_only(dataset, fresh_dir)
+    first = pool_catalog.create_batch(dataset, name="第一次上传")
+    second = pool_catalog.create_batch(dataset, name="第二个模块又挑了一次")
+    pool_catalog.attach_items(dataset, first["id"], imported)
+    pool_catalog.attach_items(dataset, second["id"], imported)
+    for rel in imported:
+        assert str(ledger(dataset)[rel].get("batch")) == first["id"], "来处被后面那次改挂了"
+
+
+def test_retiring_a_library_import_batch_keeps_row_and_stamp(dataset):
+    """模块导入的批次「只摘引用」也得不留行、留来处，和池批次同一套规矩。"""
+    rel = sorted(load_index(dataset, "pose").items)[0]
+    batch = create_batch(dataset, name="模块导入的一批", kind="image", lib="pose")
+    attach_items(dataset, batch["id"], [rel], lib="pose")
+    pool_catalog.attach_items(dataset, batch["id"], [rel])
+    finish_batch(dataset, batch["id"], "done", "入库 1 张")
+
+    delete_batches(dataset, [batch["id"]], keep_files=True)
+    rows = {row["id"]: row for row in pool_catalog.import_records(dataset)}
+    assert batch["id"] in rows, "只摘引用就把批次行删了：这批素材从此没有来处"
+    assert rows[batch["id"]]["status"] == pool_catalog.STATUS_RETIRED, rows[batch["id"]]
+    assert str(ledger(dataset)[rel].get("batch")) == batch["id"], "素材还在池里，来处不该抹"
+
+
+def test_purging_a_library_import_batch_clears_the_stamp(dataset):
+    """连原图一起删才是真删：批次行、索引、来处章一次清干净，不留暗账。"""
+    rel = sorted(load_index(dataset, "pose").items)[0]
+    batch = create_batch(dataset, name="整批清掉", kind="image", lib="pose")
+    attach_items(dataset, batch["id"], [rel], lib="pose")
+    pool_catalog.attach_items(dataset, batch["id"], [rel])
+    finish_batch(dataset, batch["id"], "done", "入库 1 张")
+
+    delete_batches(dataset, [batch["id"]], keep_files=False)
+    assert batch["id"] not in {row["id"] for row in list_batches(dataset)}
+    assert batch["id"] not in {row["id"] for row in pool_catalog.import_records(dataset)}
+    assert not str(ledger(dataset).get(rel, {}).get("batch") or ""), "素材都没了还留着来处"
+
+
+def test_restore_brings_back_what_a_batch_delete_took(dataset):
+    """删掉的批次要能原样装回来：标签原文、索引条目、批次记录，一样都不靠重跑。"""
+    rel = sorted(load_index(dataset, "pose").items)[0]
+    label = label_path_for(dataset, rel, "pose")
+    with open(label, "w", encoding="utf-8") as handle:
+        handle.write("0 0.5 0.5 0.2 0.3 0.9 0.9 0.02\n" * 3)
+    batch = create_batch(dataset, name="删错的那批", kind="image", lib="pose")
+    attach_items(dataset, batch["id"], [rel], lib="pose")
+    finish_batch(dataset, batch["id"], "done", "入库 1 张")
+
+    delete_batches(dataset, [batch["id"]], keep_files=True)
+    assert rel not in load_index(dataset, "pose").items
+    assert not os.path.exists(label), "前提：删除确实把标签文件摘掉了"
+
+    snapshot = list_snapshots(dataset, limit=1)[0]
+    assert snapshot["restorable"] == 1, snapshot
+
+    back = restore_deletion(dataset)
+    assert back["items"] == 1 and back["labels"] == 1, back
+    assert back["batches"] >= 1, back
+    assert rel in load_index(dataset, "pose").items, "图片没装回索引"
+    assert load_index(dataset, "pose").items[rel].get("batch_id") == batch["id"]
+    assert os.path.exists(label), "标签原文没写回来"
+    assert snapshot["name"] not in {row["name"] for row in list_snapshots(dataset)}, \
+        "捞过的快照要吃掉，不然按钮点第二次会重复装回"
+
+
+def test_restore_endpoint_says_so_when_nothing_is_left(server, dataset):
+    """没有快照时「捞回上次删除」得给一句人话，而不是一串裸异常。"""
+    base = server[0]
+    status, _headers, body = call(base, "/api/batches/restore", data=json.dumps({}).encode(),
+                                 headers=JSON)
+    assert status == 400, body
+    assert "快照" in body.decode("utf-8"), body
+
+
+# --------------------------------------------------------------------------- //
+# 空账：账上有图、盘上没图，会把重新导入的同一批图挡在门外
+# --------------------------------------------------------------------------- //
+def test_purging_the_last_holder_clears_the_ledger_row(dataset, fresh_dir):
+    """连原图一起删：池账本的条目得跟着走，否则这批图的 sha256 变成空账。
+
+    用户实测踩到的：一批图删掉再重新上传，传 255 张只落 169 张——删的时候只抹了
+    「来处章」，账上的 sha256 还留着，去重一撞就当成"池里已经有了"，文件根本没落盘。
+    """
+    imported, _stats = import_only(dataset, fresh_dir)
+    adopt_from_pool(dataset, imported, lib="detect")
+    batch = create_batch(dataset, name="整批清掉再重导", kind="detect_upload", lib="detect")
+    attach_items(dataset, batch["id"], imported, lib="detect")
+    pool_catalog.attach_items(dataset, batch["id"], imported)
+    finish_batch(dataset, batch["id"], "done", "入库 2 张")
+    assert set(imported) <= set(ledger(dataset)), "前提：素材账本里确实记着这批图"
+
+    delete_batches(dataset, [batch["id"]], keep_files=False)
+
+    for rel in imported:
+        assert not os.path.exists(os.path.join(images_dir(dataset), rel)), rel
+        assert rel not in ledger(dataset), f"{rel} 的文件删了，素材账本还记着一条空账"
+
+    again = import_images(dataset, [fresh_dir], dedupe="exact", register=False)
+    assert again["skipped_exact"] == 0, "重导的同一批图被空账当成重复跳过了"
+    assert again["imported"] == len(imported), again
+
+
+def test_import_ignores_a_hash_whose_file_is_gone(dataset, fresh_dir):
+    """去重要认图不认账：手工删过 images/ 之后，同一批图还能重新进池。"""
+    imported, _stats = import_only(dataset, fresh_dir)
+    for rel in imported:
+        os.remove(os.path.join(images_dir(dataset), rel))
+
+    again = import_images(dataset, [fresh_dir], dedupe="exact", register=False)
+    assert again["imported"] == len(imported) and again["skipped_exact"] == 0, again
+    for _src, rel in again["imported_files"]:
+        assert os.path.exists(os.path.join(images_dir(dataset), rel)), rel
+
+
+def test_startup_reconcile_clears_ledger_rows_for_missing_files(dataset, fresh_dir):
+    """启动对账要把空账清干净：素材池页的张数和磁盘说的是同一句话。"""
+    imported, _stats = import_only(dataset, fresh_dir)
+    for rel in imported:
+        os.remove(os.path.join(images_dir(dataset), rel))
+
+    report = reconcile_with_disk(dataset)
+    assert report["ledger_pruned"] == len(imported), report
+    assert not (set(imported) & set(ledger(dataset))), "空账还在，重导还会被挡"
+    assert reconcile_with_disk(dataset)["ledger_pruned"] == 0, "对账要可重入"
+
+
+def test_pool_job_reports_which_files_were_dropped(server, dataset):
+    """任务完成消息要讲清少掉的张数去哪了，不能拿"入库 255 张"糊过去。"""
+    base = server[0]
+    status, _headers, body = upload(base, "第一次.jpg", jpeg_bytes(9901))
+    assert status == 200, body
+    first = json.loads(body)["stored"]
+    status, _headers, body = call(base, "/api/jobs",
+                                 data=json.dumps({"kind": "pool", "files": [first]}).encode(),
+                                 headers=JSON)
+    assert status in (200, 202), body
+    job = wait_job(base, json.loads(body)["id"])
+    assert job["ok"] and job["result"]["imported"] == 1, job
+    assert "与已有素材内容相同" not in job["message"], job["message"]
+
+    # 同一个内容换个文件名再传一次：张数要报 0，并且说清是被去重跳过的
+    status, _headers, body = upload(base, "同一个内容又传一次.jpg", jpeg_bytes(9901))
+    second = json.loads(body)["stored"]
+    status, _headers, body = call(base, "/api/jobs",
+                                 data=json.dumps({"kind": "pool", "files": [second]}).encode(),
+                                 headers=JSON)
+    job = wait_job(base, json.loads(body)["id"])
+    assert job["ok"] and job["result"]["imported"] == 0, job
+    assert "与已有素材内容相同" in job["message"], job["message"]

@@ -38,12 +38,17 @@ from .dataset import (
     load_index_or_none,
     now_str,
     resolve_image,
+    source_missing,
 )
 from .atomic import atomic_write_json
 # 池账本（分类 / 只进池的素材）：它只依赖 dataset 与 library，不会绕回本模块
 from .pool import pool_items_map
-from .pool import POOL_BATCH_PREFIX, STATUS_RUNNING as POOL_STATUS_RUNNING
+from .pool import IMPORT_KINDS
+from .pool import POOL_BATCH_PREFIX
+from .pool import STATUS_RUNNING as POOL_STATUS_RUNNING
+from .pool import STATUS_RETIRED as POOL_STATUS_RETIRED
 from .pool import prune as prune_pool
+from .pool import reconcile as reconcile_pool
 from .library import (
     LIBRARIES,
     LIB_DETECT,
@@ -280,14 +285,22 @@ def reconcile_with_disk(root: str) -> dict:
     素材池几个库共用，所以「孤儿」的定义是**所有库的索引都不要这张图**；
     补进哪个库看当时还有没有正在跑的批次，都没有就归到姿态库的未分组。
 
+    顺带清一次池账本的空账（账上记着、盘上已没有的素材）：空账的 ``sha256`` 还挂在
+    去重表里，下次导入同一批图会被当成"池里已经有了"而跳过，文件根本不落盘。
+
     :return: ``{"recovered": 补回张数, "items": 补回的相对路径样本,
               "interrupted": 判定中断的批次 ID, "missing_files": 索引有记录但原图没了的张数,
-              "by_lib": 每个库的同类统计}``
+              "ledger_pruned": 清掉的素材账本空账条数, "by_lib": 每个库的同类统计}``
     """
     root = os.path.abspath(root)
     report = {"recovered": 0, "items": [], "interrupted": [], "missing_files": 0, "by_lib": {}}
     missing: set = set()
     with _file_lock(root):
+        # 先清池账本上的空账再找孤儿图：空账会让素材池页多报张数，还会把重导的同一批图
+        # 挡在去重门外（用户报的"传 255 只进 169"），清掉之后盘和账才说同一句话
+        ledger = reconcile_pool(root)
+        report["ledger_pruned"] = int(ledger.get("removed") or 0)
+        report["ledger_batches_emptied"] = int(ledger.get("batches_emptied") or 0)
         tombstones = _kept_file_tombstones(root)
         running_by_lib = {lib: [row for row in load_batches(root, lib)
                                 if row.get("status") == STATUS_RUNNING] for lib in LIBRARIES}
@@ -652,8 +665,9 @@ def delete_pool_batches(root: str, batch_ids: Sequence[str], *, keep_files: bool
 
     * 还被某个库引用的素材走库口径（摘引用 / 连素材一起删），别绕过标签与快照；
     * 只进了池的素材走 :func:`delete_pool_only`，文件和账本一起清；
-    * 批次行删掉之后，素材上指向它的「来处」也一起抹掉，不留指向不存在批次的暗账
-      （否则素材池页按这批筛就永远筛不到东西，界面上却还写着来自这批）。
+    * ``keep_files=True`` 只把批次标成「已退回模块外」，行和来处都留着——素材还在池里；
+    * 连原图一起删时批次行才真删，素材上指向它的「来处」同时抹掉，
+      不留指向不存在批次的暗账。
 
     :param keep_files: 只摘引用，``images/`` 里的原图留在池里
     :param active_ids: 还在跑任务的批次 ID；正在导入的批次默认拒绝删
@@ -704,13 +718,22 @@ def delete_pool_batches(root: str, batch_ids: Sequence[str], *, keep_files: bool
 
     catalog = pool_catalog.load_catalog(root)
     wanted = set(ids)
-    catalog["batches"] = [row for row in catalog["batches"]
-                          if str(row.get("id")) not in wanted]
     detached = 0
-    for item in list(catalog["items"].values()):
-        if str(item.get("batch") or "") in wanted:
-            item.pop("batch", None)
-            detached += 1
+    if keep_files:
+        # 素材还在池里，来处就得留着：批次行只标成「已退回模块外」。连着批次行一起删，
+        # 这 43 个素材就变成了「没有批次」——素材池页既看不出它们从哪来，
+        # 也没法再按这一批筛出来删（用户报的「导入的没有批次、也没法删除」就是这么来的）
+        for row in catalog["batches"]:
+            if str(row.get("id")) in wanted:
+                row["status"] = POOL_STATUS_RETIRED
+                row["message"] = "整批退回模块外，素材仍在池里"
+    else:
+        catalog["batches"] = [row for row in catalog["batches"]
+                              if str(row.get("id")) not in wanted]
+        for item in list(catalog["items"].values()):
+            if str(item.get("batch") or "") in wanted:
+                item.pop("batch", None)
+                detached += 1
     pool_catalog.save_catalog(root, catalog)
     return {"batches": sorted(wanted), "items": items, "removals": removals,
             "files_removed": files, "snapshot": snapshot, "keep_files": keep_files,
@@ -890,8 +913,8 @@ def delete_images(root: str, image_rels: Sequence[str], *, lib: str = LIB_POSE,
               "snapshot": snapshot_path, "keep_files": keep_files, "mode": mode, "lib": lib,
               "libs": [t for t in targets if chosen.get(t)],
               "missing": sorted(set(missing))[:10],
-              "batches_updated": sorted({str(b) for b in snapshot.get("batches", [])
-                                         if isinstance(b, dict)})}
+              "batches_updated": sorted({str(b.get("id")) for b in snapshot.get("batches", [])
+                                         if isinstance(b, dict) and b.get("id")})}
     result["batches_emptied"] = [b["id"] for b in snapshot.get("batches", [])
                                  if isinstance(b, dict) and b.get("emptied")]
     if pool_result.get("items"):
@@ -979,6 +1002,7 @@ def delete_batches(root: str, batch_ids: Sequence[str], *, keep_files: bool = Fa
     with _file_lock(root):
         plan: List[Tuple[str, dict, List[str]]] = []
         registry: Dict[str, List[dict]] = {}
+        unstamped: List[Tuple[str, str]] = []
         for batch_id in expanded:
             real_id = batch_id
             if batch_id.startswith(f"{UNGROUPED_ID}:"):
@@ -997,7 +1021,15 @@ def delete_batches(root: str, batch_ids: Sequence[str], *, keep_files: bool = Fa
                 if running and not force and (live is None or batch_id in live):
                     raise ValueError(f"批次「{record.get('name')}」仍在标注中，请先点「清除任务」，"
                                      f"或加 --force 强删")
-                registry[lib] = [b for b in registry[lib] if str(b.get("id")) != batch_id]
+                if keep_files and str(record.get("kind") or "") in IMPORT_KINDS:
+                    # 只摘引用 = 整批退回模块外：素材还在池里，来处和记录就得留着，
+                    # 和素材池批次同一个规矩。连着记录一起删，这几十个素材当场变成"没有批次"
+                    record["status"] = POOL_STATUS_RETIRED
+                    record["message"] = "整批退回模块外，素材仍在池里"
+                else:
+                    registry[lib] = [b for b in registry[lib] if str(b.get("id")) != batch_id]
+                    if str(record.get("kind") or "") in IMPORT_KINDS:
+                        unstamped.append((lib, batch_id))
             plan.append((lib, record, batch_items(root, batch_id, lib)))
 
         snapshot: dict = {"deleted_at": now_str(), "keep_files": keep_files,
@@ -1005,6 +1037,7 @@ def delete_batches(root: str, batch_ids: Sequence[str], *, keep_files: bool = Fa
                           "batches": [], "items": {}}
         removed_files = 0
         removals = 0
+        purged: List[str] = []  # 这次连原图一起删掉的素材，用来回头清池账本
         for lib, record, rels in plan:
             idx = load_index_or_none(root, lib)
             if idx is None:
@@ -1022,6 +1055,7 @@ def delete_batches(root: str, batch_ids: Sequence[str], *, keep_files: bool = Fa
                 removed_files += _remove_lib_files(root, lib, rel)
                 if not keep_files:
                     removed_files += _maybe_remove_pool(root, lib, rel)
+                    purged.append(rel)
                 idx.remove(rel)
             snapshot["batches"].append({**record, "lib": lib, "items": kept})
             idx.save()
@@ -1029,6 +1063,24 @@ def delete_batches(root: str, batch_ids: Sequence[str], *, keep_files: bool = Fa
                                or str(row.get("id")) != UNGROUPED_ID]
         for lib, rows in registry.items():
             save_batches(root, rows, lib)
+        # 连原图一起删：素材本体没了，池账本里的条目也必须跟着走。以前只抹「来处章」
+        # 不删条目，sha256 还留在账上——下次导入同一批图，去重一撞就当成"池里已经有了"，
+        # 文件根本没落盘：传 255 张只进 169 张，界面上还写着"已进池 255 张"。
+        # 还有别的库在用的素材文件没删（_maybe_remove_pool 留的），那些得留在账上。
+        if purged:
+            lost = [rel for rel in purged if source_missing(root, rel)]
+            if lost:
+                prune_pool(root, lost)
+        # 连原图一起删的导入批次：素材本体没了，池账本上的来处章也得跟着抹，
+        # 否则素材池页按这批筛会筛到一堆指向空气的记录
+        if unstamped:
+            from . import pool as pool_catalog
+
+            for lib, batch_id in unstamped:
+                rels = [rel for row in snapshot["batches"]
+                        if str(row.get("id")) == batch_id for rel in (row.get("items") or [])]
+                if rels:
+                    pool_catalog.detach_batch(root, rels)
         snapshot_path = _write_snapshot(root, snapshot) if snapshot["items"] else ""
 
     result = {"batches": sorted({str(record["id"]) for _lib, record, _rels in plan}),
@@ -1055,6 +1107,198 @@ def _merge_delete_results(one: dict, two: dict) -> dict:
     merged["mode"] = "mixed"
     merged["pool_only"] = int(one.get("pool_only") or 0) + int(two.get("pool_only") or 0)
     return merged
+
+
+# --------------------------------------------------------------------------- #
+# 删错了往回捞
+# --------------------------------------------------------------------------- #
+
+def list_snapshots(root: str, limit: int = 20) -> List[dict]:
+    """删除快照清单（新→旧）：界面上的「捞回上次删除」和命令行 ``--restore`` 都读它。
+
+    快照是删图 / 删批次时顺手写的补救材料，里面存着索引条目原文和三个库各自的标签
+    原文。以前只写不读，界面上那句"误删能捞回来"其实要人手拼 JSON。
+    """
+    folder = deleted_dir(root)
+    try:
+        names = sorted((name for name in os.listdir(folder) if _SNAPSHOT_NAME.match(name)),
+                       key=_snapshot_order, reverse=True)
+    except OSError:
+        return []
+    out: List[dict] = []
+    for name in names[:max(0, int(limit))]:
+        try:
+            with open(os.path.join(folder, name), "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        items = data.get("items") if isinstance(data.get("items"), dict) else {}
+        # 原图已经被删掉的（勾了"连原图文件一起删"）装回来也是指向空气，先数清楚
+        alive = sum(1 for rel in items if not source_missing(root, str(rel)))
+        out.append({
+            "name": name, "deleted_at": data.get("deleted_at"),
+            "mode": str(data.get("mode") or ""), "lib": str(data.get("lib") or ""),
+            "keep_files": bool(data.get("keep_files")),
+            "batches": len([row for row in (data.get("batches") or [])
+                            if isinstance(row, dict) and row.get("id") and row.get("kind")]),
+            "items": len(items), "restorable": alive,
+        })
+    return out
+
+
+def restore_deletion(root: str, name: str = "", *, regenerate: bool = True) -> dict:
+    """把一次删除原样装回去：标签文件、索引条目、批次记录，池里的来处也一并补上。
+
+    一张图该回哪个库按两层证据判：它原来挂的批次属于哪个库，其次看快照里哪个库存过
+    它的标签原文（同一张图从几个库被摘过时，标签原文是分库存的）。原图文件已经不在了
+    就不装——装回来只是让索引里多一条指向空气的记录，导出时才炸。
+
+    :param name: 快照文件名，留空装最近一次
+    """
+    from . import pool as pool_catalog
+
+    root = os.path.abspath(root)
+    wanted = str(name or "").strip()
+    if wanted:
+        chosen = os.path.basename(wanted)
+        if not _SNAPSHOT_NAME.match(chosen):
+            raise ValueError(f"快照文件名认不出来: {wanted}")
+    else:
+        newest = list_snapshots(root, limit=1)
+        if not newest:
+            raise ValueError("没有删除快照可捞：删图 / 删批次时会自动写一份到 .autolabel/deleted/")
+        chosen = str(newest[0]["name"])
+    path = os.path.join(deleted_dir(root), chosen)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except OSError as exc:
+        raise ValueError(f"读不到快照 {chosen}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"快照 {chosen} 已经损坏: {exc}") from exc
+
+    items = data.get("items") if isinstance(data.get("items"), dict) else {}
+    records = [row for row in (data.get("batches") or [])
+               if isinstance(row, dict) and row.get("id") and row.get("kind")]
+    if not items and not records:
+        raise ValueError(f"快照 {chosen} 是空的，没东西可捞")
+    owner = {str(row.get("id")): normalize(str(row.get("lib") or LIB_POSE)) for row in records}
+
+    plan: Dict[str, Dict[str, dict]] = {}
+
+    def queue(target: str, rel: str, entry: dict, full: bool) -> None:
+        """把一张图排进某个库的装回清单；``full=False`` 只带素材层字段。
+
+        快照里每张图只留一份索引条目（几个库同删时后写的盖掉先写的），素材层字段
+        （尺寸 / 哈希 / 入库时间）几个库通用，标注层字段却不通用。往"不是自己那份"的
+        库装回时只搬通用字段，剩下那一库的标签原文单独补——宁可少几个状态标记，
+        也不能让检测库的 ``detect_*`` 跑到提示词库的索引里。
+        """
+        slot = plan.setdefault(target, {})
+        if rel in slot:
+            if full and slot[rel] is not entry:
+                slot[rel] = entry
+            return
+        if full:
+            slot[rel] = entry
+            return
+        from .pool import POOL_ITEM_KEYS
+
+        keep = {key: value for key, value in entry.items()
+                if key in POOL_ITEM_KEYS or key in ("imported_at", "bytes", "width", "height")}
+        keep["batch_id"] = str(entry.get("batch_id") or "")
+        slot[rel] = keep
+
+    for rel, entry in items.items():
+        if not isinstance(entry, dict):
+            continue
+        targets = [owner.get(str(entry.get("batch_id") or ""))] if owner.get(
+            str(entry.get("batch_id") or "")) else []
+        targets += [name for name in LIBRARIES if entry.get(f"{name}_label_lines")]
+        targets.append(normalize(str(entry.get("lib") or LIB_POSE)))
+        for target in dict.fromkeys(name for name in targets if name):
+            queue(target, str(rel), entry, True)
+    # 批次记录里点名的素材：即使快照把它算给了别的库，这个库也曾经引用过它，得装回
+    for record in records:
+        target = owner.get(str(record.get("id")))
+        batch_id = str(record.get("id"))
+        if not target:
+            continue
+        for rel in (record.get("items") or []):
+            entry = items.get(str(rel))
+            if not isinstance(entry, dict):
+                continue
+            entry = {**entry, "batch_id": batch_id}
+            queue(target, str(rel), entry, str(entry.get("batch_id")) == batch_id
+                  and normalize(str(entry.get("lib") or "")) == target)
+
+    restored = {"items": 0, "labels": 0, "batches": 0}
+    landed: set = set()
+    skipped: List[str] = []
+    with _file_lock(root):
+        for target, rows in plan.items():
+            idx = load_index(root, target)
+            for rel, entry in rows.items():
+                if source_missing(root, rel):
+                    skipped.append(rel)
+                    continue
+                if idx.get(rel) is not None:
+                    continue  # 已经在那儿了（比如又重导过一次），别覆盖新的
+                fields = {key: value for key, value in entry.items()
+                          if key != "lib" and not str(key).endswith("_label_lines")}
+                idx.upsert(rel, **fields)
+                restored["items"] += 1
+                landed.add(rel)
+                lines = [str(line) for line in (entry.get(f"{target}_label_lines") or [])
+                         if str(line).strip()]
+                if not lines:
+                    continue
+                label = label_path_for(root, rel, target)
+                if os.path.exists(label):
+                    continue
+                os.makedirs(os.path.dirname(label), exist_ok=True)
+                with open(label, "w", encoding="utf-8") as fh:
+                    fh.write("\n".join(lines) + "\n")
+                restored["labels"] += 1
+            idx.save()
+
+        touched: Dict[str, List[dict]] = {}
+        for record in records:
+            target = owner.get(str(record.get("id"))) or LIB_POSE
+            rows = touched.setdefault(target, load_batches(root, target))
+            batch_id = str(record.get("id"))
+            kept = [str(rel).replace("\\", "/") for rel in (record.get("items") or [])]
+            found = next((row for row in rows if str(row.get("id")) == batch_id), None)
+            if found is None:
+                fresh = {**record, "lib": target, "status": "done"}
+                rows.append(fresh)
+                restored["batches"] += 1
+            else:
+                # 只摘引用时留的是"已退回模块外"，素材装回来了这行就恢复成已完成
+                found["status"] = "done"
+                restored["batches"] += 1
+                found["message"] = str(record.get("message") or found.get("message") or "")
+                found["items"] = sorted({str(rel).replace("\\", "/")
+                                         for rel in (found.get("items") or [])} | set(kept))
+        for target, rows in touched.items():
+            save_batches(root, rows, target)
+        # 导入批次的来处章重新盖回池账本：素材池页的批次筛选、按批删除都靠它
+        for record in records:
+            if str(record.get("kind") or "") not in IMPORT_KINDS:
+                continue
+            kept = [str(rel).replace("\\", "/") for rel in (record.get("items") or [])]
+            if kept:
+                pool_catalog.attach_items(root, str(record.get("id")), kept)
+        os.remove(path)
+
+    result = {"snapshot": chosen, "items": len(landed), "entries": restored["items"],
+              "labels": restored["labels"], "batches": restored["batches"],
+              "skipped": len(skipped),
+              "skipped_files": [os.path.basename(rel) for rel in sorted(set(skipped))][:6],
+              "mode": str(data.get("mode") or ""), "keep_files": bool(data.get("keep_files"))}
+    if regenerate and restored["items"]:
+        result.update(_regenerate(root))
+    return result
 
 
 # --------------------------------------------------------------------------- #

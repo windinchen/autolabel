@@ -15,6 +15,8 @@ const POOL = {
   cat: "",           // "" = 全部；"__none__" = 未分类；其余是分类 ID
   state: "",         // "" / unassigned / in / shared
   batch: "",         // 来源批次 ID
+  batchKind: "",     // "" = 全部；import = 只看导入；label = 只看标注
+  restore: {},       // 最近一次删除快照（能捞回来的那份）
   query: "",
   busy: false,
   batchSel: new Set(),
@@ -24,7 +26,7 @@ const POOL = {
 
 const UNCATEGORIZED = "__none__";
 const BATCH_STATUS = { running: "进行中", done: "已完成", cancelled: "已取消",
-                       failed: "失败", interrupted: "已中断" };
+                       failed: "失败", interrupted: "已中断", retired: "已退回模块外" };
 const BATCH_SOURCE = { upload: "网页上传", cli: "命令行", ui: "网页操作",
                        unknown: "历史", "-": "历史" };
 
@@ -40,6 +42,7 @@ async function loadPool() {
     POOL.rows = data.all || [];
     POOL.cats = data.categories || [];
     POOL.batches = data.batches || [];
+    POOL.restore = data.restore || {};
     POOL.stats = data.stats || {};
     const name = (data.dataset && data.dataset.name) || "";
     if (name) { $("ds-name").textContent = " · " + name; }
@@ -123,7 +126,7 @@ function renderPoolFilters() {
   const batch = $("pool-batch");
   const current = POOL.batch;
   batch.innerHTML = '<option value="">全部批次</option>';
-  for (const row of POOL.batches) {
+  for (const row of POOL.batches.filter((item) => item.action !== "label")) {
     const opt = document.createElement("option");
     opt.value = String(row.id);
     opt.textContent = `${row.name || "未命名批次"}（${row.items || 0} 张）`;
@@ -461,16 +464,65 @@ function setPoolView(view) {
 function renderBatchView() {
   const box = $("pool-batch-list");
   if (!box) { return; }
-  const rows = POOL.batches;
-  $("batch-count").textContent = rows.length ? `共 ${rows.length} 批` : "还没有导入记录";
+  const rows = POOL.batches.filter((row) => !POOL.batchKind || row.action === POOL.batchKind);
+  $("batch-count").textContent = rows.length
+    ? `共 ${rows.length} 批` + (POOL.batchKind ? `（已筛，全部 ${POOL.batches.length} 批）` : "")
+    : "还没有批次记录";
+  syncRestoreButton();
   box.innerHTML = "";
   if (!rows.length) {
-    box.innerHTML = '<div class="batch-empty muted small">还没有批次记录：从这一页或各标注模块导入一次素材就会出现在这里。</div>';
+    box.innerHTML = '<div class="batch-empty muted small">'
+      + (POOL.batchKind ? "这一类还没有批次：换个类型，或去标注模块跑一轮批量标注。"
+        : "还没有批次记录：从这一页或各标注模块导入一次素材就会出现在这里。") + '</div>';
     syncBatchButtons();
     return;
   }
   for (const batch of rows) { box.append(batchRow(batch)); }
   syncBatchButtons();
+}
+
+/** 「捞回上次删除」：有快照才点亮，并把要捞的东西写在按钮旁边 */
+function syncRestoreButton() {
+  const button = $("batch-restore");
+  const note = $("restore-note");
+  if (!button) { return; }
+  const info = POOL.restore || {};
+  const ok = Boolean(info.name) && Number(info.restorable || 0) > 0;
+  button.disabled = !ok || POOL.busy;
+  button.title = ok ? `捞回 ${info.deleted_at || ""} 那次删除：${info.items || 0} 张图片`
+    : "还没有可捞回的删除快照";
+  if (note) {
+    note.textContent = ok
+      ? `最近一次删除：${info.deleted_at || "时间未知"} · ${info.items || 0} 张（可装回 ${info.restorable} 张）`
+        + " · 每次删除都在 .autolabel/deleted/ 留快照，含标签原文"
+      : "每次删除都会在 .autolabel/deleted/ 留一份快照（含标签原文），删错了点「捞回上次删除」装回来。";
+  }
+}
+
+async function restoreLastDelete() {
+  const info = POOL.restore || {};
+  if (!info.name || POOL.busy) { return; }
+  const ok = await confirmBox({
+    title: "捞回上次删除",
+    body: `把 ${info.deleted_at || "上次"} 删掉的 ${info.items || 0} 张装回各标注库：`
+      + "索引条目、标签原文、批次记录一起恢复，原图文件已经删掉的会跳过。",
+    okLabel: "装回来",
+  });
+  if (!ok) { return; }
+  POOL.busy = true;
+  try {
+    const data = await postJson("/api/batches/restore", { name: info.name });
+    const text = `已捞回 ${data.items} 张 · 标签 ${data.labels} 份 · 批次记录 ${data.batches} 个`
+      + (data.skipped ? ` · 原图没了跳过 ${data.skipped} 张` : "");
+    poolLog(text);
+    toast(text);
+    await loadPool();
+  } catch (err) {
+    poolLog("捞回失败：" + err.message, true);
+    toast("捞回失败：" + err.message, true);
+  }
+  POOL.busy = false;
+  renderBatchView();
 }
 
 function batchRow(batch) {
@@ -492,14 +544,18 @@ function batchRow(batch) {
   name.className = "batch-name";
   const badge = document.createElement("span");
   badge.className = "chip";
-  badge.textContent = batch.module_name || LIB_LABELS[batch.module] || "素材池";
+  badge.textContent = `${batch.action_name || "导入"} · `
+    + (batch.module_name || LIB_LABELS[batch.module] || "素材池");
   name.append(badge, document.createTextNode(" " + (batch.name || "未命名批次")));
   const files = (batch.files || []).slice(0, 3).join("、")
     + (batch.file_count > 3 ? ` 等 ${batch.file_count} 个` : "");
   const meta = document.createElement("div");
   meta.className = "muted small batch-meta";
+  const left = Number(batch.in_pool || 0);
   meta.textContent = `${batch.created_at || "时间未知"} · `
-    + `${BATCH_SOURCE[batch.source] || batch.source || "历史"} · ${batch.items || 0} 个素材`
+    + `${BATCH_SOURCE[batch.source] || batch.source || "历史"} · `
+    + (left === Number(batch.items || 0) ? `${left} 个素材`
+       : `${left} 个素材还在池里（原报 ${batch.items || 0} 个）`)
     + (files ? ` · ${files}` : "") + (batch.message ? ` · ${batch.message}` : "");
   main.append(name, meta);
   const status = document.createElement("span");
@@ -522,11 +578,14 @@ function batchRow(batch) {
 
 async function loadBatchFiles(id) {
   if (POOL.batchFiles[id]) { delete POOL.batchFiles[id]; renderBatchView(); return; }
+  const poolBatch = String(id).startsWith("p_");
   const label = [];
   try {
     const data = await getJson("/api/batch/files?id=" + encodeURIComponent(id));
     for (const file of (data.files || []).slice(0, 40)) {
-      label.push(`${file.name} · ${kb(file.bytes || 0)} · ${statusLabel(file.status || "")}`);
+      // 池批次没进过任何库，没有复核状态可写，写它的分类才有用
+      label.push(poolBatch ? `${file.name} · ${kb(file.bytes || 0)} · ${file.category_name || "未分类"}`
+        : `${file.name} · ${kb(file.bytes || 0)} · ${statusLabel(file.status || "")}`);
     }
     POOL.batchFiles[id] = (data.files || []).length
       ? label.join("\n") + ((data.files || []).length > 40 ? `\n… 还有 ${(data.files || []).length - 40} 个` : "")
@@ -552,10 +611,13 @@ async function deleteBatches() {
   const ids = [...POOL.batchSel];
   if (!ids.length || POOL.busy) { return; }
   const purge = $("purge-files").checked;
+  const picked = POOL.batches.filter((row) => ids.includes(String(row.id)));
+  const labels = picked.filter((row) => row.action === "label").length;
   const ok = await confirmBox({
     title: `删掉 ${ids.length} 个批次`,
-    body: purge ? "这批素材在每个标注库里的引用都摘掉，并把 images/ 里的原图一起删掉。"
-      : "只摘掉各标注库对这批素材的引用，原图留在池里，以后还能再挑进来。",
+    body: (purge ? "这批素材在每个标注库里的引用都摘掉，并把 images/ 里的原图一起删掉。"
+      : "只摘掉各标注库对这批素材的引用，原图留在池里，以后还能再挑进来。")
+      + (labels ? ` 其中 ${labels} 个是标注批次，这一轮标出来的结果也会一起摘掉（可用「捞回上次删除」装回来）。` : ""),
     okLabel: purge ? "删批次和原图" : "只摘引用",
   });
   if (!ok) { return; }
@@ -594,7 +656,22 @@ const up = { files: [], busy: false };
 
 function openUpload(open) {
   $("up-modal").classList.toggle("hidden", !open);
-  if (open) { syncUpload(); $("up-batch-name").focus(); }
+  if (open) { paintCategoryChoices(); syncUpload(); $("up-batch-name").focus(); }
+}
+
+/** 导入弹层的分类选项：这一页已经读过分类表，直接铺，不必再请求一次 */
+function paintCategoryChoices() {
+  const select = $("up-category");
+  if (!select) { return; }
+  const keep = select.value;
+  select.innerHTML = '<option value="">未分类</option>';
+  for (const row of POOL.cats || []) {
+    const opt = document.createElement("option");
+    opt.value = String(row.id);
+    opt.textContent = row.name || "未命名分类";
+    select.append(opt);
+  }
+  if ([...select.options].some((opt) => opt.value === keep)) { select.value = keep; }
 }
 
 function addUploadFiles(list) {
@@ -650,6 +727,7 @@ async function startUpload() {
   }
   const params = {
     batch_name: $("up-batch-name").value.trim(),
+    category: readImportCategory("up-category"),
     fps: readNumber("up-fps", 0.5),
     max_frames: Math.round(readNumber("up-max-frames", 600)),
     video_dedupe: $("up-keep-similar").checked ? "none" : "perceptual",
@@ -769,6 +847,8 @@ async function bootPool() {
   $("pool-select-all").onclick = selectAllVisible;
   $("pool-state").onchange = (e) => { POOL.state = e.target.value; renderPoolGrid(); };
   $("pool-batch").onchange = (e) => { POOL.batch = e.target.value; renderPoolGrid(); };
+  $("batch-kind").onchange = (e) => { POOL.batchKind = e.target.value; renderBatchView(); };
+  $("batch-restore").onclick = () => restoreLastDelete();
   $("pool-query").oninput = (e) => { POOL.query = e.target.value; renderPoolGrid(); };
   $("pool-adopt").onclick = adoptSelected;
   $("pool-assign").onclick = assignSelected;

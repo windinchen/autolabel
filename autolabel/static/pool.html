@@ -78,7 +78,7 @@
         <div class="menu-sep"></div>
         <div class="menu-label">管起来</div>
         <button class="menu-item" id="btn-categories"><svg class="ic"><use href="#ic-tag"/></svg>分类管理<span class="kbd k">C</span></button>
-        <button class="menu-item" id="btn-view-batches"><svg class="ic"><use href="#ic-layers"/></svg>看导入批次<span class="kbd k">B</span></button>
+        <button class="menu-item" id="btn-view-batches"><svg class="ic"><use href="#ic-layers"/></svg>看批次记录<span class="kbd k">B</span></button>
         <button class="menu-item" id="pool-refresh"><svg class="ic"><use href="#ic-check"/></svg>重新读取磁盘<span class="kbd k">R</span></button>
         <div class="menu-sep"></div>
         <div id="menu-modules"></div>
@@ -108,7 +108,7 @@
 <div class="shell-row">
   <div id="rail">
     <button class="iconbtn on" id="rail-grid" title="按素材看（缩略图挑着管）"><svg class="ic"><use href="#ic-boxes"/></svg></button>
-    <button class="iconbtn" id="rail-batches" title="按导入批次看（一次上传算一批）（B）"><svg class="ic"><use href="#ic-layers"/></svg></button>
+    <button class="iconbtn" id="rail-batches" title="按批次看（导入的和标注的都在这里）（B）"><svg class="ic"><use href="#ic-layers"/></svg></button>
     <button class="iconbtn" id="rail-cat" title="分类管理（C）"><svg class="ic"><use href="#ic-tag"/></svg></button>
     <span class="rail-spacer"></span>
     <button class="iconbtn" id="rail-help" title="本页操作说明（?）"><svg class="ic"><use href="#ic-key"/></svg></button>
@@ -171,8 +171,16 @@
 
       <div class="model-section hidden" id="sec-batches">
         <div class="model-section-head">
-          <span class="panel-title">导入批次<span class="muted small"> · 一次上传 / 一次抽帧算一批，删一批就是把这批素材整批退回池外</span></span>
+          <span class="panel-title">批次记录<span class="muted small"> · 谁把素材带进来的、哪个模块拿它们跑过标注，全都在这</span></span>
           <span class="spacer"></span>
+          <label class="muted small" title="导入批次=一次上传 / 一次抽帧 / 一次「从素材池添加」；标注批次=一次批量标注跑出来的">
+            类型
+            <select id="batch-kind">
+              <option value="">全部</option>
+              <option value="import">只看导入</option>
+              <option value="label">只看标注</option>
+            </select>
+          </label>
           <span class="muted small" id="batch-count"></span>
         </div>
         <div id="pool-batch-list" class="batch-list"></div>
@@ -181,9 +189,13 @@
           <label class="muted small" title="不勾=只把图从各标注库摘掉，images/ 里的原图留着">
             <input type="checkbox" id="purge-files"> 连原图文件一起删
           </label>
+          <span class="spacer"></span>
+          <button id="batch-restore" class="btn" disabled>捞回上次删除</button>
         </div>
-        <div class="muted small">批次记的是素材的来处（哪个文件、什么时候、抽了几帧），标好的结果仍记在各标注库里；
-          整批退回池外只摘引用，已经标过的内容在 <span class="mono">.autolabel/deleted/</span> 留有快照，误删能捞回来。</div>
+        <div class="muted small">批次记的是素材的来处（哪个文件、什么时候、抽了几帧）和每个模块跑过的那一轮标注；
+          整批退回模块外只摘掉标注库的引用：素材还留在池里，这批记录也留着当来处，改主意了随时能再挑进模块。
+          勾上「连原图文件一起删」才会真删 <span class="mono">images/</span> 里的文件。
+          <span id="restore-note">每次删除都会在 <span class="mono">.autolabel/deleted/</span> 留一份快照（含标签原文），删错了点「捞回上次删除」装回来。</span></div>
       </div>
     </div>
   </main>
@@ -218,6 +230,10 @@
     <div class="vlm-row">
       <label class="muted small grow">批次名（选填）
         <input type="text" id="up-batch-name" placeholder="例如：10 月现场补拍" spellcheck="false">
+      </label>
+      <label class="muted small" title="导入即归类：分类跟着素材走，三个模块看到的是同一套。要新增或改名，去素材池页的「分类管理」">
+        归类到
+        <select id="up-category"><option value="">未分类</option></select>
       </label>
     </div>
     <div id="up-files" class="muted small">尚未选择文件</div>
@@ -271,7 +287,7 @@
       <div class="panel-title">快捷</div>
       <div><span>U</span><span>导入素材</span></div>
       <div><span>C</span><span>分类管理</span></div>
-      <div><span>B</span><span>切到导入批次视图</span></div>
+      <div><span>B</span><span>切到批次记录视图</span></div>
       <div><span>A</span><span>把选中的素材加进右边那个模块</span></div>
       <div><span>R</span><span>重新读取磁盘上的文件</span></div>
       <div><span>⌘K</span><span>命令面板：跳模块、删素材、开系统设置都能搜</span></div>

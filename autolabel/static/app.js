@@ -898,6 +898,7 @@ function addUpFiles(list) {
 
 function openUpload(open) {
   $("upload-modal").classList.toggle("hidden", !open);
+  if (open) { fillImportCategories("up-category"); }   // 分类可能刚被改过，开一次铺一次
 }
 
 /** 清除正在执行/排队的后台任务（带确认弹窗） */
@@ -960,6 +961,7 @@ async function startUpload() {
   const params = {
     model: $("up-model").value,
     batch_name: $("up-batch-name") ? $("up-batch-name").value.trim() : "",
+    category: readImportCategory("up-category"),
     vlm_profile: vlmProfile,
     // 留空回落默认；填 0 是实义值，交给服务端说人话。
     // 以前这里 parseFloat 出来的 NaN 会被 JSON 变成 null，任务里 float(None) 直接炸英文错。

@@ -539,18 +539,25 @@ def import_images(
             digest = file_sha256(src)
             if dedupe in ("exact", "perceptual") and digest in exact_seen:
                 rel = exact_seen[digest]
-                if _reuse(rel):
-                    stats["reused"] += 1
-                    stats["imported_files"].append((src, rel))
-                    if on_progress:
-                        on_progress(rel, stats)
-                else:
-                    stats["skipped_exact"] += 1
-                continue
+                if not source_missing(root, rel):
+                    if _reuse(rel):
+                        stats["reused"] += 1
+                        stats["imported_files"].append((src, rel))
+                        if on_progress:
+                            on_progress(rel, stats)
+                    else:
+                        stats["skipped_exact"] += 1
+                    continue
+                # 空账：账上记着这张图、盘上却没有（删批次时只摘了来处章、手工删过
+                # images/、上次导入断在半路）。拿它当重复，新图就既落不了盘也不报错，
+                # 传 255 张只进 169 张就是这么丢的。去重要认图，不能只认账。
+                exact_seen.pop(digest, None)
+                pool.pop(rel, None)
             im = _load_rgb(src, max_side=max_side)
             ph = dhash64(im) if dedupe == "perceptual" else None
             if ph is not None:
-                hit = next((rel for digest, rel in phash_seen if hamming(digest, ph) <= 5), None)
+                hit = next((rel for digest, rel in phash_seen
+                            if hamming(digest, ph) <= 5 and not source_missing(root, rel)), None)
                 if hit:
                     rel = _reuse(hit)
                     if rel:
@@ -680,20 +687,25 @@ def import_prepared(
             digest = file_sha256(src)
             if dedupe in ("exact", "perceptual") and digest in exact_seen:
                 rel = exact_seen[digest]
-                reused = _reuse(rel)
-                if reused:
-                    fields = dict(extra or {})
-                    if fields:
-                        idx.upsert(reused, **fields)
-                    stats["reused"] += 1
-                    stats["imported_files"].append((src, reused))
-                else:
-                    stats["skipped_exact"] += 1
-                continue
+                if not source_missing(root, rel):
+                    reused = _reuse(rel)
+                    if reused:
+                        fields = dict(extra or {})
+                        if fields:
+                            idx.upsert(reused, **fields)
+                        stats["reused"] += 1
+                        stats["imported_files"].append((src, reused))
+                    else:
+                        stats["skipped_exact"] += 1
+                    continue
+                # 空账不算重复（同 :func:`import_images`）：抽帧也走这条，视频导两遍才不会丢帧
+                exact_seen.pop(digest, None)
+                pool.pop(rel, None)
             im = _load_rgb(src, max_side=max_side)
             ph = dhash64(im) if dedupe == "perceptual" else None
-            similar = next((rel for d, rel in phash_seen if ph is not None and hamming(d, ph) <= 5),
-                           None)
+            similar = next((rel for d, rel in phash_seen
+                            if ph is not None and hamming(d, ph) <= 5
+                            and not source_missing(root, rel)), None)
             if similar is not None:
                 reused = _reuse(similar)
                 if reused:

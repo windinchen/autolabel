@@ -568,7 +568,7 @@ def cmd_auto(args: argparse.Namespace) -> int:
 
 def cmd_batches(args: argparse.Namespace) -> int:
     """列出批次，或删除指定批次的图片与记录。"""
-    from .batches import UNGROUPED_ID, delete_batches, list_batches
+    from .batches import UNGROUPED_ID, delete_batches, list_batches, list_snapshots, restore_deletion
 
     lib = "" if args.lib == "all" else args.lib
 
@@ -598,6 +598,19 @@ def cmd_batches(args: argparse.Namespace) -> int:
             print(f"     快照 -> {result['snapshot']}（索引字段 + 标签原文，可照此恢复）")
         if result.get("coords"):
             print(f"     坐标文件已重算 -> {result['coords']}")
+        return 0
+
+    if args.restore is not None:
+        result = restore_deletion(args.dataset, str(args.restore or ""))
+        print(f"[ok] 捞回删除 {result['snapshot']}：装回图片 {result['items']} 张 · "
+              f"标签 {result['labels']} 份 · 批次记录 {result['batches']} 个")
+        if result.get("skipped"):
+            print(f"     原图文件已经不在了，跳过 {result['skipped']} 张："
+                  f"{'、'.join(result['skipped_files'])}")
+        if result.get("coords"):
+            print(f"     坐标文件已重算 -> {result['coords']}")
+        if result.get("report"):
+            print(f"     QC 报告已重算 -> {result['report']}")
         return 0
 
     if args.delete:
@@ -642,6 +655,11 @@ def cmd_batches(args: argparse.Namespace) -> int:
           f"加 --keep-files 只删记录、--force 强删僵尸批次）")
     print(f"按张删除：batches {args.dataset} --delete-images images/a.jpg --lib objects "
           f"[--mode lib|purge]（lib 只摘本库引用，purge 连素材文件一起删）")
+    snapshots = list_snapshots(args.dataset, limit=3)
+    if snapshots:
+        latest = snapshots[0]
+        print(f"删错了往回捞：batches {args.dataset} --restore（默认最近一次，现在是 "
+              f"{latest['deleted_at']} 那次 · {latest['items']} 张，可装回 {latest['restorable']} 张）")
     return 0
 
 
@@ -1998,6 +2016,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "purge 三个库一起摘并把素材文件删掉")
     p.add_argument("--force", action="store_true",
                    help="忽略「仍在标注中」的保护，用于服务中断留下的僵尸批次")
+    p.add_argument("--restore", nargs="?", const="", default=None, metavar="快照名",
+                   help="捞回一次删除（留空=最近一次）：图片引用、标签、批次记录一起装回")
     p.add_argument("--json", action="store_true", help="以 JSON 输出批次列表")
     p.set_defaults(func=cmd_batches)
 

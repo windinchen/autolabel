@@ -76,6 +76,7 @@ from .batches import (
     batch_file_rows,
     delete_images,
     list_batches,
+    list_snapshots,
     reconcile_with_disk,
 )
 from .yolo_pose import COCO17_KEYPOINTS, Keypoint, Person, parse_label_file, write_label_file
@@ -510,7 +511,11 @@ class ReviewStore:
             "all": rows if view == "all" else [],
             "categories": categories,
             "category_summary": pool_catalog.category_summary(self.root, rows),
-            "batches": pool_catalog.batches(self.root),
+            # 「导入记录」要把各标注模块导入的批次一起列出来，否则页面上
+            # 写着 86 个素材、批次视图却说「还没有导入记录」
+            "batches": pool_catalog.import_records(self.root, rows),
+            # 捞回用的最近一份删除快照：空的时候界面按钮不点亮，别给一颗按下去报错的按钮
+            "restore": (list_snapshots(self.root, limit=1) or [{}])[0],
             "files": [row for row in rows
                       if not wanted or not row.get(f"in_{wanted}")],
             "stats": {"files": len(rows),
@@ -548,17 +553,22 @@ class ReviewStore:
     def adopt_pool(self, image_rels: List[str], lib: str = LIB_POSE,
                    batch_name_text: str = "") -> dict:
         """把素材池里已有的图片添加到某个库，并登记成一个批次（不复制文件）。"""
-        from .batches import attach_items, batch_name as make_batch_name, create_batch, finish_batch
+        from .batches import attach_items, create_batch, finish_batch
 
         lib = normalize(lib)
         rels = [str(rel) for rel in (image_rels or []) if str(rel).strip()]
         if not rels:
             raise ValueError("没有选择要添加的图片")
+        head = os.path.basename(rels[0])
+        # 批次名别说成「素材池 N 个」：这一条记的是「某个模块从池里挑了一批」，
+        # 和素材池页自己的导入批次撞名，两条并排时根本分不清谁是谁
+        default_name = (f"从素材池添加 {len(rels)} 个 · {head}"
+                        + (" 等" if len(rels) > 1 else ""))[:80]
         with self._mutate(resync=True):
-            batch = create_batch(self.root, name=make_batch_name("pool", [
-                os.path.basename(rel) for rel in rels], batch_name_text),
-                kind="pool", source="ui", uploads=[os.path.basename(rel) for rel in rels],
-                lib=lib)
+            batch = create_batch(self.root,
+                                 name=str(batch_name_text or "").strip() or default_name,
+                                 kind="pool", source="ui",
+                                 uploads=[os.path.basename(rel) for rel in rels], lib=lib)
             stats = adopt_from_pool(self.root, rels, lib)
             if stats["added_items"]:
                 attach_items(self.root, batch["id"], stats["added_items"], lib=lib)
@@ -575,9 +585,19 @@ class ReviewStore:
                 "module_names": dict(MODULE_NAMES)}
 
     def batch_files(self, batch_id: str) -> dict:
-        """某批次下的单张清单（点开批次看文件、按张删时用）。"""
+        """某批次下的单张清单（点开批次看文件、按张删时用）。
+
+        ``p_`` 开头的是素材池批次：这批素材往往还没进任何库，库索引里查不到，
+        得从池账本凑清单，否则点一批只回一句读取失败。
+        """
+        from . import pool as pool_catalog
+        from .batches import is_pool_batch
+
         if not str(batch_id or "").strip():
             raise ValueError("没有指定批次")
+        if is_pool_batch(batch_id):
+            return {"batch_id": batch_id,
+                    "files": pool_catalog.batch_file_rows(self.root, str(batch_id))}
         return {"batch_id": batch_id, "files": batch_file_rows(self.root, str(batch_id))}
 
     def delete_images(self, image_rels: List[str], keep_files: bool = False,
@@ -624,6 +644,13 @@ class ReviewStore:
             params["vlm_profile"] = profile["id"]
         job = self.jobs.submit("prompt_upload", files, params)
         return job.payload()
+
+    def restore_deletion(self, name: str = "") -> dict:
+        """把最近一次删除装回来（标签文件 + 索引条目 + 批次记录 + 池里的来处）。"""
+        from .batches import restore_deletion as _restore
+
+        with self._mutate(resync=True):
+            return _restore(self.root, str(name or "").strip())
 
     def delete_batches(self, batch_ids: List[str], keep_files: bool = False) -> dict:
         """按批次删除图片与记录；与人工写入共用同一把锁，避免边删边改。"""
@@ -1806,6 +1833,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self._send_json(job.payload(), status=202)
             elif parsed.path == "/api/jobs/clear":
                 self._send_json({"ok": True, **self.store.jobs.clear()})
+            elif parsed.path == "/api/batches/restore":
+                self._send_json({"ok": True, **self.store.restore_deletion(
+                    str(payload.get("name") or ""))})
             elif parsed.path == "/api/batches/delete":
                 ids = [str(b) for b in (payload.get("ids") or []) if str(b)]
                 if not ids:
@@ -2110,6 +2140,10 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bo
     if stale["files"]:
         print(f"[info] 清理上次遗留的上传临时文件 {stale['files']} 个"
               f"（{stale['bytes'] / 1048576:.1f} MB，超过 24 小时未使用）")
+    # 启动对账顺手清的素材空账：不清的话素材池页多报张数，重导同一批图还会被当成重复
+    ledger = int((store.recovery or {}).get("ledger_pruned") or 0)
+    if ledger:
+        print(f"[info] 清理素材账本里指向已删文件的空账 {ledger} 条（重新导入才不会被当成重复）")
     secure, note = False, ""
     context = None
     if cert and key:
