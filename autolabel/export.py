@@ -167,6 +167,7 @@ def export_dataset(
     written: Dict[str, set] = {"train": set(), "val": set()}
     split_by_rel: Dict[str, str] = {}
     taken: Dict[str, str] = {}
+    placed: set = set()
     for rel, item in selected:
         src_img = os.path.join(os.path.abspath(root), "images", rel)
         src_lbl = label_path_for(root, rel)
@@ -181,9 +182,9 @@ def export_dataset(
         split_unique = unique_stem(taken, export_stem(rel), rel)
         dst_img = os.path.join(out_root, "images", split, split_unique + ".jpg")
         dst_lbl = os.path.join(out_root, "labels", split, split_unique + ".txt")
-        _place(src_img, dst_img, mode)
+        placed.add(_place(src_img, dst_img, mode))
         if os.path.exists(src_lbl):
-            _place(src_lbl, dst_lbl, mode)
+            placed.add(_place(src_lbl, dst_lbl, mode))
         counts[split] += 1
         counts["people"][split] += len(persons)
         written[split].add(split_unique)
@@ -222,7 +223,7 @@ def export_dataset(
         "seed": seed,
         "val_ratio": val_ratio,
         "max_empty_ratio": max_empty_ratio,
-        "mode": mode,
+        "mode": mode, "placed_with": sorted(placed),
         "counts": counts,
         "skipped": [{"image": rel, "reason": reason} for rel, reason in skipped][:2000],
         "split": [{"image": s, "split": sp, "people": len(p)} for s, _, sp, p in coco_records],
@@ -252,6 +253,7 @@ def export_dataset(
 
     return {"out": out_root, **counts, "skipped": len(skipped),
             "skipped_note": skipped_summary(skipped),
+            "mode_note": place_note(mode, sorted(placed)),
             "train_images": counts["train"], "val_images": counts["val"],
             "coords": coord_out}
 
@@ -476,23 +478,52 @@ def find_reusable_export(root: str, fingerprint: str, kind: str = "pose") -> Opt
     return None
 
 
-def _place(src: str, dst: str, mode: str) -> None:
+#: 三种"把文件放进导出目录"的说法，报给用户时别用英文术语
+PLACE_LABELS = {"symlink": "软链接", "hardlink": "硬链接", "copy": "直接拷贝"}
+#: 退路顺序：软链 → 硬链 → 拷贝，越往后越占磁盘但越不会失败
+PLACE_FALLBACKS = {"symlink": "hardlink", "hardlink": "copy", "copy": ""}
+
+
+def _place(src: str, dst: str, mode: str) -> str:
+    """把一份文件放进导出目录，返回**实际**用的方式。
+
+    软链最省磁盘，但 Windows 上没开「开发者模式」的进程 ``os.symlink`` 直接抛
+    ``OSError``（WinError 1314 客户端没有所需的特权）——以前整批导出当场崩，
+    报的还是那句裸的 WinError。这里退回硬链接，再退回直接拷贝：导出照样成功，
+    只是多占点磁盘，调用方拿返回值提醒一句就好。
+    """
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     if os.path.islink(dst) or os.path.exists(dst):
         os.remove(dst)
-    if mode == "symlink":
-        # 相对链接：整个导出目录（或整个数据集）搬家、换机器挂载点变了都还连得上，
-        # 绝对路径的软链一挪目录就全断，只能重新导一份。
-        os.symlink(os.path.relpath(src, os.path.dirname(dst)), dst)
-    elif mode == "copy":
-        shutil.copy2(src, dst)
-    elif mode == "hardlink":
-        try:
-            os.link(src, dst)
-        except OSError:
-            shutil.copy2(src, dst)
-    else:
+    if mode not in PLACE_LABELS:
         raise ValueError(f"未知导出模式: {mode}")
+    while True:
+        try:
+            if mode == "symlink":
+                # 相对链接：整个导出目录（或整个数据集）搬家、换机器挂载点变了都还连得上，
+                # 绝对路径的软链一挪目录就全断，只能重新导一份。
+                os.symlink(os.path.relpath(src, os.path.dirname(dst)), dst)
+            elif mode == "hardlink":
+                os.link(src, dst)
+            else:
+                shutil.copy2(src, dst)
+            return mode
+        except OSError:
+            nxt = PLACE_FALLBACKS[mode]
+            if not nxt:
+                raise
+            mode = nxt
+
+
+def place_note(requested: str, used: Sequence[str]) -> str:
+    """退回到硬链/拷贝时说清原因，别让人以为导出坏了（只会看到目录变大）。"""
+    extra = sorted({item for item in used if item != requested})
+    if not extra:
+        return ""
+    got = "、".join(PLACE_LABELS.get(item, item) for item in extra)
+    return (f"这台机器建不了{PLACE_LABELS.get(requested, requested)}"
+            "（Windows 上软链接要开「开发者模式」或用管理员），本次改用"
+            f"{got}，导出结果一样能训练")
 
 
 def write_coco_keypoints(path: str, records: Sequence[Tuple[str, dict, str, List]],

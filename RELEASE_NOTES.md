@@ -1,3 +1,65 @@
+## 自动标注系统 v1.4.0（Windows 也能用了：启动链路搬进 Python）
+
+开发者 **windinchen** · 源码与发布 <https://github.com/windinchen/autolabel> · 版本号 `autolabel version`
+
+以前「双击启动」这件事写在 zsh 里——`运行工作台.command` 和 `后台实例.command` 各自包办了环境自检、签证书、起服务、等端口、写日志。Windows 上既没有 zsh 也没有 `/tmp`，连门都进不去。这一版不是给 `.bat` 抄一份，而是把逻辑收进 Python，两个系统各留一层壳。
+
+### 新增：Windows 支持
+
+- **三个新模块**：`platform_utils.py`（系统差异的唯一点：家目录、日志位置、找 `uv`、找 `openssl`、谁在听端口、把 stdout 切 UTF-8）、`launch.py`（自检 → 缺证书现签 → 起服务 → 端口真监听了才开浏览器 → 日志滚动 → 写 PID 条）、`service.py`（注册 / 状态 / 重启 / 注销，系统差异压在 `LaunchdBackend` 与 `TaskSchedulerBackend` 两个类里）。命令行多出 `launch` / `service` / `service-run` 三个子命令。
+- **四个启动器都只剩壳**：`运行工作台.command` / `后台服务.command` 改薄，新增对等的 `运行工作台.bat` / `后台服务.bat`；`后台实例.command` 删掉——它的「等端口 + 打日志」已经是第三份实现，并进了 `autolabel service-run`。四个启动器现在都进仓库（以前 `运行工作台.command` 被 `.gitignore` 忽略，换台机器就得靠记忆重建）。
+- **Windows 侧的对应物**：任务计划程序登录触发（`-AtLogOn`）+ 失败自动重启（`-RestartCount 999 -RestartInterval 1 分钟`）+ `IgnoreNew`，语义对齐 launchd 的 `KeepAlive = {SuccessfulExit: false}`；任务名 `AutoLabel-<实例名>`。`.cmd` 按 OEM 代码页解析，中文路径写进去会变乱码，所以启动片先 `cd /d` 进一个指向项目的目录联接（`mklink /J`，不要管理员），中文只留在文件系统里。查状态用 `Get-ScheduledTask.State` 而不是 `schtasks /Query`——后者连**值**都跟着系统语言翻译。
+- **证书不再只认钥匙串**：Windows 走 `certutil -addstore -user Root`，装没装上按 SHA-1 指纹核对（名称匹配对空格和横线很敏感，比对前先抹掉）。签失败不拦路：服务退回 HTTP，只有摄像头用不了，并把这件事说一句。`ca --status` 现在会报告当前用的是哪个信任库。
+- **日志从 `/tmp` 搬到 `~/.autolabel/logs/`**：Windows 没有 `/tmp`，而 `%TEMP%` 会被存储感知定期清，崩溃现场跟着一起没。
+
+### 顺手修掉的四个真 bug
+
+| 症状 | 根因 |
+| --- | --- |
+| **任何一次双击都起不来**，终端窗口一闪而过 | 启动器把环境变量名当值传出去：`${NAME}` 少写一个 `(P)`，无条件拼出 `--port PORT --device DEVICE`。以前测过 `zsh -n` 和 `--help`，两条都碰不到这段 |
+| 清理僵尸任务时**把别人的 launchd 任务当自己的** | `~/Library/LaunchAgents` 是全体 App 共用目录，前缀对不上时也把整个文件名当实例名返回。实测 `--dry-run` 一次点名六个：Steam、Clash Verge、蒲公英、Hermes |
+| 双击「后台服务」**结果打开了工作台** | `.bat` 里装了 `uv` 的那条分支错写成 `-m autolabel launch`；原测试只查「文件里有没有 `autolabel service`」，被没装 uv 的分支蒙混过去了 |
+| 服务管理器换个环境就炸 | 清单里的相对数据集路径（`datasets/demo`）没解析成绝对路径，全靠「启动片恰好先 cd 到项目根」才没出事 |
+
+### 其他改进
+
+- **日志不再攒在缓冲区**：`review` 的 stdout 重定向进文件后 Python 切成 8 KB 块缓冲，实测界面早就就绪、日志 30 秒还是 588 字节。现在拼参数统一带 `-u`。
+- **状态页靠 PID 条认领进程**：`uv run` 不 exec，会再 fork 一个 python 监听端口（两个 PID 差 1），服务管理器记的 PID 不是「在听端口的那个」。现在实例自己写 `~/.autolabel/services/<实例名>.pid`，注册 / 状态 / 重启都认它。
+- **导出不再假设软链能用**：Windows 建软链要开发者模式，`_place()` 改成软链 → 硬链 → 拷贝逐级退让，并记录实际用了哪种（`placed_with`），界面直接写「这次是硬链接（软链需要开发者模式）」。
+- **中文差点写不进日志**：Windows 重定向 stdout 时用 cp936，`✓ ✗ ▸` 一个都编码不了，进程打第一行就崩——症状正是「双击没反应，日志是空的」。`main()` 开头统一把两条输出流切到 UTF-8。
+- **实例清单补了模板** `configs/后台实例.conf.example`：真实清单仍是本机偏好、不入库，但新克隆的机器（尤其第一次在 Windows 上跑）终于知道清单长什么样；`service` 缺清单时会指出模板路径。
+- **中文用户名的 Windows 有出路**：`C:\Users\张三` 很常见，而启动片必须在纯 ASCII 路径下。报错写清两条路：`AUTOLABEL_HOME=D:\autolabel` 只挪服务目录，或先只用 `运行工作台.bat` 干活。
+- **Windows 也认 `PORT` / `DEVICE` / `HALF`**：`set PORT=8766 && 运行工作台.bat`，与 mac 的 `PORT=8766 ./运行工作台.command` 对齐。
+
+### macOS 行为没变
+
+plist 逐字段对过（唯一差异是日志路径，这是有意的），`KeepAlive` / `RunAtLoad` / `ThrottleInterval` / 启动片内容与权限全在测试里钉着，launchd 标签仍是 `com.windinchen.autolabel.<实例名>`。
+
+### 升级
+
+```bash
+git pull
+python3 -m pip install -r requirements.txt
+python3 -m autolabel --version   # 应显示 1.4.0
+```
+
+已经注册过常驻服务的机器，重跑一次注册让新启动片与 PID 条生效：
+
+```bash
+./后台服务.command --restart
+```
+
+Windows：
+
+```powershell
+copy configs\后台实例.conf.example configs\后台实例.conf   # 按自己的端口/数据集改
+后台服务.bat
+```
+
+**测试 795 → 916 条全跑**（新增 76 条后台服务、37 条平台差异、29 条启动流程；Windows 分支在 macOS 上也能验，因为拼命令、拼 PowerShell 脚本、解析 `Get-ScheduledTask` 都是纯函数）。`ruff` 与 5 个 JS 文件的 `node --check` 全绿。
+
+---
+
 ## 自动标注系统 v1.3.2（后台服务加固：失败要体面、状态要诚实）
 
 开发者 **windinchen** · 源码与发布 <https://github.com/windinchen/autolabel> · 版本号 `autolabel version`

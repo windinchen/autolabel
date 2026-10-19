@@ -1,5 +1,31 @@
 # 变更记录
 
+## 2026-10-19 11:40 — Windows 也能正常用了：启动链路从 zsh 搬进 Python（开发中，未发版）
+
+需求是「这个项目最适配 mac，我要 Windows 也能正常使用」。查下来根因很实在：**双击启动这件事写在 zsh 里**——`运行工作台.command` 和 `后台实例.command` 两份脚本各自包办了环境自检、签证书、起服务、等端口、写日志，Windows 上既没有 zsh 也没有 `/tmp`，连门都进不去。所以这一轮不是给 `.bat` 抄一份，而是把逻辑收进 Python，两个系统各留一层壳。
+
+- **三个新模块**：`autolabel/platform_utils.py`（系统差异的唯一点：家目录、日志位置、找 `uv`、找 `openssl`、端口有没有人听、谁在听、在文件管理器里选中一个文件、强制把 stdout/stderr 切到 UTF-8）、`autolabel/launch.py`（双击启动的全部流程：自检 → 缺证书现签 → 起服务 → 端口真监听了才开浏览器 → 日志滚动 → 写 PID 条）、`autolabel/service.py`（常驻服务的注册 / 状态 / 重启 / 注销，系统差异压在 `LaunchdBackend` 与 `TaskSchedulerBackend` 两个类里）。`cli.py` 多出 `launch` / `service` / `service-run` 三个子命令。
+- **四个启动器都只剩壳**：`运行工作台.command` / `后台服务.command` 改薄，新增对等的 `运行工作台.bat` / `后台服务.bat`（UTF-8 无 BOM + CRLF + `chcp 65001` + `cd /d "%~dp0"`，自己按四个已知位置找 `uv`，找不到就退回系统 Python 并说清要自己装依赖）；`后台实例.command` 删掉——它的「等端口 + 打日志」已经是第三份实现，并进了 `autolabel service-run`。四个启动器现在都进仓库（以前 `运行工作台.command` 被 `.gitignore` 忽略，换台机器就得靠记忆重建）。
+- **Windows 侧的对应物**：任务计划程序登录触发（`-AtLogOn`）+ `-RestartCount 999 -RestartInterval 1 分钟` + `IgnoreNew`，语义对齐 launchd 的 `KeepAlive = {SuccessfulExit: false}`；任务名 `AutoLabel-<实例名>`。`.cmd` 是按 OEM 代码页解析的，中文路径写进去容易变乱码，所以启动片里 `cd /d "%~dp0<实例名>.work"` 先进一个指向项目的目录联接（`mklink /J`，不要管理员），中文只留在文件系统里。查任务状态用 `Get-ScheduledTask.State` 而不是 `schtasks /Query`——后者连**值**都跟着系统语言翻译，中文系统是「状态: 正在运行」，换台机器就对不上。
+- **证书不再只认钥匙串**：Windows 走 `certutil -addstore -user Root`，装没装上按 SHA-1 指纹问 `certutil -store` 确认（按名称匹配对空格和横线都很敏感，比对前先抹掉）。签失败照样不拦路：服务退回 HTTP，只有摄像头用不了，并把这件事说一句。`autolabel ca --status` 现在会报告当前用的是哪个信任库。
+- **日志从 `/tmp` 搬到 `~/.autolabel/logs/`**：Windows 没有 `/tmp`，而 `%TEMP%` 会被存储感知定期清，崩溃现场跟着一起没。`autolabel service` 注册时照旧先把旧日志滚成 `.1` 再启动。
+- **服务进程加 `-u`，日志不再攒在缓冲区里**：`autolabel review` 的 stdout 被重定向进日志文件，Python 于是默认切成 8KB 块缓冲——实测界面早就就绪、日志文件 30 秒还是 588 字节纹丝不动，「工作台开着但日志是空的」就是这么来的，而启动头几行（用的哪块算力、证书加没加载、算力降级警告）正是排查时最想要的线索。现在拼参数时统一带上 `-u`，实测同样的启动几秒内日志就落全了。
+- **状态页靠 PID 条认领进程**：实测 `uv run` 不 exec，它再 fork 一个 python 出来监听端口（两个 PID 差 1），launchd 与任务计划程序记的那个 PID 根本不是「在听端口的那个」——拿它比对，结论永远是「这不是我起的」，于是窗口一关、屏幕上还写着就绪。现在实例自己往 `~/.autolabel/services/<实例名>.pid` 写一条，`install` / `--status` / `--restart` 都以它为准。
+- **导出不再假设软链能用**：Windows 建软链要开发者模式或管理员权限。`_place()` 改成软链 → 硬链 → 拷贝逐级退让，并返回**实际**用了哪种；导出结果和 `manifest.json` 都记下 `placed_with`，界面导入条上直接写「这次是硬链接（软链需要开发者模式）」，不让人以为省了空间。
+- **日志重定向到文件时差点写不出中文**：Windows 把 stdout 重定向进日志文件时用的是 cp936，`✓ ✗ ▸` 一个都编码不了，进程在打第一行提示时就 UnicodeEncodeError 崩了——症状是「双击没反应，日志是空的」。`main()` 开头统一把两条输出流切到 UTF-8（`errors="replace"`），彻底堵住。
+- **顺手修掉四个真 bug**：
+  - `运行工作台.command` 把**环境变量名当值**传了出去：`${NAME}` 少写一个 `(P)`（zsh 的间接取值），`PORT` / `DEVICE` 两个翻译循环于是无条件拼出 `--port PORT --device DEVICE`，参数校验当场报错——**任何一次双击都起不来**，症状是终端窗口一闪而过。以前测过 `zsh -n` 语法和 `--help`，两条都碰不到这段。现在把 `uv` 换成一个「把自己的参数原样打出来」的假脚本，设不设 `PORT`、写 `HALF=no` 还是 `yes` 全都钉住了（顺手把 `HALF=no` 也改成真的不开半精度）。
+  - 清理僵尸任务时把**别人的 launchd 任务**当成自己的：`~/Library/LaunchAgents` 是全体 App 共用的目录，`_unit_name()` 对不上 `com.windinchen.autolabel.` 前缀时也照样把整个文件名当实例名返回，于是这台机器上 Steam、Clash Verge、蒲公英、Hermes 的任务全部进入「清单里已经没有 → bootout + 删文件」名单。实测 `--dry-run` 一次就点名六个。现在只认自己的前缀，并加了 8 条参数化用例（含 `com.windinchen.autolabelx.ghost` 这种「只差一点」的名字）。
+  - `后台服务.bat` 里装了 `uv` 的那条分支错写成 `-m autolabel launch`：双击「后台服务」结果打开了工作台。原来的测试只查「文件里有没有 `autolabel service`」，被没装 uv 的那条分支蒙混过去了；现在改成「一个启动器里出现的 `-m autolabel <子命令>` 必须只有一个动词」。
+  - 清单里的相对数据集路径（`datasets/demo`）只做了存在性检查、没解析成绝对路径就存了下来，全靠「启动片恰好先 `cd` 到项目根」才没出事，服务管理器给的环境一变就炸，现在读清单时就算成绝对路径。
+- **实例清单补了模板 `configs/后台实例.conf.example`**：真实清单是本机偏好、一直不入库，代价是新克隆的机器（尤其第一次在 Windows 上跑的人）根本不知道清单长什么样，只能照着报错现猜。模板里逐列写了取值范围，还带了 `cp` / `copy` 两条现成命令；`autolabel service` 缺清单时会顺手把模板路径指出来（模板不在就不提，免得指一个不存在的路径）。测试顺手把模板当真清单解析了一遍——模板写坏，第一脚就踩空。
+- **Windows 侧补上 `PORT` / `DEVICE` / `HALF` 三个环境变量的翻译**：mac 的 `PORT=8766 DEVICE=cuda ./运行工作台.command` 是文档里写着的用法，`.bat` 原来只透传 `%*`，两边能力对不上；现在 Windows 用 `set PORT=8766 && 运行工作台.bat` 也一样认。
+- **中文用户名的 Windows 不再只有一句「换个家目录」**：启动片必须在纯 ASCII 路径下这条是硬要求（服务管理器传中文路径会乱码），但 `C:\Users\张三` 在家用机器上很常见。报错现在写清原因和两条出路：设 `AUTOLABEL_HOME=D:\autolabel` 只把服务用的目录挪走，或者先只双击 `运行工作台.bat` 干活（这条限制只管后台任务）。
+- **`tests/test_background_service.py` 重写并扩到 76 条**，新增 `tests/test_platform_utils.py`（37 条）、`tests/test_launch.py`（29 条）：Windows 那条分支的命令拼装、PowerShell 注册脚本内容、`.cmd` 启动片内容、`Get-ScheduledTask` 状态解析全都能在 mac 上验，因为它们都是纯函数。`test_launch.py` 还补了一条 autouse 默认值「端口是空的」——常驻服务正在听 8765 时跑测试，原来会有用例走错分支红一片（而这正是用户最常在的状态下跑测试）。`launchctl` 的替身改成按标签分别应答——原来所有查询都回同一个值，「未注册 / 定义写好了但没加载 / 加载了没在跑」三态在测试里是糊的。测试计数 795 → **916**（`pytest --collect-only` 实数）。
+- **macOS 行为没变**：plist 逐字段对过（唯一差异是日志路径，这是有意的），`KeepAlive` / `RunAtLoad` / `ThrottleInterval` / 启动片内容与权限全在测试里钉着；launchd 标签还是 `com.windinchen.autolabel.<实例名>`。
+
+版本号仍停在 **1.3.2**，发版前不动 `autolabel/version.py`。
+
 ## 2026-10-19 09:30 — 后台常驻服务搬进项目：开机自起、崩溃自拉起，顺带挖出两个只有重启才暴露的坑
 
 需求是「把 `/tmp` 里那两份启动脚本挪进项目，不然重启就起不来」。顺着这条线把整条后台启动链路重做了一遍——查下去发现原来那套其实扛不过一次重启。

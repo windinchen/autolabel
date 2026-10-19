@@ -87,13 +87,22 @@ yolo detect train
 
 ## 环境
 
+**macOS 和 Windows 用的是同一套代码，双击就能起**：macOS 双击 `运行工作台.command`，Windows 双击 `运行工作台.bat`。环境自检、签本地证书、起服务、等端口真监听了再开浏览器——这一整套判断都在 `autolabel/launch.py` 里，两条启动链路共用同一份，不存在「mac 修好了 Windows 忘了」那种事（以前启动逻辑写在 zsh 里，Windows 连门都进不去）。
+
 已在本机验证：macOS（Apple M3 Ultra）+ Python 3.9.6 + `torch 2.8.0` + `ultralytics 8.4.24`，推理默认走 Apple Silicon 的 MPS，这台机器上不依赖 CUDA。
 
-装了 NVIDIA 显卡的机器（Linux / Windows + CUDA 版 PyTorch）不用改代码：界面 `⌥S` **系统设置** 或 `autolabel settings --device cuda` 切成 CUDA，界面会先探测这台机器到底有哪几张卡、说清型号；所选设备当场用不了也不报错，跑的时候自动降级并说明原因。
+装了 NVIDIA 显卡的机器（Linux / Windows + CUDA 版 PyTorch）不用改代码：界面 `⌥S` **系统设置** 或 `autolabel settings --device cuda` 切成 CUDA，界面会先探测这台机器到底有哪几张卡、说清型号；所选设备当场用不了也不报错，跑的时候自动降级并说明原因。常驻服务里也能按实例固定算力（`configs/后台实例.conf` 一行一个实例，第四列写 `cuda`），不用每次开界面再点一遍。
+
+**Windows 上要提前准备的只有两样**：
+
+1. **Python 环境**：装一次 `uv`（`winget install astral-sh.uv`）以后就不用管了——脚本会自己在 `%USERPROFILE%\.local\bin`、`%LOCALAPPDATA%\Programs\uv`、`%USERPROFILE%\.cargo\bin` 和 `PATH` 里找它，找到就顺手把 Python 3.11 和依赖备齐。没装也能跑：脚本会退回系统 Python 并提示你自己 `python -m pip install -r requirements.txt`。
+2. **摄像头要的 HTTPS**：第一次启动自动签一张本地证书，并用 `certutil -addstore -user Root` 把根证书加进**当前用户**的受信任根证书——不要管理员权限、不动系统级证书列表（对应 macOS 的 `security add-trusted-cert`）。装不上不拦路：服务照样起，只是退回 HTTP，看图改标签全正常，只有摄像头录不了像。
+
+另外三件 Windows 特有的事，代码里都已经兜住了，写在这儿免得被当成 bug：常驻服务用**任务计划程序**（登录触发 + 失败自动重启，语义对齐 launchd 的 `KeepAlive`），任务名 `AutoLabel-<实例名>`；日志在 `%USERPROFILE%\.autolabel\logs\autolabel-<端口>.log`，不放 `%TEMP%`——存储感知会清临时目录，崩溃现场跟着一起没；导出训练集默认想省空间用软链，但 Windows 建软链要开发者模式或管理员权限，所以会自动退到硬链接、再退到复制，导出结果里如实写明这次用的是哪一种。
 
 ```bash
 python3 -m pip install -r requirements.txt   # 已有 torch/ultralytics 可跳过
-python3 -m pytest tests -q                    # 792 项测试，约 2 分钟
+python3 -m pytest tests -q                    # 916 项测试，约 2 分钟
 # 其中 5 项端到端用例需要 models/yolo11n-pose.pt 与 models/bus.jpg，缺权重时会自动跳过（`-rs` 可看到原因）
 ```
 
@@ -347,6 +356,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 ├── configs/default.yaml  参数模板
 ├── configs/vlm.json      多模态大模型配置（不含明文 Key，建议不入库）
 ├── configs/models.json   模型登记表（备注/默认值/本地登记/下载记录，本机状态，不入库）
+├── configs/后台实例.conf.example  常驻服务实例清单的模板（真实清单 `configs/后台实例.conf` 是本机偏好，不入库）
 └── models/               权重与测试图
 ```
 
@@ -373,6 +383,9 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 | `version` | 看版本号 / 开发者 / 与 GitHub 比对（`--check` 立刻联网重查）、升版本号（`--bump [patch|minor|major]`，日常只 +0.01） |
 | `ca` | 本地 HTTPS 证书：签发 + 设为受信任（摄像头要 HTTPS）、`--status` 只看状态、`--force` 重签、`--uninstall` 卸载 |
 | `settings` | 看 / 改系统设置：`--device auto\|cuda\|mps\|cpu`、`--half` / `--no-half`、`--reset`（附这台机器的算力探测结果） |
+| `launch` | **双击启动器真正的入口**（mac / Windows 共用）：自检 → 缺证书现签 → 起服务 → 端口真监听了才开浏览器；数据集可以不填（默认 `datasets/demo`） |
+| `service` | 常驻服务：注册 / `--status` / `--restart` / `--remove` / `--dry-run` / `--show 名字`。macOS 走 launchd，Windows 走任务计划程序，流程只有一份 |
+| `service-run` | 被服务管理器拉起来的那一个实例（无界面、不开浏览器、端口被占就让路退出 0），平时不用手敲 |
 | `fields` | 管理类别/字段登记表：`--lib objects\|detect` 选库、`--add 名=描述`、`--set-label 名=显示名`、`--delete 名`（`--drop-boxes` 连带删框） |
 | `prompt` | 提示词标注：`--vlm` 选多模态配置、`--fields` 选字段、`--limit` 试跑、`--overwrite` 重标、`--status` 看进度、`--coords` / `--export` 出坐标与训练集 |
 | `batches` | 按批次查看三个库的已标注数据（`--lib all\|pose\|objects\|detect`），`--delete <批次ID>` 整批删除图片与记录，`--delete-images images/a.jpg --mode lib\|purge` 按张删（`--keep-files` 只删记录，`--force` 强删中断遗留的批次） |
@@ -384,9 +397,11 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 - **为什么是 HTTPS**：浏览器只在「安全网页」里开放摄像头和麦克风，HTTP 页面点录制只会拿到「权限被拒绝」。现在的浏览器还会自动把 `http://` 升级成 `https://`，纯 HTTP 服务反而会出现「浏览器不支持此网站」。
 - **只做一次**：`autolabel ca` 签一张本地证书，并把根证书写进**当前用户**的钥匙串——不要管理员密码、不弹「修改受限制的系统根证书」那种授权框。之后 `review` 自动用它，什么都不用带。
 - **地址**：`https://localhost:8765/`。想用 `https://autolabel.local:8765/` 得自己在 `/etc/hosts` 加一行 `127.0.0.1 autolabel.local`（证书里已经带上这个名字了），不加也完全能用。
-- **不想敲命令**：双击项目根目录的 `运行工作台.command`，缺证书它自己补、起服务、开浏览器，一条都不用记。
+- **不想敲命令**：双击项目根目录的 `运行工作台.command`（Windows 双击 `运行工作台.bat`），缺证书它自己补、起服务、开浏览器，一条都不用记。带参数就在终端里跑：`./运行工作台.command datasets/vidtest --device cuda`，路径写 `datasets\\vidtest` 也一样认。
 - **多卡机器开多个实例**：`PORT=8766 DEVICE=cuda ./运行工作台.command datasets/vidtest`，或命令行 `review --port 8766 --device cuda`。启动参数只喂给这一个实例，不去改家目录那份全局设置，两块卡各跑各的互不干扰。
-- **想让它常驻**：双击 `后台服务.command`，按 `configs/后台实例.conf` 的清单注册成开机自起、崩了自动拉起的后台任务（不占终端窗口）。`--status` 看谁在跑、`--restart` 改完代码重启、`--remove` 注销。项目放在桌面 / 文稿 / 下载里要先解决一条 macOS 权限（后台任务读不到这三个文件夹），脚本会把该点哪里直接打出来——实测最省事的是把项目挪到这三个文件夹之外（详见 `demo_docs/07-常见问题.md`）。
+- **想让它常驻**：双击 `后台服务.command`（Windows 双击 `后台服务.bat`），按 `configs/后台实例.conf` 的清单注册成开机自起、崩了自动拉起的后台任务（不占终端窗口）。`--status` 看谁在跑、`--restart` 改完代码重启、`--remove` 注销。清单 `configs/后台实例.conf` 是本机偏好、不进仓库，仓库里放模板 `configs/后台实例.conf.example`——新克隆的机器 `cp` 一份改掉端口和数据集那行就能注册。macOS 落在 launchd（`~/Library/LaunchAgents/com.windinchen.autolabel.<实例名>.plist`），Windows 落在任务计划程序（任务名 `AutoLabel-<实例名>`），注册 / 状态 / 重启 / 注销的流程只写一份。
+- **macOS 独有一条坑**：项目放在桌面 / 文稿 / 下载里，要先解决一条隐私权限（后台任务读不到这三个文件夹），脚本会把该点哪里直接打出来——实测最省事的是把项目挪到这三个文件夹之外（详见 `demo_docs/07-常见问题.md`）。Windows 没有这条限制。
+- **日志在哪**：`~/.autolabel/logs/autolabel-<端口>.log`（Windows 是 `%USERPROFILE%\\.autolabel\\logs\\`）。不放临时目录，重启和存储感知都不会把崩溃现场顺手清掉。
 - **`--no-ssl` 退回 HTTP**：浏览、改标签都正常，只是录不了像；除非在排查证书问题，一般用不着。
 - **同网段设备访问**：`review --host 0.0.0.0` 之后手机能用 `https://这台机器的IP:8765/`，但得把 `certs/ca.pem` 装到那台设备上，否则浏览器照样拦。
 

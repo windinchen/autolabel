@@ -4,8 +4,13 @@
 浏览器只在 HTTPS（或 localhost）下开放摄像头，而且现在的浏览器会自动把
 http:// 升级成 https://，所以工作台长期跑在自签 HTTPS 上反而省事。
 
-根证书装在**当前用户**的信任域（不带 -d），因此不需要管理员密码，也不会弹
+根证书装在**当前用户**的信任域，因此不需要管理员密码，也不会弹
 "某某浏览器想修改受限制的系统根证书"那种框：
+
+- macOS：登录钥匙串（``security add-trusted-cert``）；
+- Windows：当前用户的「受信任的根证书颁发机构」（``certutil -addstore -user Root``），
+  Chrome / Edge 认的就是这个存储；中途会弹一个确认框，点「是」即可；
+- 其它系统：只签发不装，提示手动导入。
 
     autolabel ca                  # 生成 + 装进钥匙串 + 打印状态
     autolabel ca --status         # 只看状态，不改动
@@ -21,10 +26,11 @@ import datetime
 import hashlib
 import os
 import re
-import shutil
 import subprocess
 import sys
 from typing import Dict, Optional, Tuple
+
+from . import platform_utils
 
 # 名称用 ASCII：security 按 -c 搜索中文名会匹配不到
 CA_NAME = "AutoLabel Local Dev Root CA"
@@ -62,7 +68,17 @@ def leaf_key_path() -> str:
 
 
 def openssl_available() -> bool:
-    return shutil.which("openssl") is not None
+    return platform_utils.find_openssl() is not None
+
+
+def openssl_bin() -> str:
+    """openssl 的路径。找不到时退回裸名字，让系统按 PATH 试一次再报错。
+
+    不能写死 ``"openssl"``：Windows 上它通常只在 Git for Windows 的 ``usr/bin``
+    里，而双击启动时那个目录不在 PATH 上——明明装了却报"找不到"最难查。
+    """
+    found = platform_utils.find_openssl()
+    return str(found) if found else "openssl"
 
 
 def _run(args, **kw) -> subprocess.CompletedProcess:
@@ -100,13 +116,13 @@ def _pem_blocks(pem: bytes):
 
 
 def _not_after(path: str) -> str:
-    out = _run(["openssl", "x509", "-in", path, "-noout", "-enddate"])
+    out = _run([openssl_bin(), "x509", "-in", path, "-noout", "-enddate"])
     return out.stdout.strip().split("=", 1)[-1] if out.returncode == 0 else ""
 
 
 def days_left(path: str) -> Optional[int]:
     """还有几天过期；取不到时间就返回 None。"""
-    out = _run(["openssl", "x509", "-in", path, "-noout", "-enddate"])
+    out = _run([openssl_bin(), "x509", "-in", path, "-noout", "-enddate"])
     if out.returncode:
         return None
     raw = out.stdout.strip().split("=", 1)[-1]
@@ -122,7 +138,7 @@ def days_left(path: str) -> Optional[int]:
 
 def sans(path: str) -> Tuple[str, ...]:
     """证书里的备用名称（沙盒里的 LibreSSL 不一定支持 -ext，只能读文本）。"""
-    out = _run(["openssl", "x509", "-in", path, "-noout", "-text"])
+    out = _run([openssl_bin(), "x509", "-in", path, "-noout", "-text"])
     if out.returncode:
         return ()
     body = out.stdout.replace(" ", "").replace("IPAddress:", "IP:")
@@ -159,7 +175,8 @@ def _alt_names_section() -> Dict[str, str]:
 def issue(force: bool = False) -> Dict:
     """签发根证书与 localhost 叶子证书，已存在且没到期就原样留着。"""
     if not openssl_available():
-        raise RuntimeError("找不到 openssl 命令，无法签发本地证书")
+        raise RuntimeError("找不到 openssl 命令，无法签发本地证书\n        "
+                           + platform_utils.openssl_missing_hint())
     os.makedirs(certs_dir(), exist_ok=True)
     os.chmod(certs_dir(), 0o700)
     existing = days_left(leaf_cert_path())
@@ -188,13 +205,13 @@ def issue(force: bool = False) -> Dict:
 
     steps = []
     if force or not os.path.exists(ca_cert_path()):
-        steps.append(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        steps.append([openssl_bin(), "req", "-x509", "-newkey", "rsa:2048", "-nodes",
                       "-keyout", ca_key_path(), "-out", ca_cert_path(),
                       "-days", str(CA_DAYS), "-sha256", "-config", ca_cnf])
     csr = os.path.join(certs_dir(), "leaf.csr")
-    steps.append(["openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes",
+    steps.append([openssl_bin(), "req", "-new", "-newkey", "rsa:2048", "-nodes",
                   "-keyout", leaf_key_path(), "-out", csr, "-config", leaf_cnf])
-    steps.append(["openssl", "x509", "-req", "-in", csr, "-out", leaf_cert_path(),
+    steps.append([openssl_bin(), "x509", "-req", "-in", csr, "-out", leaf_cert_path(),
                   "-CA", ca_cert_path(), "-CAkey", ca_key_path(), "-CAcreateserial",
                   "-days", str(LEAF_DAYS), "-sha256",
                   "-extfile", leaf_cnf, "-extensions", "v3_req"])
@@ -202,7 +219,7 @@ def issue(force: bool = False) -> Dict:
         done = _run(step)
         if done.returncode:
             raise RuntimeError(f"{step[1]} 失败：{(done.stderr or done.stdout).strip()[:200]}")
-    verified = _run(["openssl", "verify", "-CAfile", ca_cert_path(), leaf_cert_path()])
+    verified = _run([openssl_bin(), "verify", "-CAfile", ca_cert_path(), leaf_cert_path()])
     if verified.returncode:
         raise RuntimeError("签出来的证书链校验不过："
                            f"{(verified.stderr or verified.stdout).strip()[:160]}")
@@ -215,6 +232,62 @@ def issue(force: bool = False) -> Dict:
     return {"created": True, **status()}
 
 
+def trust_store_label() -> str:
+    """「根证书装在哪」用当前系统的话说一遍，命令行和界面共用一句。"""
+    if platform_utils.is_windows():
+        return "受信任根证书（当前用户）"
+    if platform_utils.is_macos():
+        return "钥匙串信任"
+    return "系统信任"
+
+
+def _certutil(*args: str) -> Tuple[int, str]:
+    """跑 certutil 并合并输出。Windows 上「证书到底装没装上」只能问它。"""
+    try:
+        done = _run(["certutil", *args])
+    except OSError as exc:
+        return 1, str(exc)
+    return done.returncode, ((done.stdout or "") + (done.stderr or "")).strip()
+
+
+def _store_has_root(fingerprint: str) -> bool:
+    """当前用户的「受信任的根证书颁发机构」里有没有这张根证书。
+
+    拿指纹当查询条件而不是证书名：certutil 按名称匹配对空格和大小写都很敏感，
+    比对指纹没这些毛病。输出里的指纹是"aa bb cc"这种带空格的写法，先抹干净。
+    """
+    code, body = _certutil("-store", "-user", "Root", fingerprint)
+    if code != 0:
+        return False
+    return fingerprint.lower() in re.sub(r"[^0-9a-f]", "", body.lower())
+
+
+def _install_trust_windows() -> Dict:
+    if not os.path.exists(ca_cert_path()):
+        return {"ok": False, "note": "还没有证书，先跑一次 autolabel ca"}
+    want = _sha1_of_cert(ca_cert_path())
+    if want and _store_has_root(want):
+        return {"ok": True, "note": "根证书已在「受信任的根证书颁发机构」里，无需重复安装",
+                "fingerprint": want}
+    code, body = _certutil("-addstore", "-user", "Root", ca_cert_path())
+    if code != 0:
+        return {"ok": False, "note": f"写入受信任根证书失败：{body[:160]}"}
+    return {"ok": True,
+            "note": "已把根证书加入当前用户的「受信任的根证书颁发机构」（不需要管理员）。"
+                    "中途弹的确认框点「是」；装完要完全退出浏览器再打开才生效",
+            "fingerprint": want}
+
+
+def _uninstall_trust_windows() -> Dict:
+    want = _sha1_of_cert(ca_cert_path())
+    if not want or not _store_has_root(want):
+        return {"ok": True, "note": "本机信任列表里没有这张根证书，无需卸载"}
+    code, body = _certutil("-delstore", "-user", "Root", want)
+    if code != 0:
+        return {"ok": False, "note": f"删除失败：{body[:160]}"}
+    return {"ok": True, "note": f"已从「受信任的根证书颁发机构」移除「{CA_NAME}」"}
+
+
 def keychain_fingerprints() -> Tuple[str, ...]:
     """钥匙串里所有证书的 SHA-1。按指纹比，不按名字搜——中文名匹配不可靠。"""
     if sys.platform != "darwin":
@@ -225,8 +298,15 @@ def keychain_fingerprints() -> Tuple[str, ...]:
 
 def chain_trusted() -> Tuple[bool, str]:
     """让系统自己判这条链能不能用于 TLS，比查列表准。"""
+    if platform_utils.is_windows():
+        want = _sha1_of_cert(ca_cert_path())
+        if not want:
+            return False, "读不到本地根证书的指纹，先跑一次 autolabel ca"
+        if _store_has_root(want):
+            return True, ""
+        return False, "当前用户的「受信任的根证书颁发机构」里没有这张证书"
     if sys.platform != "darwin":
-        return False, "非 macOS：需手动把 certs/ca.pem 设为受信任根证书"
+        return False, f"{platform_utils.current()}：需手动把 certs/ca.pem 设为受信任根证书"
     out = _run(["security", "verify-cert", "-p", "ssl", "-c", leaf_cert_path()])
     if out.returncode == 0:
         return True, ""
@@ -235,8 +315,10 @@ def chain_trusted() -> Tuple[bool, str]:
 
 def install_trust() -> Dict:
     """把根证书装进**当前用户**的信任域（不碰系统域，免管理员密码）。"""
+    if platform_utils.is_windows():
+        return _install_trust_windows()
     if sys.platform != "darwin":
-        return {"ok": False, "note": "非 macOS：请把 certs/ca.pem 手动设为受信任根证书"}
+        return {"ok": False, "note": f"{platform_utils.current()}：请把 certs/ca.pem 手动设为受信任根证书"}
     if not os.path.exists(ca_cert_path()):
         return {"ok": False, "note": "还没有证书，先跑一次 autolabel ca"}
     want = _sha1_of_cert(ca_cert_path())
@@ -252,8 +334,10 @@ def install_trust() -> Dict:
 
 
 def uninstall_trust() -> Dict:
+    if platform_utils.is_windows():
+        return _uninstall_trust_windows()
     if sys.platform != "darwin":
-        return {"ok": False, "note": f"非 macOS：请手动删除钥匙串里的「{CA_NAME}」"}
+        return {"ok": False, "note": f"非 macOS：请手动删除信任列表里的「{CA_NAME}」"}
     keychain = os.path.expanduser("~/Library/Keychains/login.keychain-db")
     fingerprints = keychain_fingerprints()
     want = _sha1_of_cert(ca_cert_path())
@@ -280,7 +364,8 @@ def status() -> Dict:
     return {"dir": certs_dir(), "have_cert": have, "days_left": left,
             "trusted": trusted, "fingerprint": want,
             "sans": list(sans(leaf)) if have else [],
-            "openssl": openssl_available(),
+            "openssl": openssl_available(), "platform": platform_utils.current(),
+            "trust_store": trust_store_label(),
             "expires_soon": bool(left is not None and left <= RENEW_AFTER_DAYS)}
 
 

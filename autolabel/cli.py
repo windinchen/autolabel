@@ -1,6 +1,6 @@
-"""命令行入口：init / import / video / auto / label / detect / qc / review / export / coords /
-validate / status / batches / pool / migrate / fields / prompt / models / settings / version / ca /
-reset。"""
+"""命令行入口：init / import / video / auto / label / detect / qc / review / launch / service /
+service-run / export / coords / validate / status / batches / pool / migrate / fields / prompt /
+models / settings / version / ca / reset。"""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from .backends import BackendSettings
 from .settings import DEVICE_VALUES
 from . import __version__
+from . import platform_utils
 from .dataset import (
     ALL_STATUSES,
     STATUS_APPROVED,
@@ -231,11 +232,81 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_launch(args: argparse.Namespace) -> int:
+    """双击启动的核心：自检 → 起服务 → 端口真监听了才开浏览器。
+
+    macOS 的 ``运行工作台.command`` 和 Windows 的 ``运行工作台.bat`` 都只负责把自己
+    交到这里，两条启动链路共用同一份判断，不再各写一遍「等端口」「失败打日志」。
+    """
+    from .launch import launch
+
+    half = True if args.half else None
+    return launch(os.getcwd(), args.dataset, port=args.port, host=args.host,
+                  device=args.device, half=half, open_browser=not args.no_browser,
+                  wait_seconds=args.wait)
+
+
+def cmd_service(args: argparse.Namespace) -> int:
+    """常驻服务：注册 / 状态 / 重启 / 注销。macOS 走 launchd，Windows 走任务计划程序。"""
+    from . import service
+
+    try:
+        if args.print_env:
+            inst = service.instance_for(os.getcwd(), args.print_env)
+            print("\n".join(inst.env_lines()))
+            return 0
+        if args.show:
+            inst = service.instance_for(os.getcwd(), args.show)
+            chosen = service.backend()
+            if chosen is None:
+                print("[error] 这个系统还没有常驻服务后端", file=sys.stderr)
+                return 1
+            print(chosen.render_unit(inst), end="")
+            return 0
+        if args.status:
+            return service.status(os.getcwd())
+        if args.restart is not None:
+            return service.restart(os.getcwd(), args.restart or None)
+        if args.remove is not None:
+            return service.remove(os.getcwd(), args.remove or None)
+        return service.install(os.getcwd(), dry_run=args.dry_run)
+    except service.ServiceError as exc:
+        print(f"[error] {exc.head}", file=sys.stderr)
+        for line in exc.details:
+            print(f"        {line}", file=sys.stderr)
+        return 1
+
+
+def cmd_service_run(args: argparse.Namespace) -> int:
+    """真正被服务管理器拉起来的那一个实例：参数从清单现读，不开浏览器、不占窗口。
+
+    端口被占时**必须退出码 0**：launchd 的 ``KeepAlive`` 与任务计划程序的
+    「失败重启」都只认非零退出，非零就等于让它每 10 秒撞一次端口刷日志。
+    """
+    from . import service
+    from .launch import launch
+
+    try:
+        inst = service.instance_for(os.getcwd(), args.name) if args.name else \
+            service.Instance("manual", args.port or 8765, args.dataset or "datasets/demo",
+                             args.device or "", bool(args.half))
+    except service.ServiceError as exc:
+        print(f"[error] {exc.head}", file=sys.stderr)
+        for line in exc.details:
+            print(f"        {line}", file=sys.stderr)
+        return 1
+    return launch(os.getcwd(), inst.dataset, port=inst.port, device=inst.device or None,
+                  half=True if inst.half else None, open_browser=False,
+                  guard_port=True, wait_seconds=args.wait,
+                  pid_file=service.pid_file(inst.name))
+
+
 def cmd_ca(args: argparse.Namespace) -> int:
     from . import ca
 
     if not ca.openssl_available():
-        print("[error] 找不到 openssl 命令（macOS 自带，Linux 需装 openssl）", file=sys.stderr)
+        print("[error] 找不到 openssl 命令，签不出本地证书", file=sys.stderr)
+        print(f"        {platform_utils.openssl_missing_hint()}", file=sys.stderr)
         return 1
     if args.uninstall:
         done = ca.uninstall_trust()
@@ -260,7 +331,8 @@ def cmd_ca(args: argparse.Namespace) -> int:
     print(f"     地址: {', '.join(info['sans']) or '（无）'}")
     print(f"     有效期: {info['days_left']} 天"
           + ("（快到期，建议 autolabel ca --force 重签）" if info["expires_soon"] else ""))
-    print("     钥匙串信任: " + ("✓ 已设为受信任根证书" if info["trusted"] else "✗ 未信任，浏览器仍会提示不安全"))
+    print(f"     {info.get('trust_store') or ca.trust_store_label()}: "
+          + ("✓ 已设为受信任根证书" if info["trusted"] else "✗ 未信任，浏览器仍会提示不安全"))
     if info["trusted"]:
         print("     打开 https://localhost:8765/ 即可，摄像头可用")
     else:
@@ -1626,6 +1698,43 @@ def build_parser() -> argparse.ArgumentParser:
                             help="这个实例关半精度")
     p.set_defaults(func=cmd_review)
 
+    p = sub.add_parser("launch", help="启动复核工作台（自检 → 起服务 → 端口就绪再开浏览器；"
+                                      "运行工作台.command / .bat 就是它）")
+    p.add_argument("dataset", nargs="?", default="datasets/demo",
+                   help="数据集目录，默认 datasets/demo（双击启动时不用填）")
+    p.add_argument("--port", type=_positive_int, default=8765, help="监听端口，默认 8765")
+    p.add_argument("--host", default="127.0.0.1", help="监听地址，默认只本机可访问")
+    p.add_argument("--device", choices=[*DEVICE_VALUES, "0", "1"],
+                   help="推理算力：auto / cuda（N 卡）/ mps（Apple 加速）/ cpu；"
+                        "不填就按「系统设置」里存的那档")
+    p.add_argument("--half", action="store_true", help="半精度推理（只在 NVIDIA 显卡上有意义）")
+    p.add_argument("--no-browser", action="store_true", help="起好了但不自动开浏览器")
+    p.add_argument("--wait", type=_positive_int, default=90,
+                   help="最多等多少秒端口还没监听就放弃，默认 90")
+    p.set_defaults(func=cmd_launch)
+
+    p = sub.add_parser("service", help="常驻服务：登录自起、崩了自动拉起"
+                                       "（macOS 用 launchd，Windows 用任务计划程序）")
+    p.add_argument("--status", action="store_true", help="谁在跑、端口、退出原因、日志尾几行")
+    p.add_argument("--restart", nargs="?", const="", metavar="名字",
+                   help="改完代码重启（不给名字就全部重启）")
+    p.add_argument("--remove", nargs="?", const="", metavar="名字",
+                   help="注销并删掉生成的任务定义与启动片")
+    p.add_argument("--dry-run", action="store_true", help="只把任务定义写出来，不碰服务管理器")
+    p.add_argument("--show", metavar="名字", help="打印这个实例的任务定义（排查用，不改任何东西）")
+    p.add_argument("--print-env", metavar="名字", dest="print_env",
+                   help="打印这个实例的参数（服务启动片自己用）")
+    p.set_defaults(func=cmd_service)
+
+    p = sub.add_parser("service-run", help="常驻服务的实例本体（由服务管理器调用，一般不用手敲）")
+    p.add_argument("name", nargs="?", help="清单里的实例名；不填就用手上的参数临时起一个")
+    p.add_argument("--port", type=_positive_int)
+    p.add_argument("--dataset", help="不读清单时临时指定数据集")
+    p.add_argument("--device", choices=[*DEVICE_VALUES, "0", "1"], help="不读清单时临时指定算力")
+    p.add_argument("--half", action="store_true", help="半精度推理")
+    p.add_argument("--wait", type=_positive_int, default=90, help="最多等多少秒端口就绪")
+    p.set_defaults(func=cmd_service_run)
+
     p = sub.add_parser("version", help="看版本号 / 开发者 / 与 GitHub 比对 / 升版本")
     p.add_argument("--check", action="store_true", help="立刻联网重新比对（平时读半天内的缓存）")
     p.add_argument("--bump", nargs="?", const="patch", choices=["patch", "minor", "major"],
@@ -1871,6 +1980,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # 先固定输出编码：Windows 把输出重定向进日志文件时按本地代码页写字节，
+    # 中文机器上满屏的 ✓ ✗ ▸ 一个都不在里头，写第一行就崩，而且只在后台跑时崩
+    platform_utils.force_utf8_streams()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

@@ -853,8 +853,9 @@ def export_detection_dataset(
     可能不连续，而 YOLO 要求 ``names`` 的键从 0 连续递增。
     """
     from .export import (MISSING_SOURCE_REASON, _place, content_fingerprint,
-                         find_reusable_export, prune_stale, rank_for_split, skipped_summary,
-                         split_val_set, unique_export_dir, unique_stem, yaml_comment, yaml_scalar)
+                         find_reusable_export, place_note, prune_stale, rank_for_split,
+                         skipped_summary, split_val_set, unique_export_dir, unique_stem,
+                         yaml_comment, yaml_scalar)
 
     lib = normalize_lib(lib)
     records, meta = collect_object_records(root, exclude_status=exclude_status, lib=lib)
@@ -916,6 +917,7 @@ def export_detection_dataset(
               "empty_dropped": len(empty_dropped), "dropped": 0, "missing_source": len(missing)}
     written: Dict[str, set] = {"train": set(), "val": set()}
     taken: Dict[str, str] = {}
+    placed: set = set()
     for rec in selected:
         split = "val" if rec["image"] in val_set else "train"
         from .export import export_stem
@@ -923,7 +925,7 @@ def export_detection_dataset(
         stem = unique_stem(taken, export_stem(rec["image"]), rec["image"])
         dst_img = os.path.join(out_root, "images", split, stem + os.path.splitext(rec["image"])[1])
         dst_lbl = os.path.join(out_root, "labels", split, stem + ".txt")
-        _place(resolve_image(root, rec["image"]), dst_img, mode)
+        placed.add(_place(resolve_image(root, rec["image"]), dst_img, mode))
         lines: List[str] = []
         for obj in rec["objects"]:
             if obj["cls"] not in remap:
@@ -976,7 +978,8 @@ def export_detection_dataset(
             "boxes": counts["boxes"], "classes": [
                 {"class_id": cls, "export_id": remap[cls],
                  "name": (names.get(cls) or {}).get("name") or f"class_{cls}"} for cls in used],
-            "counts": counts, "data_yaml": os.path.join(out_root, "data.yaml")}
+            "counts": counts, "data_yaml": os.path.join(out_root, "data.yaml"),
+            "mode_note": place_note(mode, sorted(placed))}
 
 
 def write_prompt_files(root: str, lib: str = LIB_OBJECTS) -> int:

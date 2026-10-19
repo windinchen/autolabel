@@ -975,8 +975,8 @@ class ReviewStore:
     def reveal_export(self, payload: dict) -> dict:
         """在系统文件管理器里定位导出目录：产物是目录，光给路径用户还是找不到。"""
         import subprocess
-        import sys
 
+        from . import platform_utils
         from .library import exports_dir
 
         raw = str((payload or {}).get("path") or "").strip()
@@ -988,12 +988,9 @@ class ReviewStore:
             raise ValueError("只能打开本数据集 exports/ 下的导出结果")
         if not os.path.exists(target):
             raise ValueError(f"导出目录不存在，可能已被清理：{target}")
-        if sys.platform == "darwin":
-            cmd = ["open", "-R", target]
-        elif sys.platform.startswith("win"):
-            cmd = ["explorer", os.path.normpath(target)]
-        else:
-            cmd = ["xdg-open", target if os.path.isdir(target) else os.path.dirname(target)]
+        # 命令交给 platform_utils 统一给：Windows 的 explorer 只认 "/select,路径"
+        # 这种连笔写法，而且**永远返回非零**，所以只能 Popen 且不看返回码
+        cmd = platform_utils.reveal_argv(target)
         try:
             subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as exc:

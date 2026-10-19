@@ -1289,6 +1289,7 @@ function exportSummary(info, kind) {
     bits.push(`${(boxes.train || 0) + (boxes.val || 0)} 框`);
   }
   if (info.skipped_note) bits.push(`没收进来的 ${info.skipped_note}`);
+  if (info.mode_note) bits.push(info.mode_note);
   const dropped = info.empty_dropped !== undefined ? info.empty_dropped : counts.empty_dropped;
   if (dropped) bits.push(`其中背景图按上限少收 ${dropped} 张`);
   return bits.join(" · ");

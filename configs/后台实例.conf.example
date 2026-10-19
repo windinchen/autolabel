@@ -1,0 +1,21 @@
+# 后台常驻的复核工作台实例清单：autolabel service（双击 后台服务.command / 后台服务.bat）按这份清单注册
+#
+# 这是模板，直接拷一份去掉 .example 就能用：
+#   macOS / Linux   cp configs/后台实例.conf.example configs/后台实例.conf
+#   Windows         copy configs\后台实例.conf.example configs\后台实例.conf
+# 真实清单是本机偏好（端口、数据集、用哪块卡每台机器都不一样），不进仓库。
+#
+# 一行一个实例，字段用空格分开：名字  端口  数据集  设备  半精度
+#   名字   只允许字母数字和 - _，它会变成服务标签的一部分
+#          （macOS 是 com.<开发者>.autolabel.<名字>，Windows 是 AutoLabel-<名字>）
+#   端口   每个实例一个端口，别和别的程序抢
+#   数据集 相对项目根目录的目录，必须先 python3 -m autolabel init 过
+#   设备   auto / mps / cuda / cuda:1；填 - 表示跟「系统设置」里存的那档走
+#   半精度 yes / no；只在 NVIDIA 显卡上有提速意义
+#
+# 改完清单再跑一次注册命令就生效；删掉某一行，对应实例的后台任务会在下次注册时自动注销。
+mps   8765  datasets/demo  -     no
+
+# 双卡机器再开一个实例、固定只用 N 卡（Apple Silicon 上留注释，不然这个实例会因
+# CUDA 不可用而退回 MPS，白占一个端口）：
+# cuda  8766  datasets/demo  cuda  no
