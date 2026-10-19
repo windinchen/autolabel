@@ -21,7 +21,7 @@ from typing import Callable, Optional, Tuple
 
 DEVELOPER = "windinchen"
 REPO = "windinchen/autolabel"
-VERSION = "1.4.4"
+VERSION = "1.4.5"
 
 OWNER = REPO.split("/", 1)[0]
 HOME_PAGE_URL = f"https://github.com/{OWNER}"

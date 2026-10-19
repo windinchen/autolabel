@@ -1179,6 +1179,20 @@ def cmd_detect(args: argparse.Namespace) -> int:
 
     if args.model_classes:
         profile = detector.model_profile(args.model_classes, args.device or "")
+        if profile.get("open_vocab"):
+            # 开放词表权重没有"自带类别表"可列：类别是这次现填的词，
+            # 照普通权重打「0 类 + 建议 --add-classes all」等于说废话
+            print(f"{os.path.basename(profile['model'])}：{profile['task_name']} · "
+                  f"开放词表（{profile['open_vocab']}）· 算力 {profile['device']}")
+            print("     类别不来自权重自带类别表，而是你这次填的英文词——想标什么就填什么，"
+                  "不必先下载对应权重类别")
+            if profile.get("vocab"):
+                print(f"  上次用的词表：{'、'.join(profile['vocab'])}")
+            print("导入到本库类别表：python3 -m autolabel detect <数据集> --model "
+                  f"{os.path.basename(profile['model'])} --add-classes person,dog,traffic cone")
+            print("     词表只能填英文（填中文不报错但一个框都找不到），"
+                  "一次最多 80 个，每个最长 48 字符")
+            return 0
         print(f"{os.path.basename(profile['model'])}：{profile['task_name']} · "
               f"{profile['class_count']} 类 · 算力 {profile['device']}")
         for row in profile["classes"][:args.max_print]:
@@ -1947,9 +1961,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--list-models", action="store_true",
                    help="列出本机权重，并标出哪些能用在目标检测（姿态权重会说明为什么用不了）")
     p.add_argument("--model-classes", metavar="权重",
-                   help="列出这个权重自带的类别表（中文名 + 类别号），只看不动数据")
+                   help="列出这个权重自带的类别表（中文名 + 类别号），只看不动数据；"
+                        "开放词表权重会说明该填哪些英文词")
     p.add_argument("--add-classes", action="append", default=[], metavar="类名",
-                   help="把权重自带的类别导入本库类别表，逗号分隔可重复；all=全部导入", )
+                   help="把权重自带的类别导入本库类别表，逗号分隔可重复；all=全部导入。"
+                        "开放词表权重（yolov8x-world.pt、yoloe-26x-seg.pt）这里填的就是"
+                        "要找的英文词，不限权重自带类别", )
     p.add_argument("--no-label", action="store_true", help="配合 --add-classes：只导入类别，不跑标注")
     p.add_argument("--classes", action="append", default=[], metavar="类名",
                    help="只标这些类别（逗号分隔可重复），默认用本库类别表里全部")

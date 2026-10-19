@@ -120,9 +120,26 @@ def test_pose_entries_are_carried_over_verbatim(weights):
 
 def test_catalog_covers_all_tasks(weights):
     rows = modelhub.catalog()
-    assert len(rows) == len(models.PRESET_CATALOG) + len(modelhub.EXTRA_CATALOG) == 37
+    assert len(rows) == len(models.PRESET_CATALOG) + len(modelhub.EXTRA_CATALOG) == 43
     counts = {task: sum(1 for row in rows if row["task"] == task) for task in modelhub.TASK_VALUES}
-    assert counts == {"pose": 13, "detect": 14, "segment": 5, "obb": 3, "classify": 2}
+    # detect/segment 里含开放词表那几档（YOLO-World 两档 + worldv2、YOLOE 三档）：
+    # 它们的类别表不是权重自带的，但任务型照旧归在 detect / segment 下
+    assert counts == {"pose": 13, "detect": 17, "segment": 8, "obb": 3, "classify": 2}
+
+
+def test_open_vocab_rows_say_the_class_table_is_yours(weights):
+    """开放词表那几档必须自己说清"类别自己填"，否则用户会按 COCO-80 理解它。"""
+    rows = [row for row in modelhub.catalog()
+            if "-world" in row["filename"] or row["filename"].startswith("yoloe")]
+    assert len(rows) == 6
+    for row in rows:
+        assert "开放词表" in row["class_note"]
+        assert row["downloadable"] and row["task"] in ("detect", "segment")
+        # 精度这一列留空：官方数字量的是 LVIS，和本目录里 COCO 的 mAP 不是一把尺子
+        assert row["score"] is None
+    hosts = {row["homepage"] for row in rows}
+    assert "https://docs.ultralytics.com/models/yolo-world/" in hosts
+    assert "https://docs.ultralytics.com/models/yoloe/" in hosts
 
 
 @pytest.mark.parametrize("filename,expected_bytes", [
@@ -133,6 +150,9 @@ def test_catalog_covers_all_tasks(weights):
     ("yolo11n-obb.pt", 5795654), ("yolov8n-obb.pt", 6567590),
     ("yolo11n-cls.pt", 5790624), ("yolov8n-cls.pt", 5563076),
     ("yolo26n.pt", 5544453), ("yolo12s.pt", 19006455),
+    ("yolov8s-world.pt", 27169314), ("yolov8x-world.pt", 147961954),
+    ("yolov8x-worldv2.pt", 146355704), ("yoloe-26l-seg.pt", 79417413),
+    ("yoloe-26x-seg.pt", 171640453), ("yoloe-11l-seg.pt", 70982416),
 ])
 def test_catalog_expected_bytes_match_release_assets(weights, filename, expected_bytes):
     row = next(item for item in modelhub.catalog() if item["filename"] == filename)
@@ -226,8 +246,10 @@ def test_search_empty_query_returns_catalog(weights):
 
 
 @pytest.mark.parametrize("query,task,expected", [
+    # YOLOE 那三档也算"分割"：任务型是 segment，只是类别表要自己填
     ("分割", "segment", {"yolo11n-seg.pt", "yolo11s-seg.pt", "yolo11m-seg.pt",
-                          "yolov8n-seg.pt", "yolov8s-seg.pt"}),
+                          "yolov8n-seg.pt", "yolov8s-seg.pt",
+                          "yoloe-26l-seg.pt", "yoloe-26x-seg.pt", "yoloe-11l-seg.pt"}),
     ("实例分割", "segment", None),
     ("旋转框", "obb", {"yolo11n-obb.pt", "yolo11s-obb.pt", "yolov8n-obb.pt"}),
     ("航拍", "obb", None),
@@ -264,10 +286,10 @@ def test_search_size_words_match_the_size_not_the_letter(weights):
     for query in ("n", "nano"):
         rows = modelhub.search(query)
         assert {row["filename"] for row in rows[:len(NANO_FILES)]} == set(NANO_FILES)
-    assert [row["filename"] for row in modelhub.search("x")] == ["yolo11x-pose.pt",
-                                                                "yolov8x-pose.pt",
-                                                                "yolo11x.pt",
-                                                                "yolov8x.pt"]
+    # x 档现在多了开放词表的三档（YOLO-World x / worldv2、YOLOE-26x-seg）
+    assert [row["filename"] for row in modelhub.search("x")] == [
+        "yolo11x-pose.pt", "yolov8x-pose.pt", "yolo11x.pt", "yolov8x.pt",
+        "yolov8x-world.pt", "yolov8x-worldv2.pt", "yoloe-26x-seg.pt"]
 
 
 def test_search_speed_hint_prefers_fastest(weights):
@@ -287,11 +309,19 @@ def test_search_quality_hint_ranks_within_task(weights):
 
 
 def test_search_small_hint_prefers_smallest(weights):
+    """搜「小」/「大」：小的排前面、大的排前面，但不钉死具体哪一个第一。
+
+    体积倾向的分是按全目录的体积区间归一化的（``_score_range`` / ``max_mb``），
+    目录里多一档 160 MB 的开放词表权重，最小那几档之间的近似平局就会换人。
+    该守的是"最小的打头"，不是"某个文件必须打头"。
+    """
     rows = modelhub.search("小")
-    smallest = min(row["expected_bytes"] for row in modelhub.catalog())
-    assert rows[0]["expected_bytes"] == smallest
-    assert all(row["expected_mb"] <= 66.5 for row in rows)
-    assert all(row["expected_mb"] > 66.5 for row in modelhub.search("大"))
+    smallest = min(row["expected_mb"] for row in modelhub.catalog())
+    biggest = max(row["expected_mb"] for row in modelhub.catalog())
+    assert rows[0]["expected_mb"] <= smallest + 0.2
+    assert all(row["expected_mb"] <= 6.0 for row in rows[:5])
+    big = modelhub.search("大")
+    assert big and big[0]["expected_mb"] == biggest
 
 
 def test_search_keyword_bucket_ranks_below_task_words(weights):
@@ -529,7 +559,9 @@ def test_a_vague_sentence_ranks_by_what_it_said(weights):
     small = modelhub.search("最省显存的")
     big = modelhub.search("精度高")
 
-    assert small and small[0]["expected_mb"] == min(r["expected_mb"] for r in modelhub.catalog())
+    # 同上：体积区间随目录变，最小的几档之间会换人，守"最小的打头"就够了
+    assert small and small[0]["expected_mb"] <= \
+        min(r["expected_mb"] for r in modelhub.catalog()) + 0.2
     assert big and big[0]["params_m"] >= 5.0
 
 

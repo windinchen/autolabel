@@ -63,6 +63,18 @@ CLASS_NOTES: Dict[str, str] = {
     "classify": "类别表 ImageNet-1000（1000 类；score 是 top-1 准确率，不是 mAP）",
 }
 
+#: 开放词表系列的文档页（``yolov8s-world`` 的系列名会被认成 yolov8，指到 YOLOv8
+#: 那页去讲开放词表太绕了，直接给各自的模型页）
+OPEN_VOCAB_DOCS: Dict[str, str] = {
+    "world": "https://docs.ultralytics.com/models/yolo-world/",
+    "yoloe": "https://docs.ultralytics.com/models/yoloe/",
+}
+
+#: 开放词表权重的类别表来源：这一档的类别**不是**权重自带的，而是标注时现填的英文词，
+#: 界面必须说清，否则用户会对着"COCO-80"那行注释以为也只能标 80 类
+OPEN_VOCAB_CLASS_NOTE = ("开放词表：类别不固定，标注时自己填英文词（想标什么填什么，"
+                         "一次最多 80 个；中文不生效）")
+
 SIZE_NAMES: Dict[str, str] = {"n": "nano", "s": "small", "m": "medium", "l": "large", "x": "xlarge"}
 
 # --------------------------------------------------------------------------- #
@@ -78,9 +90,12 @@ def _family(stem: str) -> str:
 
 def _row(filename: str, display_name: str, task: str, params_m: Optional[float],
          score: Optional[float], expected_bytes: int, speed: str, description: str,
-         recommended_for: str, sha256: str = "") -> dict:
+         recommended_for: str, sha256: str = "", class_note: str = "") -> dict:
     """拼一条目录记录：体积按字节算 MB，出处按系列给文档地址。"""
     stem = filename[:-3] if filename.endswith(".pt") else filename
+    low = stem.lower()
+    docs = OPEN_VOCAB_DOCS["world"] if "-world" in low \
+        else (OPEN_VOCAB_DOCS["yoloe"] if low.startswith("yoloe") else "")
     return {
         "id": stem.lower(),
         "filename": filename,
@@ -99,9 +114,9 @@ def _row(filename: str, display_name: str, task: str, params_m: Optional[float],
         "recommended_for": recommended_for,
         "downloadable": True,
         "installed": False,
-        "homepage": FAMILY_DOCS.get(_family(stem), RELEASE_URL),
+        "homepage": docs or FAMILY_DOCS.get(_family(stem), RELEASE_URL),
         "num_keypoints": 17 if task == "pose" else 0,
-        "class_note": CLASS_NOTES.get(task, ""),
+        "class_note": class_note or CLASS_NOTES.get(task, ""),
     }
 
 
@@ -202,6 +217,41 @@ EXTRA_CATALOG: Tuple[dict, ...] = (
          "上一代分类 nano，top-1 准确率比 v11-nano 低一分，体积差不多，一般只在沿用旧工程时用。"
          "分数同样是 top-1 口径。",
          "与 v11 分类模型对照"),
+    # --- 开放词表（YOLO-World / YOLOE：类别自己填，不受权重自带类别表限制）---
+    # 精度这一列一律留空：官方给的是 LVIS 上的数字，和本目录里 COCO-80 的 mAP
+    # 不是同一把尺子，并排放会让人以为开放词表"比 yolo11x 还准/还差"
+    _row("yolov8s-world.pt", "YOLO-World-small 开放词表", "detect", 26.8, None, 27169314, "快",
+         "YOLO-World 的 small 档：不靠权重自带的 80 类，而是标注时现填一批英文词，"
+         "模型按词的含义去画面里找。27 MB，加上一份约 338 MB 的文本编码器权重（第一次用自动下）。"
+         "适合目标种类杂、又不想为每类单独训权重的场景；词要短，"
+         "「a person wearing a red helmet」这种长句子会明显掉点。",
+         "目标类别临时定、不想先训模型的批量预标注",
+         class_note=OPEN_VOCAB_CLASS_NOTE),
+    _row("yolov8x-world.pt", "YOLO-World-xlarge 开放词表", "detect", 68.3, None, 147961954, "慢",
+         "YOLO-World 的顶配，141 MB。词表比 small 档吃得稳，冷门词和难目标召回更好，"
+         "代价是下载和推理都慢一档。Apple Silicon 上走 MPS，N 卡走 CUDA。",
+         "冷门类别多、机器强、能等",
+         class_note=OPEN_VOCAB_CLASS_NOTE),
+    _row("yolov8x-worldv2.pt", "YOLO-World-xlarge v2 开放词表", "detect", 68.3, None, 146355704, "慢",
+         "YOLO-World 的第二版权重（官方叫 worldv2），换了更好的文本-图像对齐训练，"
+         "体量几乎一样。同一批词表和 v1 各跑一遍挑好的，是最直接的对照方式。",
+         "和 v1 做词表召回对照",
+         class_note=OPEN_VOCAB_CLASS_NOTE),
+    _row("yoloe-26l-seg.pt", "YOLOE-large 开放词表分割", "segment", 42.0, None, 79417413, "中等",
+         "YOLOE 的 26 代 large 档，76 MB，开放词表 + 实例分割：既能现填英文词，"
+         "也能不管词表当普通分割权重用。本库目前只落检测框，分割轮廓不写进标签文件。",
+         "要开放词表又要较高分割质量",
+         class_note=OPEN_VOCAB_CLASS_NOTE + "；本库只落检测框，多边形暂不落盘"),
+    _row("yoloe-26x-seg.pt", "YOLOE-xlarge 开放词表分割", "segment", 67.4, None, 171640453, "最慢（本目录内）",
+         "YOLOE 这一代的顶配，164 MB，本目录里最占地方的一档。开放词表 + 分割 + "
+         "提示微调（还有 -pf 的免提示版本）。要求冷门类别又要求质量时才值这个体积。",
+         "冷门类别 + 高质量 + 机器很强",
+         class_note=OPEN_VOCAB_CLASS_NOTE + "；本库只落检测框，多边形暂不落盘"),
+    _row("yoloe-11l-seg.pt", "YOLOE-11 large 开放词表分割", "segment", 33.1, None, 70982416, "中等",
+         "YOLOE 的 11 代 large 档，68 MB，比 26 代那档参数少一半而用法完全一致。"
+         "机器一般又想试开放词表分割，从这档开始比 26-x 划算。",
+         "机器一般、想试开放词表分割",
+         class_note=OPEN_VOCAB_CLASS_NOTE + "；本库只落检测框，多边形暂不落盘"),
 )
 
 

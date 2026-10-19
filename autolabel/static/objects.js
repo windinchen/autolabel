@@ -58,6 +58,8 @@ const modelState = {
   loading: false, models: [], unusable: [], device: "auto",
   model: "", conf: 0.25, prefsClasses: [],
   list: [], listModel: "", listLoading: false, note: "", result: "",
+  // 开放词表权重（YOLOE / YOLO-World）：类别不是权重自带的，而是这次现填的英文词
+  openVocab: "", vocab: [],
 };
 const canvas = $("canvas");
 const ctx = canvas.getContext("2d");
@@ -1031,8 +1033,11 @@ function initModelPanel() {
   }
   const search = $("cls-search");
   if (search) search.oninput = () => renderClassImportList();
+  const vocabInput = $("cls-vocab");
+  if (vocabInput) vocabInput.oninput = () => { renderClassImportList(); };
   const reload = $("cls-reload");
   if (reload) reload.onclick = () => { modelState.listModel = ""; loadModelChoices(); };
+  if ($("cls-vocab")) { $("cls-vocab").value = ""; }
   const all = $("cls-all");
   if (all) all.onclick = () => toggleAllClassRows(true);
   const clear = $("cls-clear");
@@ -1150,10 +1155,24 @@ async function loadModelClasses(model) {
     const data = await getJson("/api/detect/model/classes?model=" + encodeURIComponent(model)
       + "&device=" + encodeURIComponent(modelState.device || ""));
     modelState.list = data.classes || [];
-    modelState.note = `${data.model} 是「${data.task_name || data.task}」权重 · 自带 ${data.class_count} 个类别`
-      + (data.device ? ` · 这次用 ${data.device} 加载` : "");
+    modelState.openVocab = String(data.open_vocab || "");
+    modelState.vocab = Array.isArray(data.vocab) ? data.vocab.slice() : [];
+    if (modelState.openVocab) {
+      const box = $("cls-vocab");
+      if (box && !box.value) {
+        box.value = (modelState.vocab.length ? modelState.vocab : modelState.prefsClasses).join(", ");
+      }
+      modelState.note = `${data.model} 是「${data.task_name || data.task}」权重 · `
+        + `开放词表（${modelState.openVocab}）· 类别不来自权重自带类别表，`
+        + "而是你在下面填的英文词——想标什么填什么，不用管权重 trained 过哪些类";
+    } else {
+      modelState.note = `${data.model} 是「${data.task_name || data.task}」权重 · `
+        + `自带 ${data.class_count} 个类别` + (data.device ? ` · 这次用 ${data.device} 加载` : "");
+    }
   } catch (err) {
     modelState.list = [];
+    modelState.openVocab = "";
+    modelState.vocab = [];
     modelState.note = `读 ${model} 的类别表失败：${err.message}`;
   }
   modelState.listLoading = false;
@@ -1168,10 +1187,37 @@ function renderClassImportList() {
   if ($("cls-result")) { $("cls-result").textContent = modelState.result || ""; }
   const note = $("cls-result");
   if (note) { note.classList.toggle("err", String(modelState.result).startsWith("导入失败")); }
+  const openVocab = Boolean(modelState.openVocab);
+  if ($("cls-toolbar")) { $("cls-toolbar").hidden = openVocab; }
+  if ($("cls-vocab-row")) { $("cls-vocab-row").hidden = !openVocab; }
   const checked = new Set(checkedFields("cls-list"));
   const query = String(($("cls-search") || {}).value || "").trim().toLowerCase();
   const known = new Set(fieldOptions().map((row) => String(row.name).toLowerCase()));
   box.innerHTML = "";
+  if (openVocab) {
+    // 开放词表权重没有"自带类别表"可勾：用户在输入框里写要找的英文词，
+    // 这里只负责实时告诉他哪些是新增、哪些已经在类别表里（类别号不会再变）
+    const words = vocabWords();
+    if (!words.length) {
+      box.textContent = modelState.listLoading ? "加载中…"
+        : "还没填词。想标什么就填什么，比如 person, dog, traffic cone（只能英文，"
+          + "填中文不会报错，但一个框都找不到）。";
+    }
+    for (const word of words) {
+      const line = document.createElement("div");
+      line.className = "check-row";
+      const hit = known.has(word.toLowerCase());
+      const text = document.createElement("span");
+      text.textContent = word;
+      const meta = document.createElement("span");
+      meta.className = "muted small";
+      meta.textContent = hit ? " — 已在本库类别表，重复加入只会复用原类别号" : " — 新增类别";
+      line.append(text, meta);
+      box.append(line);
+    }
+    syncClassButtons();
+    return;
+  }
   if (!modelState.list.length) {
     box.textContent = modelState.listLoading ? "加载中…"
       : (modelState.model ? "这个权重没回报任何类别。" : "先选一个本机权重，才能列出它自带的类别。");
@@ -1205,9 +1251,35 @@ function renderClassImportList() {
   syncClassButtons();
 }
 
+/** 读输入框里的开放词表：逗号/换行/分号都当分隔符，顺手去重。 */
+function vocabWords() {
+  const raw = String(($("cls-vocab") || {}).value || "");
+  const seen = new Set();
+  const words = [];
+  for (const piece of raw.split(/[,;\n\r]+/)) {
+    const word = piece.trim().replace(/\s+/g, " ");
+    if (!word || seen.has(word.toLowerCase())) { continue; }
+    seen.add(word.toLowerCase());
+    words.push(word);
+  }
+  return words;
+}
+
 function syncClassButtons() {
   const box = $("cls-list");
   if (!box) { return; }
+  if (modelState.openVocab) {
+    const words = vocabWords();
+    const tooMany = words.length > 80;
+    if ($("cls-count")) {
+      $("cls-count").textContent = words.length ? `填了 ${words.length} 个词${tooMany ? " · 上限 80" : ""}` : "";
+    }
+    if ($("cls-import")) {
+      $("cls-import").disabled = !words.length || tooMany || !modelState.model;
+      $("cls-import").textContent = words.length ? `加入类别表（${words.length}）` : "加入类别表";
+    }
+    return;
+  }
   const inputs = Array.from(box.querySelectorAll("input"));
   const picked = inputs.filter((input) => input.checked);
   if ($("cls-count")) {
@@ -1236,8 +1308,12 @@ function invertClassRows() {
 
 /** 把勾中的权重自带类别写进本库类别表：同名永不换号，所以对老标签是安全的。 */
 async function importModelClasses() {
-  const names = checkedFields("cls-list");
-  if (!names.length) { modelState.result = "先勾选至少一个类别"; renderClassImportList(); return; }
+  const names = modelState.openVocab ? vocabWords() : checkedFields("cls-list");
+  if (!names.length) {
+    modelState.result = modelState.openVocab ? "先在输入框里填要找的英文词" : "先勾选至少一个类别";
+    renderClassImportList();
+    return;
+  }
   const button = $("cls-import");
   if (button) { button.disabled = true; }
   let data;
@@ -1253,7 +1329,8 @@ async function importModelClasses() {
   }
   const lost = data.not_in_model || [];
   modelState.result = `新增 ${data.added || 0} / 复用 ${data.updated || 0}`
-    + ` / 该权重认不出 ${lost.length}` + (lost.length ? `（${lost.join("、")}）` : "")
+    + (data.open_vocab ? ` · 词表已备好（${data.vocab.length} 个词），去「批量目标检测」开跑`
+      : ` / 该权重认不出 ${lost.length}` + (lost.length ? `（${lost.join("、")}）` : ""))
     + ((data.skipped || []).length ? ` · 还有 ${data.skipped.length} 个没进表：${data.skipped.join("、")}` : "")
     + ` · 本库类别表现有 ${data.fields.length} 个，下一个类别号 ${data.next_class_id}`;
   await refreshDataset(state.item ? state.item.image : null);

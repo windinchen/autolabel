@@ -296,7 +296,13 @@ def payload(probe: bool = False) -> dict:
     devices = detect() if probe else {}
     effective, note = (resolve(running["device"]) if probe else (running["device"], ""))
     override = env_override()
+    # 开放词表那套（CLIP 文本编码器）只在打开面板时查一次：import clip 会连带
+    # 拉起 torch，平时切页不值得为它多等这一秒
+    from . import backends as inference   # 延迟导入：这个文件平时只读一份 JSON
+
+    open_vocab = inference.text_encoder_status() if probe else {}
     return {
+        "open_vocab": open_vocab,
         "saved": saved,
         "env": {k: DEVICE_LABELS.get(v, v) if k == "device" else v for k, v in override.items()},
         "devices": devices,
@@ -327,6 +333,14 @@ def describe(raw: Optional[dict] = None) -> str:
         lines.append(f"  · 识别到 {'、'.join(names)}")
     if data["effective"]["note"]:
         lines.append(f"[降级] {data['effective']['note']}")
+    open_vocab = data.get("open_vocab") or {}
+    if open_vocab:
+        cached = open_vocab.get("cached_bytes") or 0
+        state = "已就绪" if open_vocab.get("installed") else "缺依赖"
+        lines.append(f"开放词表权重（YOLOE / YOLO-World）{state}"
+                     + (f" · 文本编码器权重已缓存 {round(cached / 1048576)} MB" if cached else ""))
+        if not open_vocab.get("installed"):
+            lines.append(f"  · {open_vocab.get('note') or ''}")
     if data["env"]:
         got = "、".join(
             (DEVICE_LABELS.get(v, v) if k == "device" else ("开" if v else "关"))

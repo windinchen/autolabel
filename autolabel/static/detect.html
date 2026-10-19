@@ -272,13 +272,19 @@
         <span class="muted small" id="cls-count"></span>
       </div>
       <div class="muted small" id="cls-note">选一个本机权重，下面会列出它自带的类别（不联网，就地读权重）。</div>
-      <div class="param-row">
+      <div class="param-row" id="cls-toolbar">
         <label class="muted small grow">搜类别（中文名 / 英文类名 / class_id）
           <input type="search" id="cls-search" placeholder="比如 bus、公交车、5" spellcheck="false">
         </label>
         <button class="btn" id="cls-all">全选</button>
         <button class="btn" id="cls-clear">清空</button>
         <button class="btn" id="cls-invert">反选</button>
+      </div>
+      <div class="param-row" id="cls-vocab-row" hidden>
+        <label class="muted small grow">这次要找什么（英文词，逗号或换行分隔，最多 80 个）
+          <textarea id="cls-vocab" rows="3" spellcheck="false"
+            placeholder="person, dog, car, traffic cone, safety helmet"></textarea>
+        </label>
       </div>
       <div id="cls-list" class="check-list muted small">加载中…</div>
       <div class="btn-row">

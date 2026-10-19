@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -551,6 +552,112 @@ DETECT_TASKS = ("detect", "segment", "obb")
 TASK_NAMES = {"detect": "目标检测", "segment": "实例分割", "obb": "旋转框检测",
               "pose": "人体姿态", "classify": "图像分类", "depth": "深度估计"}
 
+#: 开放词表权重的文件名标记。这份判断必须和 ultralytics 自己的路由一致
+#: （``YOLO(路径)`` 见到 ``-world`` 走 YOLOWorld、见到 ``yoloe`` 走 YOLOE，
+#: 见 ``ultralytics/models/yolo/model.py``），否则会出现「模型按开放词表加载、
+#: 界面却按权重自带类别表显示」——用户以为词表生效了，其实一直在跑 COCO-80。
+OPEN_VOCAB_MARKERS = (("-world", "YOLO-World"), ("yoloe", "YOLOE"))
+#: 一次最多给多少个词。词表要逐个过文本编码器，几百个词纯属拖时间
+MAX_VOCAB_WORDS = 80
+#: 单个词最长多少字符。CLIP 看的是短句，"a person riding a mountain bike on a road"
+#: 这种长描述会明显掉点，界面上限压短一点比事后解释"为什么漏标"划算
+MAX_VOCAB_WORD_CHARS = 48
+#: 文本编码器权重（CLIP 约 338MB）默认落在项目 ``weights/``，第一次用才下
+TEXT_ENCODER_WEIGHTS_DIR = "weights"
+
+
+def open_vocab_kind(name: str) -> str:
+    """按文件名判断是不是开放词表权重，返回 ``"YOLO-World"`` / ``"YOLOE"`` / 空串。
+
+    只看文件名是有意的：判断发生在加载之前，界面要在"选权重"这一步就说清
+    类别从哪来，而不是等加载完才发现类别框和权重对不上。
+    """
+    stem = os.path.splitext(os.path.basename(str(name or "")))[0].lower()
+    for marker, kind in OPEN_VOCAB_MARKERS:
+        if marker in stem:
+            return kind
+    return ""
+
+
+def clean_vocab(words: Sequence[str]) -> List[str]:
+    """整理用户填的词表：去空去重、限长限量，非 ASCII 直接报人话。
+
+    一律要求英文是有实测依据的：CLIP 文本编码器只认英文，
+    ``["人","狗","猫"]`` 这种中文词表跑完是**零检出**——不报错、不警告，
+    只是什么框都没有。宁可在这里挡住，也别让用户对着空标注库猜。
+    """
+    cleaned: List[str] = []
+    seen = set()
+    for raw in (words or []):
+        # 词表是从输入框/命令行里来的一段自由文本，分隔符不该只认一种：
+        # 中文用户很自然会打「person，dog」，按 ASCII 逗号切的那套在这就散了
+        for piece in re.split(r"[,;，；\n\r]+", str(raw or "")):
+            cleaned.extend(_vocab_one(piece, seen))
+    if not cleaned:
+        raise ValueError("开放词表权重要先填「这次要找什么」，比如 person、dog、traffic cone")
+    if len(cleaned) > MAX_VOCAB_WORDS:
+        raise ValueError(f"一次最多填 {MAX_VOCAB_WORDS} 个词，当前 {len(cleaned)} 个"
+                         "（词表要逐个过文本编码器，太多只会变慢）")
+    return cleaned
+
+
+def _vocab_one(piece: str, seen: set) -> List[str]:
+    """整理单个词：去空白、限长、挡中文、去重。合法返回单元素列表，否则空列表。"""
+    word = " ".join(str(piece or "").split())
+    if not word:
+        return []
+    if len(word) > MAX_VOCAB_WORD_CHARS:
+        raise ValueError(f"词表里的词最长 {MAX_VOCAB_WORD_CHARS} 个字符，当前 {len(word)} 个："
+                         f"{word}（模型看的是短词，长句子会明显漏标）")
+    if not word.isascii():
+        raise ValueError(f"开放词表只能填英文，中文不生效：{word}"
+                         "（文本编码器是英文词表，填中文不会报错，但一个框都找不到）")
+    if word.lower() in seen:
+        return []
+    seen.add(word.lower())
+    return [word]
+
+
+def text_encoder_hint(exc: Exception) -> str:
+    """把「文本编码器没装」这类的英文报错翻成能照着做的中文指引。"""
+    detail = str(exc)
+    if "clip" not in detail.lower():
+        return f"设置开放词表失败：{detail}"
+    return ("开放词表权重要先算文本嵌入，这一步依赖 CLIP 文本编码器，本机还没装好。"
+            "它是 ultralytics 的 git 依赖（不在普通 pip 源里），"
+            "首次使用要联网装包并下载约 338MB 的编码器权重，之后一直复用。"
+            f"\n原始报错：{type(exc).__name__}: {detail[:200]}")
+
+
+def text_encoder_status() -> dict:
+    """开放词表的可用性概况（系统设置页用；不加载模型，几百毫秒）。"""
+    installed = True
+    reason = ""
+    try:
+        import clip  # noqa: F401
+    except Exception as exc:  # noqa: BLE001 缺包/装坏了都算不可用
+        installed = False
+        reason = f"{type(exc).__name__}: {str(exc)[:120]}"
+    weights = os.path.join(os.getcwd(), TEXT_ENCODER_WEIGHTS_DIR)
+    cached = 0
+    if os.path.isdir(weights):
+        for base, _dirs, files in os.walk(weights):
+            for name in files:
+                try:
+                    cached += os.path.getsize(os.path.join(base, name))
+                except OSError:
+                    continue
+    if installed:
+        note = ""
+    elif cached:
+        note = ("文本编码器的权重已经在本地，只差装一个 Python 包；"
+                "第一次用开放词表权重时会自动装好（要联网，约 10 秒），不用手动操作")
+    else:
+        note = ("第一次用开放词表权重时会自动装依赖并下载约 338MB 的文本编码器权重"
+                "（要联网，之后离线可用），不用手动操作")
+    return {"installed": installed, "reason": reason, "weights_dir": weights,
+            "cached_bytes": int(cached), "note": note}
+
 
 @dataclass
 class Detection:
@@ -586,6 +693,10 @@ class DetectionBackend:
         self._half = resolve_half(settings.half, self._device)
         self.task = ""
         self.names: Dict[int, str] = {}
+        #: 开放词表权重是哪一类（``YOLO-World`` / ``YOLOE`` / 空串表示普通权重）
+        self.open_vocab = ""
+        #: 这次设给模型的词表；同样的词不重复算文本嵌入
+        self.vocab: Tuple[str, ...] = ()
 
     # --- 生命周期 ---
     def load(self):
@@ -608,9 +719,15 @@ class DetectionBackend:
                 f"目标检测库要的是 {'、'.join(TASK_NAMES[t] for t in DETECT_TASKS)}；"
                 "人体骨骼请回姿态标注里用带 -pose 的权重")
         self.task = task or "detect"
+        self.open_vocab = open_vocab_kind(path)
         names = getattr(self._model, "names", None) or {}
         if isinstance(names, dict):
             self.names = {int(k): str(v) for k, v in names.items()}
+        if self.open_vocab:
+            # 开放词表权重自带的那张表只是出厂默认（YOLO-World 是 COCO-80），
+            # 不代表"这次能找什么"。留着它，界面就会拿 COCO 类别去勾，
+            # 用户以为在用开放词表，其实一直在跑默认表。
+            self.names = {i: word for i, word in enumerate(self.vocab)}
         report_model_use(self.model_name, 0, tuple(self.names.values()), self._device)
         return self._model
 
@@ -629,8 +746,35 @@ class DetectionBackend:
 
     # --- 类别表 ---
     def class_names(self) -> Dict[int, str]:
-        """模型能认出哪些类（先加载，第一次会慢一点）。"""
+        """模型能认出哪些类（先加载，第一次会慢一点）。
+
+        开放词表权重返回的是**当前词表**，没设词表时是空的：它的类别由用户
+        当次填的词决定，权重自带的 COCO-80 只是没人填时的出厂默认。
+        """
         self.load()
+        return dict(self.names)
+
+    def set_vocab(self, words: Sequence[str]) -> Dict[int, str]:
+        """开放词表权重：把「这次要找什么」交给模型，返回新的类别表。
+
+        普通权重没有这一步（类别表在权重里，改不了）；开放词表权重每次换词
+        都要重算文本嵌入，首次还要下几百 MB 的文本编码器权重，所以词表没变
+        就直接复用。类别号按词的**先后顺序**排（第 0 个词 = 0 号），
+        ultralytics 内部也是这个口径。
+        """
+        model = self.load()
+        if not self.open_vocab:
+            raise ValueError(f"{os.path.basename(self.model_name)} 是普通权重，类别表在权重里改不了；"
+                             "换类别请换成开放词表权重（yolov8x-world.pt、yoloe-26x-seg.pt 这类）")
+        cleaned = clean_vocab(words)
+        if tuple(cleaned) == self.vocab:
+            return dict(self.names)
+        try:
+            model.set_classes(list(cleaned))
+        except Exception as exc:  # noqa: BLE001 缺 CLIP / 嵌入算不动都要翻成人话
+            raise RuntimeError(text_encoder_hint(exc)) from exc
+        self.vocab = tuple(cleaned)
+        self.names = {index: word for index, word in enumerate(cleaned)}
         return dict(self.names)
 
     # --- 推理 ---
@@ -685,7 +829,9 @@ class DetectionBackend:
         self.load()
         return {"model": os.path.basename(self.model_name), "task": self.task,
                 "task_name": TASK_NAMES.get(self.task, self.task),
-                "class_count": len(self.names), "device": self._device}
+                "class_count": len(self.names), "device": self._device,
+                "open_vocab": self.open_vocab,
+                "vocab": list(self.vocab)}
 
 
 class PoseEnsemble:

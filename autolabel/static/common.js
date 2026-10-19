@@ -251,6 +251,7 @@ function buildSettingsModal() {
         <span class="set-name">半精度加速<span class="muted small">只有 NVIDIA 显卡提速，CPU 上会自动按普通精度跑</span></span>
         <button class="switch" id="set-half" type="button" role="switch" aria-checked="false"><span></span></button>
       </div>
+      <div class="set-note muted small" id="set-openvocab" hidden></div>
       <div class="set-note muted small" id="set-status">读取中…</div>
     </section>
   </div>
@@ -302,6 +303,25 @@ function renderSettingsPanel() {
   }
   const path = $("set-path");
   if (path) { path.textContent = (settingsState.data || {}).path || "—"; }
+  renderOpenVocabRow();
+}
+
+/** 开放词表权重（YOLOE / YOLO-World）的依赖状况。
+ *
+ *  缺依赖不是故障：第一次用会自动装包并下载编码器权重，说清楚免得用户
+ *  对着"缺依赖"以为坏了要来报 bug；已缓存时把体积报出来，磁盘账好对。
+ */
+function renderOpenVocabRow() {
+  const host = $("set-openvocab");
+  if (!host) { return; }
+  const info = (settingsState.data || {}).open_vocab || {};
+  if (!info || !Object.keys(info).length) { return; }
+  const cached = Math.round((info.cached_bytes || 0) / 1048576);
+  host.hidden = false;
+  host.textContent = "开放词表权重（YOLOE / YOLO-World）· "
+    + (info.installed ? "依赖已就绪" : "第一次用时自动装依赖")
+    + (cached ? ` · 文本编码器权重已缓存 ${cached} MB` : "")
+    + (info.note ? `：${info.note}` : "");
 }
 
 /** 设备清单：能用/不能用都说清楚，按不下去的绝不摆成能按的样子。 */

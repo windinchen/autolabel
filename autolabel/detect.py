@@ -31,7 +31,8 @@ import numpy as np
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import fields as field_store
-from .backends import DETECT_TASKS, TASK_NAMES, BackendSettings, DetectionBackend
+from .backends import (DETECT_TASKS, TASK_NAMES, BackendSettings, DetectionBackend,
+                      clean_vocab, open_vocab_kind)
 from .classnames import zh_for
 from .dataset import (
     HUMAN_STATUSES,
@@ -118,11 +119,15 @@ def local_models(dir_: Optional[str] = None) -> List[dict]:
         # 只能用 model_status：weight_names 会把「目录里预置但还没下载」的也列出来，
         # 按文件大小判会全部显示 0 字节，界面就分不清"有"和"能下载"
         status = model_manager.model_status(name, weights_dir=dir_)
+        open_vocab = open_vocab_kind(name) if usable else ""
         rows.append({"name": name, "task": task or "unknown",
                      "task_name": TASK_NAMES.get(task, "未知（按文件名猜不出）"),
                      "usable": usable, "note": note,
+                     "open_vocab": open_vocab,
                      "installed": bool(status["ready"]),
                      "bytes": int(float(status["size_mb"] or 0) * 1048576)})
+        if open_vocab:
+            rows[-1]["task_name"] = f"{rows[-1]['task_name']} · 开放词表（{open_vocab}）"
         if usable and not status["ready"] and not note:
             row = rows[-1]
             row["note"] = "还没下载，选它开始标注时会自动下（几 MB 到几百 MB，看这一档多大）"
@@ -142,6 +147,9 @@ def model_profile(model: str, device: str = "", dir_: Optional[str] = None) -> d
     described = backend.describe()
     described["classes"] = [{"class_id": cid, "name": name, "label": zh_for(name) or name}
                             for cid, name in sorted(backend.class_names().items())]
+    if described.get("open_vocab"):
+        described["class_source"] = (f"开放词表（{described['open_vocab']}）：类别由你填英文词，"
+                                     "不受权重自带类别表限制")
     return described
 
 
@@ -185,6 +193,9 @@ def match_model_classes(root: str, model: str, wanted: Optional[Sequence[str]] =
         raise ValueError(f"{lib_name(LIB)}还没有类别：先在界面上从模型类别表里勾选，"
                          f"或跑 autolabel detect --model {model or 'yolo11n.pt'} --add-classes bus,person")
     profile = model_profile(resolve_model(model, root), device)
+    kind = str(profile.get("open_vocab") or "") or open_vocab_kind(profile["model"])
+    if kind:
+        return _match_open_vocab(profile, picked, kind)
     by_name = {str(row.get("name", "")).strip().lower(): int(row["class_id"])
                for row in profile["classes"]}
     pairs: List[Tuple[dict, int]] = []
@@ -201,6 +212,31 @@ def match_model_classes(root: str, model: str, wanted: Optional[Sequence[str]] =
             "requested": [row.get("name") for row in picked]}
 
 
+def _match_open_vocab(profile: dict, picked: List[dict], kind: str) -> dict:
+    """开放词表权重的配对：登记的类名就是要找的词，词的顺序就是模型类别号。
+
+    普通权重要拿类名去权重自带的表里找，找不到就落空（换权重时的常态）；
+    开放词表权重正过来——词表是这次现填的，登记过的类别**一定**能用，
+    没有落空这回事，所以这里 missing 恒为空。真正的失败只有一种：
+    词本身不合规矩（中文、太长、太多），那种情况直接报错而不是默默少标。
+    """
+    names = [str(row.get("name") or "").strip() for row in picked]
+    words = clean_vocab(names)
+    by_word = {word.lower(): index for index, word in enumerate(words)}
+    pairs: List[Tuple[dict, int]] = []
+    for row in picked:
+        key = str(row.get("name") or "").strip().lower()
+        if key not in by_word:
+            raise ValueError(f"词表里有只在大小写上不同的重复类别：{row.get('name')}，"
+                             "模型会把它们当成同一个词，请改掉一个")
+        pairs.append((row, by_word[key]))
+    return {"model": profile["model"], "task": profile["task"], "task_name": profile["task_name"],
+            "device": profile["device"], "class_count": len(words),
+            "pairs": pairs, "missing": [],
+            "requested": [row.get("name") for row in picked],
+            "open_vocab": kind, "vocab": words}
+
+
 def add_model_classes(root: str, model: str, names: Optional[Sequence[str]] = None,
                       device: str = "", dir_: Optional[str] = None) -> dict:
     """把模型自带的类别收进本库登记表（界面「从模型导入类别」）。
@@ -209,6 +245,17 @@ def add_model_classes(root: str, model: str, names: Optional[Sequence[str]] = No
     原样保留——它要写进 ``data.yaml``，也得和模型回报的值对得上。
     """
     profile = model_profile(resolve_model(model, root), device, dir_)
+    kind = str(profile.get("open_vocab") or "") or open_vocab_kind(profile["model"])
+    if kind:
+        # 开放词表权重没有"自带类别表"可导入：要登记什么词，用户自己填。
+        # 这里只做词表合规检查（中文/超长/超量），不合规矩当场报错，
+        # 免得登记完到跑标注时才炸。
+        words = clean_vocab(names or [])
+        payload = field_store.add_classes(root, words, source=os.path.basename(model), lib=LIB)
+        payload.update({"model": profile["model"], "task": profile["task"],
+                        "task_name": profile["task_name"], "model_class_count": 0,
+                        "open_vocab": kind, "vocab": words, "not_in_model": []})
+        return payload
     table = {str(row["name"]): int(row["class_id"]) for row in profile["classes"]}
     known = {key.lower(): key for key in table}
     wanted, unknown = [], []
@@ -353,6 +400,10 @@ def run_detect_labeling(
                                half=base.half,
                                conf=float(conf) if conf is not None else base.conf)
     backend = _backend(resolved)
+    if matched.get("open_vocab"):
+        # 词表要设在**真正跑推理的这个实例**上：后端按"权重+设备+尺寸"缓存，
+        # 换词表不必重新加载权重，只重算一次文本嵌入（首次还要下编码器权重）
+        backend.set_vocab(matched["vocab"])
     local_ids = [int(row.get("class_id", -1)) for row, _ in pairs]
     signature = signature_for(matched["model"], local_ids, resolved)
     known_names = {str(row.get("name", "")).lower() for row, _ in pairs}
@@ -389,7 +440,8 @@ def run_detect_labeling(
              "unknown_images": unknown,
              "classes": sorted(known_names), "model": matched["model"],
              "task": matched["task"], "task_name": matched["task_name"],
-             "device": matched["device"], "conf": resolved.conf, "last_error": ""}
+             "device": matched["device"], "conf": resolved.conf, "last_error": "",
+             "open_vocab": matched.get("open_vocab", ""), "vocab": matched.get("vocab", [])}
     if matched["missing"] and verbose:
         print(f"[warn] 这个模型认不出：{'、'.join(matched['missing'])}（这些类别本次不产出框）")
 
