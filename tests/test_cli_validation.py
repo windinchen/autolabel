@@ -181,3 +181,30 @@ def test_batch_delete_accepts_comma_separated_ids(dataset, capsys):
 
     assert "删除批次 2 个" in out
     assert ids[0] not in {row["id"] for row in batches_of(dataset)}
+
+
+@pytest.mark.parametrize("command", [
+    ["label", "{ds}", "--device", "cuda:1"],
+    ["review", "{ds}", "--device", "cuda:1"],
+    ["launch", "{ds}", "--device", "0"],
+    ["service-run", "--device", "cuda:0"],
+    ["auto", "{ds}", "{src}", "--device", "mps"],
+    ["detect", "{ds}", "--device", "cuda:1"],
+    ["settings", "--device", "cuda:1"],
+])
+def test_device_flag_accepts_a_card_number(dataset, command):
+    """多卡机器上「一个实例跑一块卡」是常见需求，``--device cuda:1`` 以前
+    会被 choices 拒成退出码 2，而帮助里明明写着可以填设备编号。"""
+    from autolabel.cli import build_parser
+
+    argv = [item.format(ds=dataset, src=dataset) for item in command]
+    namespace = build_parser().parse_args(argv)
+    assert namespace.device in ("cuda:1", "cuda:0", "0", "mps")
+
+
+@pytest.mark.parametrize("value", ["cuda:9", "gp u", "metal", "tpu"])
+def test_device_flag_still_rejects_nonsense(dataset, value):
+    from autolabel.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["label", dataset, "--device", value])

@@ -237,3 +237,58 @@ def test_inference_honours_the_weights_dir_env(monkeypatch, tmp_path):
     assert os.path.isdir(str(custom)), "目录要在解析路径时就建好，ultralytics 才不会写错地方"
     assert model_status("yolo11n-pose.pt")["path"] == os.path.join(str(custom), "yolo11n-pose.pt")
     assert model_manager.weights_dir() == default_weights_dir()
+
+
+def test_mirror_that_fails_really_switches_to_the_direct_url(tmp_path, monkeypatch):
+    """镜像限流时要**换个地址**再试：以前三次重试打的都是同一个镜像，
+    注释写着"退回直连"其实一步没退，白等三轮超时。"""
+    payload = zip_bytes(b"direct")
+    seen = []
+
+    def fake(request, timeout=None):
+        seen.append(request.full_url)
+        if request.full_url.startswith("https://mirror.test/"):
+            raise OSError("429 rate limited")
+        return FakeResponse(payload)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake)
+
+    path = ensure_weights("fake-pose.pt", weights_dir=str(tmp_path),
+                          mirror="https://mirror.test/", attempts=3, verbose=False)
+
+    assert weights_ready(path)
+    assert len(seen) == 2, f"第二、三次还在打同一个镜像：{seen}"
+    assert seen[0].startswith("https://mirror.test/")
+    assert seen[1] == "https://github.com/ultralytics/assets/releases/download/v8.4.0/fake-pose.pt"
+
+
+def test_warning_names_the_route_that_failed(tmp_path, monkeypatch, capsys):
+    """告警要写清这次走的是镜像还是直连，否则用户不知道该换哪一个。"""
+    def boom(*_args, **_kwargs):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+    ensure_weights("fake-pose.pt", weights_dir=str(tmp_path),
+                   mirror="https://mirror.test/", attempts=2, verbose=True)
+
+    printed = capsys.readouterr().out
+    assert "走镜像" in printed and "走直连" in printed, printed
+
+
+def test_force_redownload_keeps_the_old_weights_when_nothing_works(tmp_path, monkeypatch):
+    """``--force`` 拉不到东西时得把原来那份放回去：它虽然加载失败，
+    但比让用户手上连一份权重都不剩要好。"""
+    target = tmp_path / "fake-pose.pt"
+    target.write_bytes(b"corrupt-but-mine")
+
+    def boom(*_args, **_kwargs):
+        raise OSError("no network at all")
+
+    monkeypatch.setattr("urllib.request.urlopen", boom)
+
+    path = ensure_weights("fake-pose.pt", weights_dir=str(tmp_path),
+                          mirror="https://mirror.test/", attempts=2, verbose=False, force=True)
+
+    assert path == str(target)
+    assert target.read_bytes() == b"corrupt-but-mine"
+    assert not (tmp_path / "fake-pose.pt.bad").exists(), "失败的那份不该留在原地当垃圾"

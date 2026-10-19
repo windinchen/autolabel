@@ -123,6 +123,9 @@ const FLAG_LABEL = {
   unknown_class: "类别号不认识",
   prompt_stale: "标注设置已变更",
   vlm_failed: "大模型没答上",
+  model_stale: "标注用的模型或设置已变更",
+  model_failed: "这次推理失败",
+  masked: "分割轮廓只记了外框",
   manual: "人工画的框",
 };
 const flagLabel = (f) => FLAG_LABEL[f] || f;
@@ -740,7 +743,7 @@ const EXPORT_COMMANDS = {
 /** 复制了目录还得手敲训练命令，这里直接给整条。 */
 function exportCommand(kind, row) {
   const spec = EXPORT_COMMANDS[kind] || EXPORT_COMMANDS.pose;
-  return `yolo ${spec.verb} train data=${row.data_yaml} model=${spec.model} epochs=100 imgsz=640`;
+  return `yolo ${spec.verb} train data="${row.data_yaml}" model=${spec.model} epochs=100 imgsz=640`;
 }
 
 function latestExport(ds, kind) {

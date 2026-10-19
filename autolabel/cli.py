@@ -12,7 +12,7 @@ import unicodedata
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .backends import BackendSettings
-from .settings import DEVICE_VALUES
+from .settings import DEVICE_ARGS
 from . import __version__
 from . import platform_utils
 from .dataset import (
@@ -1604,7 +1604,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--vlm", dest="vlm_profile", metavar="配置",
                        help="改用多模态大模型标注，取「模型管理」里的配置 ID 或名称")
         # 可选值来自「系统设置」那一处定义，别再手抄一份漏掉 CUDA
-        p.add_argument("--device", choices=[*DEVICE_VALUES, "0", "1"],
+        p.add_argument("--device", choices=list(DEVICE_ARGS),
                        help="推理算力：auto / cuda（N 卡）/ mps（Apple 加速）/ cpu，0、1 指定第几块 N 卡")
         p.add_argument("--imgsz", type=_positive_int)
         p.add_argument("--conf", type=_fraction)
@@ -1689,8 +1689,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ssl-key", default="", help="HTTPS 私钥，默认按证书名猜同目录的 -key.pem")
     p.add_argument("--no-ssl", action="store_true",
                    help="退回 HTTP。能用，但浏览器会关掉摄像头，还可能被自动升级成 HTTPS 而打不开")
-    p.add_argument("--device", choices=list(DEVICE_VALUES),
-                   help="这个实例的推理算力，覆盖系统设置（想一机多卡就多用 --port 起几个实例）")
+    p.add_argument("--device", choices=list(DEVICE_ARGS),
+                   help="这个实例的推理算力，覆盖系统设置（想一机多卡就多用 --port 起几个实例，"
+                        "卡号写 cuda:1 或 1）")
     half_group = p.add_mutually_exclusive_group()
     half_group.add_argument("--half", action="store_true", default=None,
                             help="这个实例开半精度（只有 NVIDIA 显卡提速）")
@@ -1704,7 +1705,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="数据集目录，默认 datasets/demo（双击启动时不用填）")
     p.add_argument("--port", type=_positive_int, default=8765, help="监听端口，默认 8765")
     p.add_argument("--host", default="127.0.0.1", help="监听地址，默认只本机可访问")
-    p.add_argument("--device", choices=[*DEVICE_VALUES, "0", "1"],
+    p.add_argument("--device", choices=list(DEVICE_ARGS),
                    help="推理算力：auto / cuda（N 卡）/ mps（Apple 加速）/ cpu；"
                         "不填就按「系统设置」里存的那档")
     p.add_argument("--half", action="store_true", help="半精度推理（只在 NVIDIA 显卡上有意义）")
@@ -1730,7 +1731,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?", help="清单里的实例名；不填就用手上的参数临时起一个")
     p.add_argument("--port", type=_positive_int)
     p.add_argument("--dataset", help="不读清单时临时指定数据集")
-    p.add_argument("--device", choices=[*DEVICE_VALUES, "0", "1"], help="不读清单时临时指定算力")
+    p.add_argument("--device", choices=list(DEVICE_ARGS), help="不读清单时临时指定算力")
     p.add_argument("--half", action="store_true", help="半精度推理")
     p.add_argument("--wait", type=_positive_int, default=90, help="最多等多少秒端口就绪")
     p.set_defaults(func=cmd_service_run)
@@ -1742,7 +1743,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_version)
 
     p = sub.add_parser("settings", help="看/改系统设置：推理设备（CUDA / Apple 加速 / CPU）、半精度")
-    p.add_argument("--device", choices=list(DEVICE_VALUES), help="推理用哪块算力")
+    p.add_argument("--device", choices=list(DEVICE_ARGS), help="推理用哪块算力")
     half_group = p.add_mutually_exclusive_group()
     half_group.add_argument("--half", action="store_true", default=None, help="开半精度（只有 NVIDIA 显卡提速）")
     half_group.add_argument("--no-half", dest="half", action="store_false", help="关半精度")
@@ -1911,7 +1912,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="只标这些类别（逗号分隔可重复），默认用本库类别表里全部")
     p.add_argument("--images", action="append", default=[], metavar="相对路径",
                    help="只标这些图（逗号分隔可重复），默认整个目标检测库")
-    p.add_argument("--device", choices=[*DEVICE_VALUES, "0", "1"], default="",
+    p.add_argument("--device", choices=list(DEVICE_ARGS), default="",
                    help="推理算力，默认用「系统设置」里那档；0、1 指定第几块 N 卡")
     p.add_argument("--conf", type=_fraction, default=None, help="置信度阈值，默认用系统设置里的值")
     p.add_argument("--limit", type=_non_negative_int, default=0, help="只标前 N 张，用于试跑")

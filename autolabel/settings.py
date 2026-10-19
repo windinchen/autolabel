@@ -29,6 +29,12 @@ DEVICE_CHOICES: Tuple[Dict[str, str], ...] = (
     {"value": "cpu", "label": "纯 CPU", "hint": "最稳，也最慢；排查显卡问题时用"},
 )
 DEVICE_VALUES = tuple(item["value"] for item in DEVICE_CHOICES)
+
+#: 命令行 ``--device`` 认的全部写法：四个大档 + 双卡机器上的卡号写法。
+#: 界面面板只展示前四个（卡号在面板里没意义），但启动参数必须能写卡号——
+#: 清单和文档都教人写 ``cuda:1``，argparse 不认的话症状是后台任务一起来就
+#: 退出码 2，然后被服务管理器每 10 秒拉起一次刷日志。
+DEVICE_ARGS = DEVICE_VALUES + ("0", "1", "cuda:0", "cuda:1")
 DEVICE_LABELS = {item["value"]: item["label"] for item in DEVICE_CHOICES}
 
 DEFAULTS = {"device": "auto", "half": False}
@@ -92,9 +98,12 @@ def normalize(raw: Optional[dict]) -> dict:
 def env_override() -> dict:
     """本进程的环境变量覆盖（``AUTOLABEL_DEVICE`` / ``AUTOLABEL_HALF``），没设就是空。"""
     out: Dict[str, object] = {}
-    raw_device = os.environ.get(ENV_DEVICE, "").strip()
+    raw_device = os.environ.get(ENV_DEVICE, "").strip().lower()
     if raw_device:
-        out["device"] = normalize({"device": raw_device})["device"]
+        # 卡号写法（1 / cuda:1）要原样留着：归一成 "cuda" 之后"用哪块卡"就丢了，
+        # 双卡机器上「一卡一实例」的两个实例会全挤到 0 号卡，另一块空转还没提示
+        out["device"] = raw_device if raw_device in DEVICE_ARGS else \
+            normalize({"device": raw_device})["device"]
     raw_half = os.environ.get(ENV_HALF, "").strip()
     if raw_half:
         out["half"] = as_bool(raw_half, default=DEFAULTS["half"])
@@ -129,7 +138,7 @@ def save(patch: Optional[dict] = None) -> dict:
     wanted = {k: v for k, v in (patch or {}).items() if v is not None}
     if "device" in wanted:
         asked = str(wanted["device"]).strip().lower()
-        if asked not in DEVICE_VALUES and asked not in ("0", "1", "cuda:0", "cuda:1"):
+        if asked not in DEVICE_ARGS:
             raise ValueError(f"不认识的设备「{wanted['device']}」，可选：{' / '.join(DEVICE_VALUES)}")
     # 半精度也要挡住：填进来一个看不懂的词，静默按"开"存下去比报错难查得多
     if "half" in wanted:
@@ -233,7 +242,10 @@ def _mps_miss_reason(torch_module) -> str:
     version = str(getattr(torch_module, "__version__", "") or "")
     if platform.system() != "Darwin":
         return "MPS 只在 macOS 上有"
-    if version and version.split("+")[0].count(".") and _atleast(version, "1.12"):
+    # 带本地后缀的构建号（2.4.1+cpu、2.6.0a0+git1234）比版本号常见，
+    # 不去掉那截会被当成"解析不出来"，于是把一句好端端的 MPS 说成"版本太旧"
+    core = version.split("+", 1)[0]
+    if version and core.count(".") and _atleast(core, "1.12"):
         return "这台 Mac 不支持 MPS（Intel 机型或系统太旧），用 CPU"
     return "PyTorch 版本太旧，没有 MPS 支持（需要 1.12 以上）"
 
@@ -324,6 +336,7 @@ def describe(raw: Optional[dict] = None) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["DEFAULTS", "DEVICE_CHOICES", "DEVICE_LABELS", "DEVICE_VALUES", "ENV_DEVICE",
+__all__ = ["DEFAULTS", "DEVICE_ARGS", "DEVICE_CHOICES", "DEVICE_LABELS",
+           "DEVICE_VALUES", "ENV_DEVICE",
            "ENV_HALF", "describe", "detect", "env_override", "label_defaults", "load",
            "normalize", "path", "payload", "resolve", "save"]

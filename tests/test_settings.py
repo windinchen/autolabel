@@ -385,7 +385,11 @@ def test_a_bogus_launch_value_falls_back_instead_of_crashing(probe_off, monkeypa
     monkeypatch.setenv(system.ENV_DEVICE, "to-the-moon")
     assert system.load()["device"] == system.DEFAULTS["device"]
     monkeypatch.setenv(system.ENV_DEVICE, "cuda:1")     # 命令行常见的多卡写法
-    assert system.load()["device"] == "cuda"
+    # 卡号必须原样留着：收成 "cuda" 之后"用哪块卡"就丢了，双卡机器上
+    # 「一卡一实例」的两个实例会全挤到 0 号卡，另一块空转还没有任何提示
+    assert system.load()["device"] == "cuda:1"
+    monkeypatch.setenv(system.ENV_DEVICE, "CUDA:1")     # 大小写不统一也要认
+    assert system.load()["device"] == "cuda:1"
 
 
 def test_api_and_cli_say_the_override_is_not_the_saved_value(server, probe_off, monkeypatch):

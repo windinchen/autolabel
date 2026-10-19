@@ -244,7 +244,8 @@ def split_legacy_index(root: str) -> Tuple[int, int]:
     提示词库只留 ``prompt_*`` 与素材元信息（宽高/哈希/导入时间等，两库各存一份，
     因为「谁导入的」属于库的批次信息）。
     """
-    from .dataset import DatasetIndex  # 延迟导入，避免和 dataset 形成循环
+    # 延迟导入，避免和 dataset 形成循环
+    from .dataset import DatasetIndex, load_index_or_none
 
     legacy = os.path.join(meta_dir(root), "index.json")
     if not os.path.exists(legacy):
@@ -282,7 +283,8 @@ def split_legacy_index(root: str) -> Tuple[int, int]:
 
     if objects_items:
         target = index_path(root, LIB_OBJECTS)
-        if not os.path.exists(target):
+        existing = load_index_or_none(root, LIB_OBJECTS)
+        if existing is None:
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with open(target, "w", encoding="utf-8") as fh:
                 json.dump({"version": 1, "lib": LIB_OBJECTS, "name": data.get("name", ""),
@@ -291,6 +293,13 @@ def split_legacy_index(root: str) -> Tuple[int, int]:
                            "label_format": "class cx cy w h（归一化，YOLO detection）",
                            "settings": {}, "items": objects_items},
                           fh, ensure_ascii=False, indent=2, sort_keys=True)
+        else:
+            # 目标索引已经存在（先跑过一次 ``init``，或上次迁移只做了一半）时得**并**
+            # 进去，不能整份跳过：下面照样会把 ``prompt_*`` 从姿态库里剥掉，
+            # 于是提示词标注两边都没留，而命令行还报"已迁移 N 条"
+            for rel, entry in objects_items.items():
+                existing.upsert(rel, **{**entry, **(existing.get(rel) or {})})
+            existing.save()
     if objects_items or stripped:
         DatasetIndex(root=root, data=data, lib=LIB_POSE).save()
     return len(objects_items), stripped

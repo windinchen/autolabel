@@ -86,6 +86,53 @@ def test_undo_restores_previous_label(dataset):
     assert ds.load_index(dataset).get(first)["status"] == ds.STATUS_UNREVIEWED
 
 
+def test_undo_prompt_clears_the_manual_box_indices(dataset):
+    """``prompt_manual_boxes`` 记的是「第几个框是人工画的」下标。撤销把框换成
+    旧的那一份之后下标全错位，留着就会把模型框说成人工框、把 score 抬到 1.0，
+    还顺带改了复核排序——认不回来就只能清空。"""
+    add_fields(dataset, "bottle", "backpack")
+    store = rv.ReviewStore(dataset)
+    image = sorted(ds.load_index(dataset, "objects").items)[0]
+    store.write_prompt_item(image, [
+        {"cls": 0, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.4, "score": 0.6},
+        {"cls": 1, "cx": 0.2, "cy": 0.3, "w": 0.15, "h": 0.15, "score": 1.0, "flags": ["manual"]},
+    ], status="edited")
+    before = ds.load_index(dataset, "objects").get(image)
+    assert before["prompt_manual"] == 1 and before["prompt_manual_boxes"] == [1]
+
+    back = store.undo_prompt(image, "objects")
+
+    assert back["prompt_objects"] == 0 and back["prompt_status"] == "unreviewed"
+    after = ds.load_index(dataset, "objects").get(image)
+    assert after["prompt_manual"] == 0 and after["prompt_manual_boxes"] == [], \
+        "撤销之后还留着人工下标，等于把不存在的框说成人工画的"
+    assert after["prompt_score"] == 0.0 and after["prompt_classes"] == []
+    # 一份框都没有的图要带上"一个框都没有"的标记：它的存在本身就说明这些字段是重算的
+    assert after["prompt_flags"] == ["none_found"]
+
+
+def test_undo_recomputes_the_pose_flags_and_score(dataset):
+    """撤销同样要重算姿态侧的标记与分数：只把 objects 数量改回去，
+    优先级排序和筛选条件就对着一张早就不是那样的图说话。"""
+    first = seed(dataset)[0]
+    store = rv.ReviewStore(dataset)
+    item = store.read_item(first)
+    item["objects"][0]["keypoints"][0]["x"] = 0.99
+    store.write_item(first, item["objects"], status="approved")
+    assert ds.load_index(dataset).get(first)["status"] == "approved"
+
+    store.undo(first)
+
+    back = ds.load_index(dataset).get(first)
+    restored = rv.parse_label_file(ds.label_path_for(dataset, first))
+    wanted = round(sum(person.score for person in restored) / len(restored), 4)
+    assert back["status"] == ds.STATUS_UNREVIEWED
+    assert back["visible_ratio"] == pytest.approx(rv._visible_ratio(restored))
+    assert back["objects"] == len(restored)
+    assert back["score"] == pytest.approx(wanted), "分数要按撤销回来的那份框重算，别留旧的"
+    assert back["score"] != 0.77, "0.77 是 seed 写的假分数，说明这里根本没重算"
+
+
 def test_status_validation_and_unknown_image(dataset):
     first = seed(dataset)[0]
     store = rv.ReviewStore(dataset)

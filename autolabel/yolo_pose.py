@@ -316,10 +316,19 @@ def merge_person_flips(primary: Person, mirrored: Person) -> Person:
     return merged
 
 
-def mirror_person(person: Person, img_w: int, img_h: int) -> Person:
-    """把「翻转图上的检测结果」反映射回原图方向（含左右关键点互换）。"""
+def mirror_person(person: Person, img_w: int, img_h: int,
+                  flip_idx: Optional[Sequence[int]] = None) -> Person:
+    """把「翻转图上的检测结果」反映射回原图方向（含左右关键点互换）。
+
+    ``flip_idx`` 用模型自带的配对表：自训练的自定义关键点权重顺序未必是 COCO，
+    一律套 COCO 表会把左肩和右肩平均到一起——标注看着正常，其实每个点都内缩，
+    而且不报错。长度对不上（拿的是别个模型的表）就退回 COCO。
+    """
     n = len(person.keypoints)
-    flip = COCO17_FLIP_IDX[:n] if n <= len(COCO17_FLIP_IDX) else list(range(n))
+    if flip_idx is not None and len(flip_idx) == n:
+        flip = list(flip_idx)
+    else:
+        flip = COCO17_FLIP_IDX[:n] if n <= len(COCO17_FLIP_IDX) else list(range(n))
     # 注意：既要镜像 x 坐标，也要把左右下标换回来，否则左肩会和右肩对齐求平均。
     kps: List[Keypoint] = [Keypoint(x=0.0, y=0.0, v=VIS_UNLABELED, conf=0.0) for _ in range(n)]
     for src, dst in enumerate(flip):

@@ -21,6 +21,7 @@ from .yolo_pose import (
     merge_person_flips,
     mirror_person,
 )
+from .platform_utils import remove_hint
 
 
 @dataclass
@@ -148,6 +149,19 @@ def claim_download(path: str, *, wait: bool = True, deadline: float = 0.0) -> Tu
             if weights_ready(path):
                 return False, None
             time.sleep(0.5)
+            if time.time() >= deadline:
+                break
+            # 等着的一方也得回头抢锁：先动手的那个可能直接被杀了（服务重启、任务
+            # 被取消），锁早就空着却没人接手，干等到超时只能报一句"权重不完整"
+            retry = None
+            try:
+                retry = open(path + LOCK_SUFFIX, "a+b")
+                fcntl.flock(retry.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                if retry is not None:
+                    retry.close()
+                continue
+            return True, retry
         return False, None
 
 
@@ -230,7 +244,13 @@ def ensure_weights(model: str, weights_dir: Optional[str] = None,
         os.replace(path, path + ".bad")   # 先挪走，下载成功后再删，失败时还能人工比对
 
     prefix = DEFAULT_MIRROR if mirror is None else mirror
-    url = weights_url(model, prefix)
+    # 候选地址：先镜像、再直连。以前三次重试打的都是同一个镜像地址，镜像一旦限流
+    # 或挂掉就白等三轮超时——注释和提示都写着"退回直连"，得真的退回去
+    direct = weights_url(model, "")
+    candidates: List[str] = []
+    for candidate in (weights_url(model, prefix), direct):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
     # 临时名保持固定（``x.pt.part``）：服务重启、断网重连之后还能接着这半截续传，
     # 几十 MB 的权重不必从头再来——这是这个文件存在的意义，不能改成一次性随机名。
     # 并发的问题交给文件锁解决：抢不到锁的一方在这里等对方下完，而不是插一脚进来。
@@ -243,6 +263,8 @@ def ensure_weights(model: str, weights_dir: Optional[str] = None,
         return path
     try:
         for try_no in range(1, max(1, attempts) + 1):
+            url = candidates[min(try_no, len(candidates)) - 1]
+            via = "直连" if url == direct else "镜像"
             try:
                 got = _download_to(url, part, timeout=timeout, verbose=verbose, progress=progress)
                 if not weights_ready(part):
@@ -261,7 +283,7 @@ def ensure_weights(model: str, weights_dir: Optional[str] = None,
                     except Exception:  # noqa: BLE001 回调报错不该影响下载
                         pass
                 if verbose:
-                    print(f"[warn] 第 {try_no} 次经镜像下载 {model} 失败："
+                    print(f"[warn] 第 {try_no} 次走{via}下载 {model} 失败："
                           f"{type(exc).__name__}: {exc}（已下载部分保留，可续传）")
     finally:
         if handle is not None:
@@ -269,6 +291,13 @@ def ensure_weights(model: str, weights_dir: Optional[str] = None,
                 handle.close()
             except OSError:
                 pass
+    if force and not weights_ready(path) and os.path.exists(path + ".bad"):
+        # 一次都没下成（多半是这台机器没网）：把原来那份放回去。它虽然加载失败，
+        # 但比让用户手上连一份权重都不剩要好，至少人工还能拿它去比对
+        try:
+            os.replace(path + ".bad", path)
+        except OSError:
+            pass
     return path
 
 
@@ -359,7 +388,28 @@ def weights_hint(path: str, exc: Exception) -> str:
     size = os.path.getsize(path) if os.path.exists(path) else 0
     return (f"模型 {path} 加载失败（{type(exc).__name__}: {exc}）；"
             f"当前文件 {size / 1048576:.1f} MB，多半是下载中断导致不完整，"
-            f"删掉重新标注会自动重下：rm {path}")
+            f"删掉重新标注会自动重下：{remove_hint(path)}")
+
+
+def flip_indices(raw: object, count: int) -> List[int]:
+    """模型自带的左右关键点配对表；缺了或对不上才退回 COCO 的前 N 个。
+
+    只有「长度等于关键点数」且「正好是 0..N-1 的一个排列」才算数：自训练权重
+    偶尔会写出一截残缺的 ``flip_idx``，拿它去换下标会直接 IndexError。
+    """
+    wanted = max(int(count), 0)
+    items: List[int] = []
+    if isinstance(raw, (list, tuple)):
+        try:
+            items = [int(value) for value in raw]
+        except (TypeError, ValueError):
+            items = []
+    if len(items) == wanted and sorted(items) == list(range(wanted)):
+        return items
+    from .yolo_pose import COCO17_FLIP_IDX
+
+    return list(COCO17_FLIP_IDX[:wanted]) if wanted <= len(COCO17_FLIP_IDX) \
+        else list(range(wanted))
 
 
 def report_model_use(model: str, num_keypoints: int, names: Sequence[str] = (),
@@ -388,6 +438,7 @@ class PoseBackend:
         self._half = resolve_half(settings.half, self._device)
         self.keypoint_names: Tuple[str, ...] = ()
         self.num_keypoints: int = 17
+        self.flip_idx: List[int] = []
 
     # --- 生命周期 ---
     def load(self):
@@ -414,6 +465,9 @@ class PoseBackend:
             self.keypoint_names = COCO17_KEYPOINTS
             flip = meta.get("flip_idx")
             self.num_keypoints = len(flip) if flip else len(COCO17_KEYPOINTS)
+        # 镜像融合要按模型自己的左右配对换下标：自训练的自定义关键点权重顺序未必
+        # 是 COCO，一律套 COCO 表会把左肩和右肩平均到一起——错得不报错
+        self.flip_idx = flip_indices(meta.get("flip_idx"), self.num_keypoints)
         report_model_use(self.model_name, self.num_keypoints, self.keypoint_names, self._device)
         return self._model
 
@@ -424,19 +478,25 @@ class PoseBackend:
             return False
         if verbose:
             print(f"[warn] {name} 加载失败（{type(exc).__name__}），尝试经镜像重新下载…")
-        return ensure_weights(name, weights_dir=os.path.dirname(path) or "models",
-                              verbose=verbose, force=True, attempts=2) == path
+        # ensure_weights 无论成败都返回同一个 path（下坏了也要把兜底交给
+        # ultralytics），拿返回值比等于永远算成功：重下没成还会把原文件挪成
+        # .bad，第二次加载就变成一句 FileNotFoundError，中文修复提示反而看不见
+        ensure_weights(name, weights_dir=os.path.dirname(path) or "models",
+                              verbose=verbose, force=True, attempts=2)
+        return weights_ready(path)
 
     @property
     def display_names(self) -> List[str]:
         return list(self.keypoint_names)
 
     # --- 推理 ---
-    def _predict(self, image: np.ndarray, flipped: bool = False) -> List[Person]:
-        import cv2
-
+    def _predict(self, bgr: np.ndarray, flipped: bool = False) -> List[Person]:
+        """跑一次推理。入参必须已经是 BGR：ultralytics 收到 ndarray 时不做任何色彩
+        转换，直接当 BGR 用（它自己的加载器写明假定 BGR）。以前这里和
+        :meth:`infer` 各转了一次，等于把原始 RGB 交给模型，R/B 长期互换，
+        关键点置信度和坐标系统性变差，还一声不吭。
+        """
         model = self.load()
-        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         kwargs = dict(source=bgr, device=self._device, imgsz=self.settings.imgsz,
                       conf=self.settings.conf, iou=self.settings.iou,
                       max_det=self.settings.max_det, verbose=False)
@@ -466,7 +526,7 @@ class PoseBackend:
                                             v=VIS_VISIBLE, conf=conf))
                 person = Person.from_xyxy(xyxy[i], w, h, kps, score=float(confs[i]), cls_id=int(clss[i]))
                 if flipped:
-                    person = mirror_person(person, w, h)
+                    person = mirror_person(person, w, h, flip_idx=self.flip_idx or None)
                 persons.append(person)
         return persons
 
@@ -560,8 +620,12 @@ class DetectionBackend:
             return False
         if verbose:
             print(f"[warn] {name} 加载失败（{type(exc).__name__}），尝试经镜像重新下载…")
-        return ensure_weights(name, weights_dir=os.path.dirname(path) or "models",
-                             verbose=verbose, force=True, attempts=2) == path
+        # ensure_weights 无论成败都返回同一个 path（下坏了也要把兜底交给
+        # ultralytics），拿返回值比等于永远算成功：重下没成还会把原文件挪成
+        # .bad，第二次加载就变成一句 FileNotFoundError，中文修复提示反而看不见
+        ensure_weights(name, weights_dir=os.path.dirname(path) or "models",
+                             verbose=verbose, force=True, attempts=2)
+        return weights_ready(path)
 
     # --- 类别表 ---
     def class_names(self) -> Dict[int, str]:

@@ -92,6 +92,33 @@ def test_port_busy_says_no_for_junk_instead_of_crashing(junk):
     assert pu.port_busy(junk) is False
 
 
+@pytest.mark.parametrize("host,family,address", [
+    ("127.0.0.1", socket.AF_INET, "127.0.0.1"),
+    ("0.0.0.0", socket.AF_INET, "127.0.0.1"),
+    ("::", socket.AF_INET, "127.0.0.1"),
+    ("", socket.AF_INET, "127.0.0.1"),
+    ("[::1]", socket.AF_INET6, "::1"),
+    ("fe80::1%en0", socket.AF_INET6, "fe80::1%en0"),
+    ("192.168.1.20", socket.AF_INET, "192.168.1.20"),
+])
+def test_wildcard_hosts_probe_loopback(host, family, address):
+    """绑 ``::`` 时拿 ``::`` 去连是未定义行为，且 AF_INET 套接字永远连不上它——
+    症状是「服务明明起好了，启动脚本死等 90 秒说端口没监听」。"""
+    assert pu.probe_address(host) == (family, address)
+
+
+def test_port_busy_survives_an_ipv6_host():
+    """绑定地址写成 IPv6 时不许抛异常，也不许把「有人听」读成「没人听」。"""
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        # backlog 给足：连着探两次，队列只有 1 的话第二次会排到超时，测试跟着抖
+        listener.listen(64)
+        port = listener.getsockname()[1]
+        assert pu.port_busy(port, host="::") is True
+        assert pu.port_busy(port, host="0.0.0.0") is True
+        assert pu.port_busy(port, host="::1") is False, "本机没起 v6 服务时不该谎报"
+
+
 def test_listening_pid_argv_per_os(monkeypatch):
     monkeypatch.setattr(sys, "platform", "darwin")
     assert pu.listening_pid_argv(8765) == ["lsof", "-nP", "-tiTCP:8765", "-sTCP:LISTEN"]

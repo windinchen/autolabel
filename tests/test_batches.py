@@ -549,3 +549,40 @@ def test_cli_batches_all_deletes_from_every_library(dataset, capsys):
     assert "仅提示词标注" in out and "库引用 1 处" in out
     assert names[1] in load_index(dataset, "pose").items
     assert names[1] not in load_index(dataset, "objects").items
+
+
+def test_ungrouped_rows_expand_for_the_objects_library(dataset):
+    """「未分组」行的 ID 形如 ``__ungrouped__:objects``，后半段才是库名。
+    以前 ``batch_file_rows`` 不拆这个前缀，拿整串当批次号去默认的姿态库索引里找，
+    于是门户里那行明明写着 2 张，点开却是空的，按张删除也无从下手。"""
+    rows = batch_file_rows(dataset, f"{UNGROUPED_ID}:objects")
+
+    assert rows, "加入提示词库但没挂批次的图，必须能在「未分组」里展开"
+    assert {row["image"] for row in rows} == set(idx_names(dataset))
+    assert all(row["lib"] == "objects" for row in rows)
+    assert all(row["prompt_status"] == "unreviewed" for row in rows)
+    assert f"{UNGROUPED_ID}:objects" in {row["id"] for row in list_batches(dataset)}
+
+
+def test_remove_lib_files_reaches_nested_backups_and_history(dataset):
+    """素材一进子目录（``--subdir``、视频抽帧都会），备份用的扁平名
+    （``clipA__000001``）和叠加图用的原名（``clipA/000001``）就不是一回事：
+    以前只算一个 stem，删图之后人工原件和撤销历史永久留在原地。"""
+    from autolabel.batches import _remove_lib_files
+    from autolabel.library import backups_dir, history_root, qc_dir
+
+    rel = "clipA/000001.jpg"
+    label = write_label(dataset, rel, [SAMPLE], lib="pose")
+    backup = os.path.join(backups_dir(dataset, "pose"), "clipA__000001.txt")
+    history = os.path.join(history_root(dataset, "pose"), "clipA__000001", "1.txt")
+    overlay = os.path.join(qc_dir(dataset), "overlays", "clipA", "000001.jpg")
+    for path in (backup, history, overlay):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("x")
+
+    assert _remove_lib_files(dataset, "pose", rel) >= 4
+
+    assert not os.path.exists(label) and not os.path.exists(backup)
+    assert not os.path.isdir(os.path.dirname(history))
+    assert not os.path.exists(overlay)

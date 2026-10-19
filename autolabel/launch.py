@@ -9,6 +9,7 @@ macOS：``lsof``、``/tmp``、``$HOME/Library/Python/3.9/bin/uv`` 全是 mac 写
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
@@ -24,16 +25,22 @@ FULL_PACKAGES: Tuple[str, ...] = (*LIGHT_PACKAGES, "ultralytics")
 
 #: 日志超过这个大小就先滚成 ``.1``，别让后台跑几个月吃掉磁盘
 LOG_ROLL_BYTES = 2 * 1024 * 1024
+#: 从日志文件名里认端口：``autolabel-8765.log`` 和滚出来的 ``autolabel-8765.log.1``
+#: 都要认得出。早先按「最后一个 ``-`` 后面」取，滚动一次的日志名里带 ``.log``，
+#: 于是拿 ``8765.log`` 去拼老路径，永远找不到。
+LOG_PORT_PATTERN = re.compile(r"autolabel-(\d{1,5})")
 
 
 def read_log(path: object, lines: int = 25) -> str:
     """日志尾几行；文件不存在时把老位置也找一遍。"""
     target = Path(str(path))
     if not target.exists():
-        for fallback in platform_utils.legacy_logs(target.stem.rsplit("-", 1)[-1]):
-            if fallback.exists():
-                target = fallback
-                break
+        found = LOG_PORT_PATTERN.search(target.name)
+        if found:
+            for fallback in platform_utils.legacy_logs(found.group(1)):
+                if fallback.exists():
+                    target = fallback
+                    break
     try:
         kept = target.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
     except OSError:
@@ -276,7 +283,8 @@ def launch(root: object, dataset: str, *, port: int = 8765, host: str = "127.0.0
         drop_pid_file(keeper, process.pid)
 
 
-__all__ = ["FULL_PACKAGES", "LIGHT_PACKAGES", "cert_ready", "drop_pid_file",
+__all__ = ["FULL_PACKAGES", "LIGHT_PACKAGES", "LOG_PORT_PATTERN", "cert_ready",
+           "drop_pid_file",
            "ensure_cert", "import_check", "interpreter", "launch", "read_log",
            "rotate_log", "serve_command", "url_for", "wait_for_port",
            "write_pid_file"]

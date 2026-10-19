@@ -1,3 +1,76 @@
+## 自动标注系统 v1.4.1（两个不报错、却每天都在掉标注质量的 bug）
+
+开发者 **windinchen** · 源码与发布 <https://github.com/windinchen/autolabel> · 版本号 `autolabel version`
+
+v1.4.0 之后按「错了会不会悄悄毁数据」重查了一遍，不按模块查。挖到的头两个 bug 都不报错、不崩溃，只是让标注质量一天比一天差。
+
+### 一、姿态后端把 RGB 原图喂进了模型
+
+`infer` 里 RGB→BGR 转了一次，`_predict` 里又转了一次，等于把**原始 RGB** 交给模型——而 ultralytics 收到 ndarray 时不做任何色彩转换，它自己的加载器写明假定 BGR。症状最坑：标注看着没坏，关键点质量就是比直接在 Python 里跑 `model.predict` 差，且一声不吭。
+
+同一张图、同一权重（`yolo11n-pose.pt`）、同一设备，修完后两者逐点对比：
+
+```
+直接推理: 4 人 | 项目后端: 4 人
+关键点平均偏差: 0.00 px | 中位: 0.00 px | 最大: 0.00 px
+```
+
+**0.00 px** 意味着项目路径现在喂进去的数组与直接 `predict` 完全一致——之前这个数字是几十像素量级。两条后端各钉了一条桩测试（检测后端按位置传图、姿态后端用 `source=`），漏测一条就又是一次悄悄退化。
+
+### 二、镜像融合一律套 COCO 的左右配对表
+
+自定义关键点权重的左右点会被平均到一起（左肩和「不知道是什么的右手指」），每个点都朝内缩。现在 `flip_idx` 从权重元数据取，且只认**完整排列**——长度不齐 / 下标越界 / 不是排列 / 脏数据一律退回 COCO。
+
+### 权重下载
+
+- **三次重试打的都是同一个镜像 URL**：镜像限流或挂掉就白等三轮超时，而注释和提示都写着「退回直连」。现在候选是 `[镜像, 直连]` 逐次退让，告警文案标出这次走的哪条路。
+- `--force` 重下三次全失败时，把挪走的 `.bad` 改回原名——加载失败也比手上连一份权重都不剩强。
+- `claim_download` 的等待方改成周期性重抢文件锁（以前抢锁的进程崩了就一路等到 deadline）。
+- `_retry_after_redownload` 里两处 `ensure_weights(...) == path` 恒为真（该函数失败不抛错、只退回原路径），改成 `weights_ready(path)` 真判一次。
+
+### 算力与多卡
+
+| 问题 | 后果 |
+| --- | --- |
+| `--device` 的取值在六个子命令里各写一遍 | 帮助里写着能填卡号，实际被 `choices` 拒成退出码 2。现在收进 `settings.DEVICE_ARGS` 一处 |
+| `env_override` 把 `cuda:1` 收成 `cuda` | 双卡机器上两个实例全挤到 0 号卡，第二块闲着，两边都以为在用 |
+| 实例清单的 `device` 字段不校验 | 填错就退出码 2，再被服务管理器每 10 秒拉起一次刷日志。现在读清单时就拦住并列出全部可填档位 |
+
+另外 `resolve_weight_in_dir` 认得「指向权重目录内部的完整路径」了（`models/x.pt` 是抄命令行时最自然的写法），目录外照旧拒绝——那几个调用方会**删文件**。
+
+### 启动与服务
+
+- **端口探测按地址族来**：服务绑 `::` 时原来的探测说「这里没人听」，双击启动白等一轮超时再报「起不来」。
+- `read_log()` 不再拿文件名尾巴反推端口：滚动过的 `autolabel-8765.log.1` 会算出 `8765.log`，打开的是个空文件。
+- **Windows 重启实例**改成 `Stop-ScheduledTask` → 等 `State -ne 'Running'` → `Start-ScheduledTask`：原来那句 `&` 不带 shell，PowerShell 当普通参数，重启必失败。
+- 注册服务时顺手清掉遗留的 `.work` 目录联接。
+
+### 复核 / 导出 / 批次
+
+- **已接受的图再存一次，返回体必须带最终 `status`**：以前 approved 分支不返回 status，前端退化成「待复核」——点接受、再微调一个点，那行状态就自己变回去了。
+- **撤销要重算派生字段**：`undo` 补回 `flags` / `score` / `visible_ratio` / `object_flags`；`undo_prompt` 补回 `flags` / `score` / `classes` 并**清空 `manual` / `manual_boxes`**——那个字段存的是「第几个框是人工画的」下标，框换成旧的那份之后下标全错位，留着就把模型框说成人工框、顺手把 score 抬到 1.0。
+- `export._place` 接住 `ValueError`：Windows 上源图在 D:、导出目录在 C: 时 `os.path.relpath` 抛的是 `ValueError`（不是 `OSError`），软链→硬链→拷贝的退让链一步都不走，整批导出崩在一句英文报错上。
+- **门户「未分组」行能展开了**：那种行 ID 形如 `__ungrouped__:objects`，后半段才是库名；以前拿整串去姿态库索引里找，行上写着 2 张、点开是空的。
+- 删一张图的清理分成两套名字：备份与撤销历史用扁平名，叠加图用带目录的原名。素材一进子目录（`--subdir`、视频抽帧都会）以前只算一个 stem，删完留一堆永久残骸。
+- `split_legacy_index` 在目标索引已存在时改成合并：`init` 会为三个库各建一本空索引，于是老数据集迁移时提示词库索引「已存在」→ 整份跳过，可下面照样把 `prompt_*` 从姿态库剥掉，结果两边都没留。
+- 前端 `FLAG_LABEL` 补上 `model_stale` / `model_failed` / `masked` 的中文名（此前界面直接显示英文键名）；训练命令的数据集路径改取 `data_yaml`。
+
+### 已知但没动（架构级的账，先记着）
+
+- `dataset.import_images` 整表读 → 整表写，且**不持**复核存储层的锁：上传/抽帧跑几分钟期间用户改的标注，可能被旧副本覆盖。
+- `_stem` 扁平化会让 `a/b.jpg` 和 `a__b.jpg` 抢同一个备份槽。
+
+### 升级
+
+```bash
+git pull
+python3 -m autolabel --version   # 应显示 1.4.1
+```
+
+**测试 916 → 964 条全跑**（新增 `tests/test_infer_input.py` 与若干回归）。`ruff` 与 5 个 JS 文件的 `node --check` 全绿。
+
+---
+
 ## 自动标注系统 v1.4.0（Windows 也能用了：启动链路搬进 Python）
 
 开发者 **windinchen** · 源码与发布 <https://github.com/windinchen/autolabel> · 版本号 `autolabel version`

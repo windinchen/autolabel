@@ -392,3 +392,27 @@ def test_status_of_detect_only_dataset_does_not_look_like_lost_data(tmp_path, ca
     out = capsys.readouterr().out
     assert "姿态库还没有素材" in out and "姿态库 图片 0" not in out
     assert "目标检测 已标" in out
+
+
+def test_split_legacy_index_merges_into_an_existing_objects_index(tmp_path):
+    """提示词库索引**已经存在**时（先跑过一次 ``init``，或上次迁移只做了一半）
+    必须把 ``prompt_*`` 并进去，不能整份跳过：下面照样会把它们从姿态库里剥掉，
+    于是标注两边都没留，而命令行还报「已迁移 1 条」。
+    """
+    from autolabel.library import ensure_lib_index, split_legacy_index
+
+    root, rel, _batch = _make_legacy_dataset(str(tmp_path / "ds"))
+    assert ensure_lib_index(root, "objects") is True
+    keep = load_index(root, "objects")
+    keep.upsert("keep-me.jpg", prompt_status="approved", prompt_objects=3)
+    keep.save()
+
+    moved, _stripped = split_legacy_index(root)
+
+    assert moved == 1
+    entry = objects_items(root)[rel]
+    assert entry["prompt_status"] == "edited" and entry["prompt_objects"] == 2
+    assert entry["prompt_flags"] == ["small_box"]
+    assert "keep-me.jpg" in objects_items(root), "并进来不能把库里原有的记录挤掉"
+    # 姿态库这边照旧剥干净，否则同样的键在两库里各留一份、以后不知以谁为准
+    assert not any(key.startswith("prompt_") for key in load_index(root).get(rel))

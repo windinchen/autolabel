@@ -200,6 +200,37 @@ def test_conf_parses_both_device_styles(home, conf):
                                   "DEVICE=cuda", "HALF=yes"]
 
 
+def test_conf_accepts_a_gpu_index_and_keeps_the_card_number(home, tmp_path):
+    """``cuda:1`` 必须能填，而且要留着卡号：收成 ``cuda`` 会让双卡机器上
+    两个实例全挤到 0 号卡，第二块卡闲着还都以为自己在用它。"""
+    real = tmp_path / "ds"
+    real.mkdir()
+    path = tmp_path / "gpu.conf"
+    path.write_text("one 8770 %s CUDA:1 no\ntwo 8771 %s 1 yes\n" % (real, real),
+                    encoding="utf-8")
+
+    got = service.read_conf(path)
+
+    assert [row.device for row in got] == ["cuda:1", "1"], "大小写要认，卡号不能丢"
+
+
+def test_conf_rejects_an_unknown_device_before_registration(home, tmp_path):
+    """填错设备现在就得拦住：这个值会原样交给 ``review --device``，
+    后台任务一起来就退出码 2，再被服务管理器每 10 秒拉起一次，日志刷爆。"""
+    real = tmp_path / "ds"
+    real.mkdir()
+    path = tmp_path / "bad-device.conf"
+    path.write_text("worker 8765 %s to-the-moon no\n" % real, encoding="utf-8")
+
+    with pytest.raises(service.ServiceError) as caught:
+        service.read_conf(path)
+
+    assert "设备不认识" in str(caught.value)
+    advice = " ".join(caught.value.details)
+    assert "cuda:1" in advice and "mps" in advice, "报错要把能填的档位全列出来"
+    assert "退出码 2" in advice, "还要说清不拦会怎么炸，用户才知道这一步不是可改可不改"
+
+
 @pytest.mark.parametrize("line,keyword,at", [
     ("中文 8765 {ds} - no", "实例名不合规", 1),
     ("dup 8765 {ds} - no\ndup 8766 {ds} - no", "实例名重复", 2),
@@ -664,6 +695,41 @@ def test_windows_query_uses_powershell_not_schtasks(monkeypatch, home):
     argv = backend.query_argv("mps")
     assert argv[0] == "powershell" and "Get-ScheduledTask" in argv[-1]
     assert "AutoLabel-mps" in argv[-1]
+
+
+def test_windows_restart_needs_no_cmd_shell(monkeypatch, home):
+    """``&`` 是 **cmd 的** 命令分隔符：不带 shell 把它交给 ``schtasks``，它只当
+    是多出来的参数报「无效参数」，Windows 上每次「重启」都会失败。"""
+    argv = win(monkeypatch).restart_argv("mps")
+    assert "&" not in argv, "argv 里没有 shell，& 只是个普通参数，不会被解析成分隔符"
+    assert argv[0] == "powershell" and "/End" not in " ".join(argv)
+    script = argv[-1]
+    assert "Stop-ScheduledTask" in script and "Start-ScheduledTask" in script
+    assert "'AutoLabel-mps'" in script
+
+
+def test_windows_restart_waits_for_the_old_instance_to_leave(monkeypatch, home):
+    """任务是 ``IgnoreNew``：旧实例还没退干净就下发起动，等于什么都没发生，
+    但两条命令都返回成功——屏幕上会写「已重启」。"""
+    script = win(monkeypatch).restart_argv("mps")[-1]
+    stop, start = script.index("Stop-ScheduledTask"), script.index("Start-ScheduledTask")
+    assert stop < start
+    assert "State -ne 'Running'" in script and "Start-Sleep" in script, "先等旧的退了再启动"
+
+
+def test_prune_stale_clears_the_windows_junction_too(monkeypatch, home, conf):
+    """Windows 的实例还留一个指向项目的目录联接，清僵尸时得连它一起清掉。"""
+    backend = win(monkeypatch)
+    services = service.services_dir()
+    services.mkdir(parents=True, exist_ok=True)
+    ghost = services / "gone.work"
+    os.symlink(home / "Desktop" / "自动标注", ghost)
+    unit = backend.unit_path("gone")
+    unit.write_text("task=AutoLabel-gone\n", encoding="utf-8")
+    monkeypatch.setattr(service, "run", lambda argv, **kw: _done())
+    service.prune_stale(backend, read_conf_lines(conf), home, echo=lambda *_: None)
+    assert not unit.exists()
+    assert not ghost.is_symlink(), "联接没清：下次同名实例会被指到别处"
 
 
 @pytest.mark.parametrize("state,loaded,running", [

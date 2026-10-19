@@ -82,6 +82,18 @@ def test_resolve_weight_in_dir_rejects_outside_files(workspace, bad):
         models.resolve_weight_in_dir(bad)
 
 
+def test_resolve_weight_in_dir_accepts_a_path_inside_the_dir(workspace):
+    """``--model models/yolo11n.pt`` 是抄命令行时最自然的写法，
+    帮助里也写着「权重文件名或路径」，以前这条会被自己的校验拒掉。"""
+    inside = os.path.join(workspace["weights"], "yolo11n.pt")
+    assert models.resolve_weight_in_dir(inside) == os.path.abspath(inside)
+    assert models.resolve_weight_in_dir(inside.replace("/", "/./")) == os.path.abspath(inside)
+    # 目录外照旧拒绝：调用方里有会删文件的，误删比报错严重
+    with pytest.raises(ValueError):
+        models.resolve_weight_in_dir(os.path.abspath(os.path.join(workspace["weights"], os.pardir,
+                                                                 "elsewhere", "x.pt")))
+
+
 def test_delete_weight_removes_part_and_bad(workspace):
     target = os.path.join(workspace["weights"], "yolo11s-pose.pt")
     with open(target, "wb") as fh:

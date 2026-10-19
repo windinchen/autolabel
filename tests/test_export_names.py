@@ -312,3 +312,22 @@ def test_detection_export_prunes_and_quotes(tmp_path):
     assert second["train"] == 1
     assert _listing(out, "train") == ["d0.jpg"], "被驳回的图还留在导出目录里"
     assert second["counts"]["pruned"] == 2
+
+
+def test_export_survives_a_source_on_another_drive(tmp_path, monkeypatch):
+    """Windows 上源图在 D:、导出目录在 C: 时，``os.path.relpath`` 抛的是
+    ``ValueError``（不是 ``OSError``），退让链一步都不走，整批导出当场崩在一句
+    英文报错上——软链接本来就是可选优化，不该因为它毁掉一次导出。
+    """
+    def no_relpath(*_args, **_kwargs):
+        raise ValueError("path is on mount 'D:', start on mount 'C:'")
+
+    monkeypatch.setattr(os.path, "relpath", no_relpath)
+    src = tmp_path / "src.jpg"
+    src.write_bytes(b"picture")
+    dst = tmp_path / "out" / "images" / "src.jpg"
+
+    used = ex._place(str(src), str(dst), "symlink")
+
+    assert used != "symlink", "跨盘符时没接住 ValueError"
+    assert open(dst, "rb").read() == b"picture"

@@ -1,6 +1,49 @@
 # 变更记录
 
-## 2026-10-19 11:40 — Windows 也能正常用了：启动链路从 zsh 搬进 Python（开发中，未发版）
+## 2026-10-19 13:40 — v1.4.0 之后第一轮全面体检：喂进模型的颜色顺序、镜像的关键点配对、撤销之后的派生字段
+
+这一轮不按模块查，按「错了会不会悄悄毁数据」排。挖到两个不报错、但每天都在掉标注质量的：**姿态后端把 RGB 原图喂进了模型**（色彩顺序长期 R/B 互换），**镜像融合一律套 COCO 的左右配对表**（自定义关键点权重的左右点会平均到一起）。
+
+### 推理与模型
+
+- **姿态后端重复转了一次色彩**：`infer` 里 RGB→BGR 转一次，`_predict` 里又转一次，等于把原始 RGB 交进模型——ultralytics 收到 ndarray **不做任何色彩转换**，它自己的加载器（`data/loaders.py`）写明假定 BGR。症状最坑：标注看着没坏，关键点质量就是比直接在 Python 里跑 `model.predict` 差，且不报错。现在只转一次，并给两条后端各钉一条桩测试（检测后端按**位置**传图、姿态后端用 `source=`，桩两种都得接住，否则漏测一条就又是一次悄悄退化）。
+- **镜像融合改用模型自己的配对表**：`flip_idx` 从权重元数据取（`pose_metadata`）传进 `mirror_person`；只认**完整排列**——长度不齐 / 下标越界 / 不是排列 / 脏数据一律退回 COCO。以前自定义关键点权重的左肩会和「不知道是什么的右手指」平均到一起，每个点都朝内缩。
+- **镜像下载要真的退回直连**：`ensure_weights` 的三次重试以前打的都是**同一个镜像 URL**，镜像限流或挂掉就白等三轮超时，而注释和提示都写着「退回直连」。现在候选是 `[镜像, 直连]` 逐次退让，告警文案标出这次走的是哪条路；`--force` 重下三次全失败时把挪走的 `.bad` 改回原名——加载失败也比手上连一份权重都不剩要强。
+- `claim_download` 的等待方改成周期性重抢文件锁：以前只在进门看一眼，抢锁的进程崩了就一路等到 `deadline`。
+- `_retry_after_redownload` 两处 `ensure_weights(...) == path` 恒为真（那个函数失败不抛错，只退回原路径），改成 `weights_ready(path)` 真判一次。
+- **`--device` 的可选值收进一处**：新增 `settings.DEVICE_ARGS`（`auto/cuda/mps/cpu` + `0/1/cuda:0/cuda:1`），六个子命令全从这里取。多卡机器上「一个实例跑一块卡」以前被 `choices` 拒成退出码 2，而帮助里明明写着可以填编号。
+- **`env_override` 不再抹掉卡号**：原来把 `cuda:1` 收成 `cuda`，双卡机器上两个实例全挤到 0 号卡，第二块卡闲着还都以为自己在用它。
+- 实例清单的 `device` 字段现在**读清单时就校验**（含大小写），填错当场拦住并列出全部可填档位；不拦的话后台任务一起来就退出码 2，再被服务管理器每 10 秒拉起一次刷日志。
+- `resolve_weight_in_dir` 认得「指向权重目录内部的完整路径」了（`models/x.pt` 是抄命令行时最自然的写法）；目录外照旧拒绝——那几个调用方会**删文件**，误删用户放在别处的权重比报一句错严重。
+- 权重加载失败时的「解除占用」提示在 Windows 上改用 `del`。
+
+### 启动与服务
+
+- **端口探测按地址族来**（`platform_utils.probe_address()`）：服务绑 `::` 时原来的探测会说「这里没人听」，双击启动白等一轮超时再报「起不来」。
+- `read_log()` 不再拿文件名尾巴反推端口：滚动过的 `autolabel-8765.log.1` 会算出 `8765.log`，`autolabel log` 打开的是个空文件。
+- **Windows 重启实例**改成 `Stop-ScheduledTask` → 等 `State -ne 'Running'` → `Start-ScheduledTask`：原来那句 `&` 不带 shell，PowerShell 把它当普通参数，重启必失败。
+- 注册服务时顺手清掉遗留的 `.work` 目录联接。
+
+### 复核 / 导出 / 批次
+
+- **已接受的图再存一次，返回体必须带最终 `status`**：以前 `write_item` 在 approved 分支不返回 status，前端退化成「待复核」——点接受、再微调一个点，那行的状态就自己变回去了。
+- **撤销要重算派生字段**：`undo` 补回 `flags` / `score` / `visible_ratio` / `object_flags`；`undo_prompt` 补回 `flags` / `score` / `classes` 并**清空 `manual` / `manual_boxes`**。`prompt_manual_boxes` 存的是「第几个框是人工画的」下标，框换成旧的那份之后下标全错位，留着就把模型框说成人工框、顺手把 score 抬到 1.0，连复核排序都跟着变。
+- `export._place` 接住 `ValueError`：Windows 上源图在 D:、导出目录在 C: 时 `os.path.relpath` 抛的是 `ValueError`（不是 `OSError`），软链→硬链→拷贝的退让链一步都不走，整批导出崩在一句英文报错上。
+- **门户「未分组」行能展开了**：那种行的 ID 形如 `__ungrouped__:objects`，后半段才是库名；`batch_file_rows` 以前不拆前缀，拿整串去默认的姿态库索引里找，结果是行上写着 2 张、点开是空的，按张删除也无从下手。
+- 删一张图的清理分成两套名字：备份和撤销历史用扁平名（`clipA__000001.txt` / `clipA__000001/`），叠加图用带目录的原名（`clipA/000001.jpg`）。素材一进子目录（`--subdir`、视频抽帧都会）以前只算一个 stem，删完留下一堆永久残骸。
+- **`split_legacy_index` 在目标索引已存在时改成合并**：`init` 会为三个库各建一本空索引，于是老数据集迁移时提示词库索引「已存在」→ 整份跳过，可下面照样把 `prompt_*` 从姿态库剥掉，结果提示词标注两边都没留，命令行还报「已迁移 1 条」。
+- 前端 `FLAG_LABEL` 补上 `model_stale` / `model_failed` / `masked` 三个标记的中文名（此前界面直接显示英文键名）；训练命令的数据集路径改取 `data_yaml`。
+
+### 已知但没动（记录一下，都是架构级的账）
+
+- `dataset.import_images` 整表读→整表写且**不持**复核存储层的锁：上传/抽帧跑几分钟期间用户改的标注可能被旧副本覆盖。
+- `_stem` 扁平化会让 `a/b.jpg` 和 `a__b.jpg` 抢同一个备份槽。
+- `settings.save()` 仍非原子写；`version.parse_version` 不吃 `+cpu` 这类后缀（只在设置侧绕过）。
+
+版本号仍是 **1.4.0**——本轮是发版后的修复，不擅自升版本。测试 **916 → 964 条**（`pytest --collect-only` 实数）全跑，`ruff` 与 5 个 JS 的 `node --check` 全绿。
+
+
+## 2026-10-19 11:40 — v1.4.0：Windows 也能正常用了，启动链路从 zsh 搬进 Python
 
 需求是「这个项目最适配 mac，我要 Windows 也能正常使用」。查下来根因很实在：**双击启动这件事写在 zsh 里**——`运行工作台.command` 和 `后台实例.command` 两份脚本各自包办了环境自检、签证书、起服务、等端口、写日志，Windows 上既没有 zsh 也没有 `/tmp`，连门都进不去。所以这一轮不是给 `.bat` 抄一份，而是把逻辑收进 Python，两个系统各留一层壳。
 
@@ -24,7 +67,7 @@
 - **`tests/test_background_service.py` 重写并扩到 76 条**，新增 `tests/test_platform_utils.py`（37 条）、`tests/test_launch.py`（29 条）：Windows 那条分支的命令拼装、PowerShell 注册脚本内容、`.cmd` 启动片内容、`Get-ScheduledTask` 状态解析全都能在 mac 上验，因为它们都是纯函数。`test_launch.py` 还补了一条 autouse 默认值「端口是空的」——常驻服务正在听 8765 时跑测试，原来会有用例走错分支红一片（而这正是用户最常在的状态下跑测试）。`launchctl` 的替身改成按标签分别应答——原来所有查询都回同一个值，「未注册 / 定义写好了但没加载 / 加载了没在跑」三态在测试里是糊的。测试计数 795 → **916**（`pytest --collect-only` 实数）。
 - **macOS 行为没变**：plist 逐字段对过（唯一差异是日志路径，这是有意的），`KeepAlive` / `RunAtLoad` / `ThrottleInterval` / 启动片内容与权限全在测试里钉着；launchd 标签还是 `com.windinchen.autolabel.<实例名>`。
 
-版本号仍停在 **1.3.2**，发版前不动 `autolabel/version.py`。
+已发版为 **v1.4.0**（`autolabel/version.py`），发布说明见 `RELEASE_NOTES.md`。
 
 ## 2026-10-19 09:30 — 后台常驻服务搬进项目：开机自起、崩溃自拉起，顺带挖出两个只有重启才暴露的坑
 

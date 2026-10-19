@@ -413,7 +413,11 @@ class ReviewStore:
                 fields["status"] = STATUS_EDITED
             self.index.upsert(image_rel, **fields)
             self.index.save()
-        return {"ok": True, "image": image_rel, **fields,
+        # 已经 accepted/rejected 的图再存一次且不指定 status 时，``fields`` 里没有
+        # status 这个键；前端 ``meta.status = data.status`` 就拿到 undefined，
+        # 行内状态退化成"待复核"、进度条跟着少一张
+        final = str(fields.get("status") or item.get("status") or STATUS_UNREVIEWED)
+        return {"ok": True, "image": image_rel, "status": final, **fields,
                 "objects": [self._person_payload(p) for p in persons]}
 
     @staticmethod
@@ -1077,7 +1081,19 @@ class ReviewStore:
                 shutil.copy2(os.path.join(history, latest), label_path_for(self.root, image_rel))
                 os.remove(os.path.join(history, latest))
             persons = parse_label_file(label_path_for(self.root, image_rel))
+            # 标签回到旧的那份，索引里的派生字段必须一起回去：只改 status 的话
+            # flags / score / visible_ratio 还是撤销前那份，界面把已经消失的问题
+            # 继续挂在标记上，低置信排序也按着旧分值排
+            item = self.index.get(image_rel) or {}
+            width, height = int(item.get("width") or 0), int(item.get("height") or 0)
+            flags = image_level_flags(height, width, persons)
+            scores = [person.score for person in persons if person.score]
             self.index.upsert(image_rel, status=STATUS_UNREVIEWED, objects=len(persons),
+                              score=round(sum(scores) / len(scores), 4) if scores else 0.0,
+                              visible_ratio=_visible_ratio(persons),
+                              flags=[flag for flag in flags if not flag.startswith("obj:")],
+                              object_flags=sorted({flag for person in persons
+                                                   for flag in person.flags}),
                               reviewed_at=now_str())
             self.index.save()
         return {"ok": True, "image": image_rel,
@@ -1101,9 +1117,30 @@ class ReviewStore:
                 if not os.path.exists(backup):
                     raise ValueError("这张图还没有可撤销的修改：它没有被保存过")
                 shutil.copy2(backup, label)
-            count = len(read_detections(self.root, image_rel, lib))
+            detections = read_detections(self.root, image_rel, lib)
+            count = len(detections)
             index = self.index_for(lib)
+            item = index.get(image_rel) or {}
+            width, height = int(item.get("width") or 0), int(item.get("height") or 0)
+            stale_flag = "model_stale" if lib == LIB_DETECT else "prompt_stale"
+            per_box = box_flags(detections, width, height,
+                                [int(field.get("class_id", -1))
+                                 for field in list_fields(self.root, lib)])
+            flags = image_flags(detections, per_box,
+                                failed_flag="model_failed" if lib == LIB_DETECT else "vlm_failed")
+            if stale_flag in (item.get(key("flags")) or []):
+                flags = sorted(set(flags) | {stale_flag})
+            scores = [detection.score for detection in detections]
+            # ``manual_boxes`` 存的是「第几个框是人工画的」下标：框换成旧的那份之后
+            # 下标全错位，留着就会把模型框说成人工框、把 score 抬到 1.0，
+            # 还顺带改变复核排序。撤销之后人工标记认不回来了，只能清空
             index.upsert(image_rel, **{key("status"): STATUS_UNREVIEWED, key("objects"): count,
+                                       key("flags"): flags,
+                                       key("manual"): 0, key("manual_boxes"): [],
+                                       key("score"): round(sum(scores) / len(scores), 4)
+                                       if scores else 0.0,
+                                       key("classes"): sorted({detection.cls
+                                                               for detection in detections}),
                                        key("reviewed_at"): now_str()})
             index.save()
         return {"ok": True, "image": image_rel, "lib": lib,

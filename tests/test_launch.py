@@ -206,6 +206,22 @@ def test_read_log_finds_the_old_temp_location(tmp_path, monkeypatch):
     assert "上次崩在这里" in L.read_log(tmp_path / "logs" / "autolabel-8765.log")
 
 
+@pytest.mark.parametrize("name", ["autolabel-8765.log", "autolabel-8765.log.1"])
+def test_read_log_recognises_a_rolled_log_when_falling_back(tmp_path, monkeypatch, name):
+    """滚动一次的日志文件名尾巴多个 ``.1``：按「最后一个 - 后面」取端口会取出
+    ``8765.log``，于是永远找不到老位置的现场。"""
+    legacy = tmp_path / "tmp" / "autolabel-8765.log"
+    legacy.parent.mkdir()
+    legacy.write_text("上次崩在这里\n", encoding="utf-8")
+    monkeypatch.setattr(L.platform_utils.tempfile, "gettempdir", lambda: str(tmp_path / "tmp"))
+    assert "上次崩在这里" in L.read_log(tmp_path / "logs" / name)
+
+
+def test_read_log_on_a_missing_file_is_silent(tmp_path):
+    """查状态时日志十有八九还不存在，这里不能把异常抛到用户脸上。"""
+    assert L.read_log(tmp_path / "没这个文件.log") == ""
+
+
 # --------------------------------------------------------------------------- #
 # PID 条：服务管理器给的 PID 不是那个在听端口的
 # --------------------------------------------------------------------------- #

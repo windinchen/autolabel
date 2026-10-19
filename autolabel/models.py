@@ -315,14 +315,20 @@ def list_weights(dir_: Optional[str] = None, dataset_root: str = "") -> List[dic
 
 
 def resolve_weight_in_dir(name: str, dir_: Optional[str] = None) -> str:
-    """把裸文件名解析到权重目录；带路径或绝对路径一律拒绝，避免误删外部权重。"""
+    """把权重名解析到权重目录里的绝对路径。
+
+    ``yolo11n.pt`` 和 ``models/yolo11n.pt`` 都认——帮助里写的就是「权重文件名或
+    路径」，而 ``--model models/yolo11n.pt`` 是抄命令行时最自然的写法，以前这条
+    会被自己拒掉。指向目录外的路径仍然拒绝：那几个调用方会**删文件**，
+    误删用户放在别处的权重比报一句错严重得多。
+    """
     dir_ = weights_dir() if dir_ is None else dir_
     raw = str(name or "").strip().replace("\\", "/")
     base = os.path.basename(raw)
     if not base.endswith(".pt"):
         raise ValueError("只能管理权重目录里的 .pt 文件")
-    if base != raw:
-        raise ValueError(f"只能管理 {dir_}/ 目录下的权重，不能带路径：{raw}")
+    if base != raw and os.path.dirname(os.path.abspath(raw)) != os.path.abspath(dir_):
+        raise ValueError(f"只能管理 {dir_}/ 目录下的权重，别的路径请先拷进来：{raw}")
     return os.path.join(os.path.abspath(dir_), base)
 
 

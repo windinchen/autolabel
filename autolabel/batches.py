@@ -568,6 +568,11 @@ def batch_items(root: str, batch_id: str, lib: str = "") -> List[str]:
 
 def batch_file_rows(root: str, batch_id: str, lib: str = "") -> List[dict]:
     """某批次下的单张清单，给门户「展开文件」和按张删除用（新→旧按入库时间）。"""
+    if str(batch_id).startswith(f"{UNGROUPED_ID}:"):
+        # 「未分组」行的 ID 形如 __ungrouped__:detect，后半段才是库名。
+        # :func:`batch_items` 自己会拆，这里不拆就会按默认库去找索引，
+        # 结果是批次行明明写着 N 张，展开却是空的，按张删除也无从下手
+        batch_id, lib = str(batch_id).split(":", 1)
     lib = normalize(lib) if lib else resolve_lib(root, batch_id)
     idx = load_index_or_none(root, lib)
     peers = _peers(root, lib)
@@ -929,19 +934,23 @@ def _read_text(path: str) -> List[str]:
 
 def _remove_lib_files(root: str, lib: str, rel: str) -> int:
     """删掉一张图在**某个库**里的痕迹：标签、人工原件备份、撤销历史。"""
-    stem = os.path.splitext(rel)[0]
+    # 备份与历史用的是扁平名（``clipA/0001.jpg`` → ``clipA__0001``，和
+    # ``ReviewStore._stem`` 一致），叠加图用的却是带子目录的原名：以前这里只算一
+    # 个 stem，素材一进子目录（``--subdir``、视频抽帧都会）删图就留下永久的残骸
+    flat = os.path.splitext(str(rel).replace("/", "__"))[0]
+    nested = os.path.splitext(rel)[0]
     removed = 0
     targets = [label_path_for(root, rel, lib),
-               os.path.join(backups_dir(root, lib), stem + ".txt")]
+               os.path.join(backups_dir(root, lib), flat + ".txt")]
     if lib == LIB_POSE:
-        targets.append(os.path.join(qc_dir(root), "overlays", stem + ".jpg"))
+        targets.append(os.path.join(qc_dir(root), "overlays", nested + ".jpg"))
     for path in targets:
         try:
             os.remove(path)
             removed += 1
         except OSError:
             pass
-    history = os.path.join(history_root(root, lib), stem)
+    history = os.path.join(history_root(root, lib), flat)
     if os.path.isdir(history):
         shutil.rmtree(history, ignore_errors=True)
         removed += 1

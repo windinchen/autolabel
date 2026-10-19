@@ -508,7 +508,10 @@ def _place(src: str, dst: str, mode: str) -> str:
             else:
                 shutil.copy2(src, dst)
             return mode
-        except OSError:
+        except (OSError, ValueError):
+            # ValueError 也要接住：Windows 上源图和导出目录不在同一个盘时，
+            # ``os.relpath`` 抛的是 ValueError（"path is on mount 'D:'..."），
+            # 它不是 OSError，退让链一步都不走，整批导出当场崩在英文报错上
             nxt = PLACE_FALLBACKS[mode]
             if not nxt:
                 raise

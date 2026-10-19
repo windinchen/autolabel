@@ -30,6 +30,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from xml.sax.saxutils import escape as xml_escape
 
 from . import platform_utils
+from .settings import DEVICE_ARGS
 from .version import DEVELOPER
 
 CONF_NAME = os.path.join("configs", "后台实例.conf")
@@ -123,8 +124,15 @@ def read_conf(path: object, *, root: Optional[object] = None) -> List[Instance]:
                 f"先 python -m autolabel init {dataset}，或把这一行改成已有目录")
         # 存解析后的绝对路径：后台任务的工作目录是项目根，但 launchd /
         # 任务计划程序给的环境千差万别，相对路径在这儿只是一颗延时引爆的雷
+        wanted_device = "" if device == "-" else device.lower()
+        if wanted_device and wanted_device not in DEVICE_ARGS:
+            raise ServiceError(
+                f"{target} 第 {lineno} 行的设备不认识：{device}（实例 {name}）",
+                "可选 " + " / ".join(DEVICE_ARGS) + "；填 - 表示跟「系统设置」里那档走",
+                "写错了先别急着注册——这个值会原样传给 review --device，"
+                "后台任务一起来就退出码 2，再被服务管理器每 10 秒拉起一次")
         seen[name] = Instance(name=name, port=int(port), dataset=str(dataset_dir),
-                             device="" if device == "-" else device,
+                             device=wanted_device,
                              half=half.lower() in ("yes", "y", "true", "1", "on"))
         order.append(name)
     if not order:
@@ -188,7 +196,8 @@ class Backend:
     def parse_state(self, stdout: str) -> Tuple[bool, bool, Optional[int]]:
         raise NotImplementedError
 
-    def extra_paths(self, inst: Instance) -> List[Path]:
+    def stray_paths(self, name: str) -> List[Path]:
+        """除了任务定义和启动片，这个实例还会留下什么文件（Windows 多个目录联接）。"""
         return []
 
     def prepare(self, inst: Instance, root: object) -> None:
@@ -317,8 +326,8 @@ class TaskSchedulerBackend(Backend):
         """
         return services_dir() / f"{inst.name}.work"
 
-    def extra_paths(self, inst: Instance) -> List[Path]:
-        return [self.work_link(inst)]
+    def stray_paths(self, name: str) -> List[Path]:
+        return [services_dir() / f"{name}.work"]
 
     def prepare(self, inst: Instance, root: object) -> None:
         link = self.work_link(inst)
@@ -372,8 +381,22 @@ class TaskSchedulerBackend(Backend):
                 "-Confirm:$false -ErrorAction SilentlyContinue"]
 
     def restart_argv(self, name: str) -> List[str]:
-        return ["schtasks", "/End", "/TN", self.label(name)] + ["&"] + \
-            ["schtasks", "/Run", "/TN", self.label(name)]
+        """重启＝先停干净再拉起，全程 PowerShell。
+
+        原先拼的是 ``schtasks /End … & schtasks /Run …``，但 ``&`` 是 **cmd 的**
+        命令分隔符：我们不经过 shell 直接把这一串交给 ``schtasks``，它只会把
+        ``&`` 当成多出来的参数报「无效参数」，Windows 上每次重启都失败。
+        停完还要等旧实例真退了再启动——任务是 ``IgnoreNew``，手快就变成
+        「命令都成功了，可什么都没发生」。
+        """
+        task = _ps_quote(self.label(name))
+        script = ("$n='%s'; Stop-ScheduledTask -TaskName $n -ErrorAction SilentlyContinue; "
+                  "$i=0; while ($i -lt 20) { $t = Get-ScheduledTask -TaskName $n "
+                  "-ErrorAction SilentlyContinue; "
+                  "if (-not $t -or $t.State -ne 'Running') { break }; "
+                  "$i++; Start-Sleep -Milliseconds 300 }; "
+                  "Start-ScheduledTask -TaskName $n" % task)
+        return ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
 
     def query_argv(self, name: str) -> List[str]:
         """查任务状态用 PowerShell，不用 ``schtasks``。
@@ -721,6 +744,8 @@ def prune_stale(backend_: Backend, instances: Sequence[Instance], root: object,
             _remove_path(path)
             _remove_path(services_dir() / f"{name}{backend_.shim_suffix}")
             _remove_path(pid_file(name))
+            for stray in backend_.stray_paths(name):
+                _remove_path(stray)
         echo(f"! 清单里已经没有 {name}，注销并清掉它留下的任务定义和启动片")
 
 
@@ -837,7 +862,7 @@ def remove(root: object, target: Optional[str] = None,
         run(backend_.unregister_argv(inst.name))
         echo(f"✓ {inst.name} 已注销")
         for path in [backend_.unit_path(inst.name), backend_.shim_path(inst),
-                     pid_file(inst.name), *backend_.extra_paths(inst)]:
+                     pid_file(inst.name), *backend_.stray_paths(inst.name)]:
             _remove_path(path)
     echo("  清单里的实例都处理完了；要恢复常驻服务再跑一次 autolabel service")
     return 0

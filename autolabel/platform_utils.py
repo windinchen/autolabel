@@ -195,6 +195,21 @@ def force_utf8_streams() -> None:
             pass
 
 
+def probe_address(host: object) -> Tuple[object, str]:
+    """探端口该连哪个地址、用哪个地址族。
+
+    绑在通配地址上时改探 ``127.0.0.1``：拿 ``::`` 当**连接**目标是未定义行为
+    （macOS 上直接报错），而且 AF_INET 的套接字拿 ``::`` 去连永远连不上——
+    端口明明有人听也会说没人，症状是「服务起好了，但脚本死等 90 秒」。
+    """
+    text = str(host).strip().strip("[]")
+    if text in ("", "*", "0.0.0.0", "127.0.0.1", "::", "::0"):
+        return socket.AF_INET, "127.0.0.1"
+    if ":" in text:
+        return socket.AF_INET6, text
+    return socket.AF_INET, text
+
+
 def port_busy(port: int, host: str = "127.0.0.1", timeout: float = 0.4) -> bool:
     """端口有没有人监听。
 
@@ -205,9 +220,11 @@ def port_busy(port: int, host: str = "127.0.0.1", timeout: float = 0.4) -> bool:
         target = int(port)
     except (TypeError, ValueError):
         return False
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+    family, address = probe_address(host)
+    where = (address, target, 0, 0) if family == socket.AF_INET6 else (address, target)
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
         sock.settimeout(timeout)
-        return sock.connect_ex((host, target)) == 0
+        return sock.connect_ex(where) == 0
 
 
 def listening_pid_argv(port: int) -> List[str]:
@@ -261,6 +278,11 @@ def open_argv(url: str) -> List[str]:
     return ["xdg-open", url]
 
 
+def remove_hint(path: object) -> str:
+    """「删掉这个文件」在本系统怎么敲。提示语里的 ``rm`` 在 Windows 上没用。"""
+    return f'del "{path}"' if is_windows() else f"rm {path}"
+
+
 def service_backend() -> str:
     """常驻服务用哪个系统机制：``launchd`` / ``taskscheduler`` / ``none``。"""
     return {MACOS: "launchd", WINDOWS: "taskscheduler"}.get(current(), "none")
@@ -306,6 +328,7 @@ __all__ = [
     "current", "find_openssl", "find_uv", "force_utf8_streams", "is_macos",
     "is_windows", "legacy_logs", "openssl_missing_hint",
     "listening_pid", "listening_pid_argv", "log_dir", "log_paths", "open_argv",
-    "port_busy", "protected_parent", "reveal_argv", "service_backend",
+    "port_busy", "probe_address", "protected_parent", "remove_hint", "reveal_argv",
+    "service_backend",
     "service_log", "state_dir", "tcc_hint", "uv_argv",
 ]
