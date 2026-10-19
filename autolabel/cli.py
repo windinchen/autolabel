@@ -706,6 +706,66 @@ def cmd_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
+#: 试词最多打印几张图：再多终端一屏放不下，而且每张都要重新加载一遍推理
+PROBE_PRINT_IMAGES = 3
+
+
+def _print_probe(args: argparse.Namespace, detector, images: Sequence[str]) -> int:
+    """试词结果的打印：一个词一行，最后一行给"下一步照抄就行"的命令。"""
+    words = _split_multi([args.probe])
+    targets = list(images)
+    if not targets:
+        index = load_index(args.dataset, LIB_DETECT)
+        targets = [str(rel) for rel, _row in index.ordered_items()][:1]
+    if not targets:
+        print(f"{lib_name(LIB_DETECT)}里还没有图：先 autolabel import <数据集> "
+              f"--lib {LIB_DETECT} <图片>，或在界面里上传")
+        return 1
+    if len(targets) > PROBE_PRINT_IMAGES:
+        print(f"[info] 试词一次最多看 {PROBE_PRINT_IMAGES} 张，"
+              f"多出的 {len(targets) - PROBE_PRINT_IMAGES} 张这次不跑")
+    last = None
+    for rel in targets[:PROBE_PRINT_IMAGES]:
+        result = detector.probe_words(args.dataset, rel, model=args.model, words=words,
+                                      conf=args.conf, imgsz=args.imgsz, device=args.device or "")
+        last = result
+        vocab = f" · 开放词表（{result['open_vocab']}）" if result["open_vocab"] else \
+            f" · 权重自带 {result['class_count']} 类"
+        print(f"{result['model']}（{result['task_name']}{vocab}）· 算力 {result['device']} · "
+              f"分辨率 {result['imgsz']} · 阈值 {result['conf']:g} · {rel}")
+        width = max((len(str(row["word"])) for row in result["words"]), default=8)
+        for row in result["words"]:
+            boxes = f"{row['boxes']} 框" if row["over"] else "无框"
+            print(f"  {_pad(row['word'], width + 2)}最高 {row['best']:.3f}  {boxes:<6} {row['advice']}")
+        if not result["open_vocab"] and result.get("model_classes"):
+            print(f"     这个权重认识的是：{'、'.join(result['model_classes'])} …"
+                  f"（共 {result['class_count']} 类）")
+        passed = [row for row in result["words"] if row["over"]]
+        if not any(row["best"] > 0 for row in result["words"]):
+            print("  结论：这些词一个分都没给，换词或换图再试")
+        elif not passed:
+            print(f"  结论：最高的是 {result['words'][0]['word']} {result['best']:.3f}，"
+                  f"把置信度降到 {result['suggested_conf']:g} 就有框")
+        elif result.get("suggested_conf"):
+            print(f"  结论：{passed[0]['word']} 能出框；检不出框的词最高 "
+                  f"{result['missed_best']:.3f}，想一起标出来把置信度降到 {result['suggested_conf']:g}")
+        else:
+            print(f"  结论：{passed[0]['word']} 已经能出框，直接导入类别开标就行")
+        print()
+    if last:
+        usable = [row["word"] for row in last["words"] if row["best"] > 0]
+        if usable:
+            command = (f"python3 -m autolabel detect <数据集> --model {last['model']} "
+                       f"--add-classes {','.join(usable)}")
+            if not any(row["over"] for row in last["words"]):
+                command += f" --conf {last['suggested_conf']:g}"
+                if last.get("suggest_imgsz"):
+                    command += f" --imgsz {last['suggest_imgsz']}"
+                command += " --overwrite"
+            print(f"下一步照抄：{command}")
+    return 0
+
+
 def cmd_models(args: argparse.Namespace) -> int:
     """列出并管理姿态权重与多模态大模型配置；不带参数就是清单。"""
     from . import models as model_admin
@@ -1215,6 +1275,9 @@ def cmd_detect(args: argparse.Namespace) -> int:
         print("导入到本库类别表：python3 -m autolabel detect <数据集> --model "
               f"{os.path.basename(profile['model'])} --add-classes all")
         return 0
+
+    if args.probe:
+        return _print_probe(args, detector, images)
 
     if args.status:
         summary = detector.detect_summary(args.dataset)
@@ -1992,6 +2055,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="把权重自带的类别导入本库类别表，逗号分隔可重复；all=全部导入。"
                         "开放词表权重（yolov8x-world.pt、yoloe-26x-seg.pt）这里填的就是"
                         "要找的英文词，不限权重自带类别", )
+    p.add_argument("--probe", metavar="词表",
+                   help="试词：拿一张图问权重「这些词你到底认不认、最高给了多少分」，"
+                        "只读不写数据；配合 --images 指定图（默认取库里第一张）")
     p.add_argument("--no-label", action="store_true", help="配合 --add-classes：只导入类别，不跑标注")
     p.add_argument("--classes", action="append", default=[], metavar="类名",
                    help="只标这些类别（逗号分隔可重复），默认用本库类别表里全部")

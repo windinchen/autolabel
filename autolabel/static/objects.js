@@ -136,6 +136,7 @@ async function bootObjects() {
   initFieldPanel();
   initRunPanel();
   initModelPanel();
+  initProbePanel();
   bindCanvas();
   initShell();
   window.addEventListener("keydown", onKeyDown);
@@ -422,6 +423,7 @@ async function draw() {
       for (const [hx, hy] of [[x1, y1], [x2, y1], [x1, y2], [x2, y2]]) {
         ctx.fillRect(hx - 3.5, hy - 3.5, 7, 7);
       }
+      if (poly.length) drawPolyHandles(poly, color);
     }
     if (!showLabels) return;
     const small = (box.flags || []).includes("small_box") ? " ⚠" : "";
@@ -446,6 +448,86 @@ function boxAt(mx, my) {
     if (mx >= x1 - 4 && mx <= x2 + 4 && my >= y1 - 4 && my <= y2 + 4) return i;
   }
   return -1;
+}
+
+/** 轮廓顶点（屏幕坐标）与边中点：前者能拖、后者拖一下就插一个新点。 */
+function polyHandles(box) {
+  const points = polyPoints(box);
+  const vertices = points.map(([px, py]) => toScreen(px, py));
+  const middles = vertices.map((point, index) => {
+    const next = vertices[(index + 1) % vertices.length];
+    return [(point[0] + next[0]) / 2, (point[1] + next[1]) / 2];
+  });
+  return { vertices, middles };
+}
+
+function drawPolyHandles(poly, color) {
+  const { vertices, middles } = polyHandles({ poly });
+  ctx.lineWidth = 1.4;
+  ctx.strokeStyle = color;
+  ctx.fillStyle = canvasPalette().veil;
+  for (const [hx, hy] of middles) {
+    ctx.beginPath();
+    ctx.arc(hx, hy, 3.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  }
+  ctx.fillStyle = color;
+  for (const [hx, hy] of vertices) {
+    ctx.beginPath();
+    ctx.arc(hx, hy, 4.2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+/** 轮廓顶点的命中测试（按屏幕像素给容差，缩得再小也点得着）。 */
+function vertexAt(mx, my) {
+  if (state.sel < 0) { return null; }
+  const box = state.boxes[state.sel];
+  if (!box || !polyPoints(box).length) { return null; }
+  const { vertices, middles } = polyHandles(box);
+  for (let index = 0; index < vertices.length; index += 1) {
+    if (Math.abs(mx - vertices[index][0]) <= HANDLE_PX
+      && Math.abs(my - vertices[index][1]) <= HANDLE_PX) return { kind: "vertex", index };
+  }
+  for (let index = 0; index < middles.length; index += 1) {
+    if (Math.abs(mx - middles[index][0]) <= HANDLE_PX
+      && Math.abs(my - middles[index][1]) <= HANDLE_PX) return { kind: "middle", index };
+  }
+  return null;
+}
+
+/** 像素点列（画布口径）写回框，并把方框收成轮廓的外接框——YOLO 那 4 列必须包住轮廓。 */
+function setPoly(box, points) {
+  const clean = points.map(([px, py]) => [
+    Number(clamp(px, 0, state.img.width).toFixed(2)),
+    Number(clamp(py, 0, state.img.height).toFixed(2)),
+  ]);
+  box.poly = clean;
+  const xs = clean.map((p) => p[0]);
+  const ys = clean.map((p) => p[1]);
+  const [x1, x2] = [Math.min(...xs), Math.max(...xs)];
+  const [y1, y2] = [Math.min(...ys), Math.max(...ys)];
+  const w = Math.max(0.001, (x2 - x1) / state.img.width);
+  const h = Math.max(0.001, (y2 - y1) / state.img.height);
+  box.cx = Number((((x1 + x2) / 2) / state.img.width).toFixed(6));
+  box.cy = Number((((y1 + y2) / 2) / state.img.height).toFixed(6));
+  box.w = Number(w.toFixed(6));
+  box.h = Number(h.toFixed(6));
+  box.xyxy = [Number(x1.toFixed(2)), Number(y1.toFixed(2)),
+              Number(x2.toFixed(2)), Number(y2.toFixed(2))];
+  return box;
+}
+
+/** 方框被动过时轮廓跟着走：按新老方框做仿射，和后端 carry_polygons 同一套算法。 */
+function rescalePoly(points, from, to) {
+  if (!points || !points.length || from[2] <= from[0] || from[3] <= from[1]) return points || [];
+  const sx = (to[2] - to[0]) / (from[2] - from[0]);
+  const sy = (to[3] - to[1]) / (from[3] - from[1]);
+  return points.map(([px, py]) => [
+    Number((to[0] + (px - from[0]) * sx).toFixed(2)),
+    Number((to[1] + (py - from[1]) * sy).toFixed(2)),
+  ]);
 }
 
 function handleAt(mx, my) {
@@ -492,12 +574,38 @@ function bindCanvas() {
       state.drag = { mode: "pan", mx, my, ox: state.view.ox, oy: state.view.oy };
       return;
     }
+    const spot = vertexAt(mx, my);
+    if (spot) {
+      const box = state.boxes[state.sel];
+      const points = polyPoints(box).map((p) => p.slice());
+      if (e.altKey && spot.kind === "vertex") {
+        if (points.length <= 3) { toast("轮廓最少留 3 个点", true); return; }
+        points.splice(spot.index, 1);
+        setPoly(box, points);
+        markDirty(); renderBoxes(); draw();
+        toast(`删掉一个顶点，还剩 ${points.length} 个`);
+        return;
+      }
+      if (spot.kind === "middle") {
+        const a = points[spot.index];
+        const b = points[(spot.index + 1) % points.length];
+        points.splice(spot.index + 1, 0, [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]);
+      }
+      state.drag = { mode: "vertex", index: spot.kind === "vertex" ? spot.index : spot.index + 1, points };
+      return;
+    }
     const handle = handleAt(mx, my);
-    if (handle) { state.drag = { mode: "resize", handle }; return; }
+    if (handle) {
+      const box = state.boxes[state.sel];
+      state.drag = { mode: "resize", handle, from: box.xyxy.slice(), poly: polyPoints(box).map((p) => p.slice()) };
+      return;
+    }
     const hit = boxAt(mx, my);
     if (hit >= 0) {
       state.sel = hit;
-      state.drag = { mode: "move", mx, my, box: { ...state.boxes[hit] } };
+      state.drag = { mode: "move", mx, my, box: { ...state.boxes[hit] },
+                     from: state.boxes[hit].xyxy.slice(),
+                     poly: polyPoints(state.boxes[hit]).map((p) => p.slice()) };
       renderBoxes(); draw();
       return;
     }
@@ -509,8 +617,9 @@ function bindCanvas() {
   });
 
   window.addEventListener("mousemove", (e) => {
-    if (!state.drag || !state.img) return;
+    if (!state.img) return;
     const [mx, my] = eventPoint(e);
+    if (!state.drag) { hoverCursor(mx, my); return; }
     const drag = state.drag;
     if (drag.mode === "pan") {
       state.view.ox = drag.ox + (mx - drag.mx);
@@ -527,6 +636,13 @@ function bindCanvas() {
     }
     const box = state.boxes[state.sel];
     if (!box) return;
+    if (drag.mode === "vertex") {
+      const points = drag.points.map((p) => p.slice());
+      points[drag.index] = [nx * state.img.width, ny * state.img.height];
+      setPoly(box, points);
+      markDirty(); draw();
+      return;
+    }
     const [bx1, by1, bx2, by2] = toWorldBox(box);
     let next;
     if (drag.mode === "move") {
@@ -544,6 +660,8 @@ function bindCanvas() {
       next = normBox(box.cls, x1, y1, x2, y2);
     }
     Object.assign(box, next);
+    // 拖的是方框也不能把轮廓丢在原地：按新老方框仿射过去（后端同口径，两边不会打架）
+    if (drag.poly && drag.poly.length) box.poly = rescalePoly(drag.poly, drag.from, box.xyxy);
     markDirty(); draw();
   });
 
@@ -561,10 +679,17 @@ function bindCanvas() {
       state.sel = state.boxes.length - 1;
       markDirty(); renderBoxes(); draw();
       toast(`已补画一个 ${fieldName(box.cls)}`);
-    } else if (drag.mode === "move" || drag.mode === "resize") {
+    } else if (drag.mode === "move" || drag.mode === "resize" || drag.mode === "vertex") {
       markDirty(); renderBoxes();
     }
   });
+}
+
+/** 光标形状就是可拖性提示：轮廓点、方框角点、平移，各给一种。 */
+function hoverCursor(mx, my) {
+  const want = vertexAt(mx, my) ? "grab"
+    : (handleAt(mx, my) ? "nwse-resize" : (boxAt(mx, my) >= 0 ? "move" : ""));
+  if (canvas.style.cursor !== want) { canvas.style.cursor = want; }
 }
 
 function toWorldBox(box) {
@@ -615,6 +740,8 @@ async function save(silent) {
   clearTimeout(state.saveTimer);
   const objects = state.boxes.map((b) => ({
     cls: b.cls, cx: b.cx, cy: b.cy, w: b.w, h: b.h, score: b.score, flags: b.flags,
+    // 拖过顶点的轮廓原样交回（像素点）；没轮廓就是空表，后端照旧按 IoU 从磁盘认领
+    poly: polyPoints(b),
   }));
   try {
     const data = await postJson("/api/prompt/item",
@@ -1075,6 +1202,196 @@ function initModelPanel() {
   if (invert) invert.onclick = invertClassRows;
   const add = $("cls-import");
   if (add) add.onclick = importModelClasses;
+  const probeSelect = $("probe-model");
+  if (probeSelect) {
+    probeSelect.onchange = () => {
+      modelState.model = probeSelect.value;
+      renderModelChoices();
+    };
+  }
+}
+
+// --------------------------------------------------------------------------- //
+// 试词：这个词权重到底认不认、最高给了多少分。
+//
+// 「一个框都没有」以前有三种完全不同的原因却只有一句话：权重压根没这一类、
+// 分被阈值挡了、图里确实没这个目标。下一步动作互不相同，所以这里一次分开报，
+// 并且只跑一张图、只读不写——试错不该把已标好的框覆盖掉。
+// --------------------------------------------------------------------------- //
+const probe = { busy: false, data: null };
+
+function initProbePanel() {
+  if (!$("probe-modal")) { return; }   // 提示词页没这块：那边是问大模型，不问权重类别表
+  $("btn-probe").onclick = () => openProbe(true);
+  $("btn-probe-menu").onclick = () => { openMenu(false); openProbe(true); };
+  $("probe-close").onclick = () => openProbe(false);
+  $("probe-run").onclick = () => runProbe();
+  $("probe-import").onclick = () => importProbedWords();
+  $("probe-apply").onclick = applyProbeSuggestion;
+}
+
+function openProbe(open) {
+  if (!$("probe-modal")) { return; }
+  openModal("probe-modal", open);
+  if (!open) { return; }
+  renderModelChoices();
+  const box = $("probe-words");
+  // 每次都按当前选择重算默认词：类别管理里刚改过词表，这里再留旧词就是误导
+  if (box) { box.value = prefillProbeWords(); }
+  renderProbeTarget();
+  renderProbeResult(probe.data);
+}
+
+/** 默认拿哪些词试：词表输入框 → 勾中的类别 → 本库类别表，一路兜底。 */
+function prefillProbeWords() {
+  const words = splitWords(($("cls-vocab") || {}).value || "");
+  if (words.length) { return words.slice(0, 12).join(", "); }
+  const picked = checkedFields("cls-list");
+  if (picked.length) { return picked.slice(0, 12).join(", "); }
+  return fieldOptions().map((row) => row.name).slice(0, 12).join(", ");
+}
+
+/** 用户往词框里打的分隔符不止一种：中文逗号、分号、换行都得认。 */
+function splitWords(text) {
+  return String(text || "").split(/[,，;；、\n\r]+/).map((v) => v.trim()).filter(Boolean);
+}
+
+function probeTargetImage() {
+  if (state.item && state.item.image) { return String(state.item.image); }
+  const items = libItems();
+  return items.length ? String(items[0].image) : "";
+}
+
+function renderProbeTarget() {
+  const rel = probeTargetImage();
+  const el = $("probe-image");
+  if (el) {
+    el.textContent = rel
+      ? `试的这张图：${rel}${state.item ? "" : "（当前没打开图，取队列里第一张）"}`
+      : `${CFG.name}里还没有图：先导入图片再试词`;
+  }
+  const run = $("probe-run");
+  if (run) { run.disabled = !rel || probe.busy; }
+}
+
+async function runProbe() {
+  if (probe.busy) { return; }
+  const words = String(($("probe-words") || {}).value || "").trim();
+  if (!words) { toast("先说要试哪些词，比如 t-shirt, shirt, top", true); return; }
+  const image = probeTargetImage();
+  if (!image) { toast(`${CFG.name}里还没有图：先导入图片再试词`, true); return; }
+  const payload = { image, words, model: ($("probe-model") || {}).value || modelState.model };
+  const imgsz = ($("probe-imgsz") || {}).value;
+  if (imgsz) { payload.imgsz = Number(imgsz); }
+  probe.busy = true;
+  renderProbeBusy(true);
+  renderProbeTarget();
+  try {
+    probe.data = await postJson("/api/detect/probe", payload);
+  } catch (err) {
+    probe.data = null;
+    toast("试检失败：" + err.message, true);
+  }
+  probe.busy = false;
+  renderProbeBusy(false);
+  renderProbeTarget();
+  renderProbeResult(probe.data);
+}
+
+function renderProbeBusy(on) {
+  const run = $("probe-run");
+  if (!run) { return; }
+  run.disabled = on;
+  run.textContent = on ? "试检中…" : "开始试检";
+}
+
+function renderProbeResult(data) {
+  const box = $("probe-result");
+  const actions = $("probe-actions");
+  if (!box) { return; }
+  box.innerHTML = "";
+  if (!data) {
+    box.textContent = "填好词点「开始试检」：一个词一行，告诉你是权重没这一类、分被阈值挡了，"
+      + "还是图里确实没这个目标。";
+    if (actions) { actions.hidden = true; }
+    return;
+  }
+  const head = document.createElement("div");
+  head.className = "muted small";
+  const vocab = data.open_vocab ? `开放词表（${data.open_vocab}）` : `权重自带 ${data.class_count} 类`;
+  head.textContent = `${data.model} · ${data.task_name} · ${vocab} · 算力 ${data.device} · `
+    + `分辨率 ${data.imgsz} · 阈值 ${data.conf}`;
+  box.append(head);
+  for (const row of data.words || []) {
+    const line = document.createElement("div");
+    line.className = "probe-row " + (row.over ? "ok" : (row.best > 0 ? "low" : "none"));
+    const name = document.createElement("b");
+    name.textContent = row.word;
+    const bar = document.createElement("span");
+    bar.className = "probe-bar";
+    const fill = document.createElement("i");
+    fill.style.width = Math.max(2, Math.min(100, Number(row.best) * 100)) + "%";
+    bar.append(fill);
+    const score = document.createElement("span");
+    score.className = "mono";
+    score.textContent = Number(row.best).toFixed(3);
+    const boxes = document.createElement("span");
+    boxes.textContent = row.over ? `${row.boxes} 框` : "无框";
+    const advice = document.createElement("span");
+    advice.className = "muted small probe-advice";
+    advice.textContent = row.advice;
+    line.append(name, bar, score, boxes, advice);
+    box.append(line);
+  }
+  const usable = probedUsable();
+  const foot = document.createElement("div");
+  foot.className = "muted small";
+  if (usable.length === 0) {
+    foot.textContent = "这些词一个分都没给：先确认图里真有这个目标，"
+      + "再把词换成更常见的英文写法（普通权重还得换开放词表权重）。";
+  } else if (data.suggested_conf) {
+    foot.textContent = `已经有词能出框；检不出框的词最高 ${data.missed_best}：把置信度降到 `
+      + data.suggested_conf + " 就一起标得出来，下面两个按钮照顺序点。";
+  } else {
+    foot.textContent = `${usable.length} 个词都已经能出框：导入类别表就能直接开跑。`;
+  }
+  box.append(foot);
+  if (actions) { actions.hidden = usable.length === 0; }
+}
+
+const probedUsable = () => ((probe.data || {}).words || []).filter((row) => Number(row.best) > 0);
+
+/** 把试出来有分的词写进本库类别表（与「类别管理」的导入同一条路）。 */
+async function importProbedWords() {
+  const usable = probedUsable().map((row) => row.word);
+  if (!usable.length) { return; }
+  const button = $("probe-import");
+  if (button) { button.disabled = true; }
+  try {
+    const data = await postJson("/api/detect/classes/add", {
+      model: ($("probe-model") || {}).value || modelState.model, names: usable,
+    });
+    const lost = data.not_in_model || [];
+    toast(`类别表已更新：新增 ${data.added || 0} · 复用 ${data.updated || 0}`
+      + (lost.length ? ` · 这个权重认不出 ${lost.length} 个` : ""));
+    await refreshDataset(state.item ? state.item.image : null);
+    renderFieldPanel();
+    renderRunFields();
+    renderClassImportList();
+  } catch (err) {
+    toast("导入失败：" + err.message, true);
+  }
+  if (button) { button.disabled = false; }
+}
+
+/** 按建议阈值去标注：把算好的阈值填进批量面板并摊开它，省得用户回去手动改。 */
+function applyProbeSuggestion() {
+  const data = probe.data || {};
+  openProbe(false);
+  const conf = $("run-conf");
+  if (conf && data.suggested_conf) { conf.value = Math.max(0.01, Number(data.suggested_conf)); }
+  openRun(true);
+  if (data.suggested_conf) { toast(`置信度已调到 ${data.suggested_conf}，勾好类别就能开跑`); }
 }
 
 /** 取本机权重清单（不加载模型，几百毫秒），顺带把上次用的权重/类别/阈值回填回来。 */
@@ -1136,7 +1453,7 @@ function unusableWeightsNote(rows) {
 
 /** 三个下拉框（类别管理 / 批量运行 / 导入素材）共用同一份权重清单与同一个选择。 */
 function renderModelChoices() {
-  for (const id of ["cls-model", "run-model", "up-model"]) {
+  for (const id of ["cls-model", "run-model", "up-model", "probe-model"]) {
     const select = $(id);
     if (!select) { continue; }
     const previous = select.value || modelState.model;
@@ -1160,7 +1477,8 @@ function renderModelChoices() {
     select.value = modelState.models.some((row) => row.name === previous)
       ? previous : (modelState.model || modelState.models[0].name);
   }
-  const active = ($("cls-model") || {}).value || ($("run-model") || {}).value || "";
+  const active = ($("cls-model") || {}).value || ($("run-model") || {}).value
+    || ($("probe-model") || {}).value || "";
   if (active) { modelState.model = active; }
   // 用不了的权重不许从界面上消失：摆在下拉框下面，说清它为什么不能用在检测库
   const unusable = unusableWeightsNote(modelState.unusable);
@@ -1871,6 +2189,11 @@ function objectsCommands() {
   ];
   if (IS_LOCAL) {
     cmds.splice(8, 0, { label: "从权重导入类别", tag: "类别", run: () => openFields(true) });
+    if ($("probe-modal")) {
+      cmds.splice(9, 0, {
+        label: "试词：这个词权重认不认", tag: "类别", run: () => openProbe(true),
+      });
+    }
   }
   for (const [value, label] of [["pending", "筛选：待复核"], ["flagged", "筛选：仅带标记"],
     ["edited", "筛选：已修改"], ["approved", "筛选：已接受"], ["rejected", "筛选：已驳回"],

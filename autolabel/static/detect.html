@@ -88,6 +88,7 @@
         </label>
         <label class="menu-field"><span>显示标签</span><input type="checkbox" id="show-labels" checked></label>
         <button class="menu-item" id="btn-fields"><svg class="ic"><use href="#ic-layers"/></svg>类别管理<span class="kbd k">1</span></button>
+        <button class="menu-item" id="btn-probe-menu"><svg class="ic"><use href="#ic-target"/></svg>试词：这个词权重认不认</button>
         <div class="menu-sep"></div>
         <div class="menu-label">导出</div>
         <a class="menu-item" href="/api/prompt/coords?format=csv&lib=detect" download
@@ -153,7 +154,7 @@
     <div id="empty-state" class="hidden">当前筛选下没有图片：点右上角「导入素材」上传图片和视频，或切右上角筛选。</div>
     <div id="loading" class="hidden">加载中…</div>
     <div id="toast" class="hidden"></div>
-    <div id="draw-hint" class="muted small">空白处拖动画框补漏标 · 点框选中后可改类别/删除 · 空格拖动平移、滚轮缩放</div>
+    <div id="draw-hint" class="muted small">空白处拖动画框补漏标 · 点框选中后可改类别/删除 · 分割轮廓可拖顶点改形状 · 空格平移、滚轮缩放</div>
     <div id="hud">
       <span class="chip bad" id="hud-flag">0 处待确认</span>
       <span class="pos" id="hud-pos">第 <b>0</b> / 0</span>
@@ -229,6 +230,9 @@
       <div class="panel-title">检测框</div>
       <div><span>空白处拖</span><span>补画漏掉的目标</span></div>
       <div><span>角点拖</span><span>改框大小</span></div>
+      <div><span>轮廓点拖</span><span>改分割轮廓形状（方框自动跟着收成外接框）</span></div>
+      <div><span>边中点拖</span><span>在轮廓边上加一个顶点</span></div>
+      <div><span>Alt + 点</span><span>删掉一个轮廓顶点（最少留 3 个）</span></div>
       <div><span>X</span><span>删除选中框</span></div>
       <div><span>[ / ]</span><span>切换选中框</span></div>
       <div><span>Z</span><span>适应窗口</span></div>
@@ -289,6 +293,7 @@
       <div id="cls-list" class="check-list muted small">加载中…</div>
       <div class="btn-row">
         <button id="cls-import" class="primary" disabled>导入所选</button>
+        <button id="btn-probe" title="拿当前这张图问权重：这些词你到底认不认、最高给了多少分（不改任何数据）">先试词</button>
       </div>
       <div class="muted small" id="cls-result"></div>
       <div class="muted small" id="cls-model-note"></div>
@@ -325,6 +330,41 @@
       <span class="mono">data.yaml</span>，但换权重后它认不出来就标不到框）。
       类别号 <span class="mono">class_id</span> 创建后固定、删了不复用，避免历史标签串类。
       本库类别表在 <span class="mono">.autolabel/detect/classes.json</span>。</div>
+  </div>
+</div>
+
+<div id="probe-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title">试词<span class="muted small"> · 拿一张图问权重「这些词你到底认不认、最高给了多少分」，只读不写数据</span></div>
+    <div class="param-row">
+      <label class="muted small">本机权重
+        <select id="probe-model"></select>
+      </label>
+      <label class="muted small" title="分辨率越高越容易检出服装、配件这类小目标，代价是更慢">输入分辨率
+        <select id="probe-imgsz">
+          <option value="">跟随系统设置</option>
+          <option value="640">640（标准）</option>
+          <option value="1024">1024（服装 / 小目标）</option>
+          <option value="1280">1280（最狠，也最慢）</option>
+        </select>
+      </label>
+    </div>
+    <label class="muted small grow">要试的词（英文，逗号或换行分隔，最多 12 个）
+      <textarea id="probe-words" rows="2" spellcheck="false" placeholder="t-shirt, shirt, top, jacket"></textarea>
+    </label>
+    <div class="muted small" id="probe-image">用当前打开的这张图试。</div>
+    <div class="btn-row">
+      <button id="probe-run" class="primary">开始试检</button>
+      <button id="probe-close">关闭</button>
+    </div>
+    <div id="probe-result" class="check-list muted small">填好词点「开始试检」：一个词一行，告诉你是权重没这一类、分被阈值挡了，还是图里确实没这个目标。</div>
+    <div class="btn-row" id="probe-actions" hidden>
+      <button id="probe-import">把这些词导入类别表</button>
+      <button id="probe-apply">按建议阈值去标注</button>
+    </div>
+    <div class="muted small">试一次只跑一张图：普通权重几十毫秒，开放词表首次要算文本嵌入（几百 MB 的文本编码器，只下第一次）。
+      三种「没框」的下一步完全不同，所以分开报——普通权重没有这一类就换开放词表权重；分被阈值挡了就降阈值或提分辨率；
+      图里真没有就换图。</div>
   </div>
 </div>
 

@@ -149,7 +149,7 @@
     <div id="empty-state" class="hidden">当前筛选下没有图片：点右上角「导入素材」上传图片和视频，或切右上角筛选。</div>
     <div id="loading" class="hidden">加载中…</div>
     <div id="toast" class="hidden"></div>
-    <div id="draw-hint" class="muted small">空白处拖动画框补漏标 · 点框选中后可改字段/删除 · 空格拖动平移、滚轮缩放</div>
+    <div id="draw-hint" class="muted small">空白处拖动画框补漏标 · 点框选中后可改字段/删除 · 分割轮廓可拖顶点改形状 · 空格平移、滚轮缩放</div>
     <div id="hud">
       <span class="chip bad" id="hud-flag">0 处待确认</span>
       <span class="pos" id="hud-pos">第 <b>0</b> / 0</span>
@@ -225,6 +225,9 @@
       <div class="panel-title">检测框</div>
       <div><span>空白处拖</span><span>补画漏掉的目标</span></div>
       <div><span>角点拖</span><span>改框大小</span></div>
+      <div><span>轮廓点拖</span><span>改分割轮廓形状（方框自动跟着收成外接框）</span></div>
+      <div><span>边中点拖</span><span>在轮廓边上加一个顶点</span></div>
+      <div><span>Alt + 点</span><span>删掉一个轮廓顶点（最少留 3 个）</span></div>
       <div><span>X</span><span>删除选中框</span></div>
       <div><span>[ / ]</span><span>切换选中框</span></div>
       <div><span>Z</span><span>适应窗口</span></div>

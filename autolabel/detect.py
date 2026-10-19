@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 
 import numpy as np
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -71,6 +72,14 @@ MAX_RUN_CLASSES = 200
 NEAR_MISS_FLOOR = 0.01
 #: 一次最多报几个候选类别
 NEAR_MISS_TOP = 6
+#: 试词时往下探到的地板：比回收候选再低一档，因为试词要回答的是"这词到底有没有分"
+PROBE_FLOOR = 0.005
+#: 试词一次最多问几个词：再多界面一屏放不下，文本编码也更慢
+MAX_PROBE_WORDS = 12
+#: 试词汇总里最多列几个"这个权重其实认识这些类"的示例
+PROBE_CLASS_SAMPLE = 12
+#: 输入分辨率能往上提的档位（与界面上那个下拉框一致）：已经站在 1024 上就别再劝人"提到 1024"
+PROBE_IMGSZ_LADDER = (640, 1024, 1280)
 #: 用户没选权重时的兜底。不能沿用 ``BackendSettings.model``——那是 ``yolo11n-pose.pt``，
 #: 拿姿态权重跑检测要等加载完才报错，而且报错不会告诉用户该换成什么。
 DEFAULT_DETECT_MODEL = "yolo11n.pt"
@@ -404,6 +413,139 @@ def label_image(root: str, image_rel: str, backend: DetectionBackend,
             "near_miss": [{"name": name, "score": round(score, 4)}
                           for name, score in sorted(missed.items(), key=lambda kv: -kv[1])],
             "raw": len(found)}
+
+
+#: 词表分隔符：与 ``backends.clean_vocab`` 同一套，中文逗号也算分隔符
+WORDS_SPLIT = re.compile(r"[,;，；\n\r]+")
+
+
+def _split_words(words: Sequence[str]) -> List[str]:
+    """把"一坨用户输入"摊成词列表：界面输入框里打 ``t-shirt，shirt`` 也要能拆开。"""
+    out: List[str] = []
+    for raw in (words or []):
+        for piece in WORDS_SPLIT.split(str(raw or "")):
+            piece = " ".join(piece.split())
+            if piece:
+                out.append(piece)
+    return out
+
+
+def probe_words(root: str, image_rel: str, *, model: str = "",
+                words: Sequence[str] = (), conf: Optional[float] = None,
+                imgsz: Optional[int] = None, device: str = "",
+                dir_: Optional[str] = None) -> dict:
+    """拿一张图试词：这些词这个权重到底认不认、最高给了多少分。
+
+    回答的是「我写的提示词，模型里到底有没有这一类」。以前只能整批跑完看有没有框，
+    可"没框"有三种完全不同的原因，下一步动作互不相同：
+
+    1. 权重压根没这一类（普通 COCO 权重不认 ``t-shirt``）→ 换开放词表权重；
+    2. 词有、分被阈值挡了（本机实测 ``shirt`` 在 640 下只有 0.026 分）→ 降阈值/提分辨率；
+    3. 图里确实没这个目标 → 换图。
+
+    与 :func:`label_image` 的差别只有两点：不落盘、不进统计，并且阈值下探到
+    ``PROBE_FLOOR`` 后在本地按真正的 ``conf`` 分家——被挡掉的分数也得报出来，
+    否则用户永远只能看见"0 个框"。
+    """
+    from .dataset import resolve_image
+
+    # 传进来的是整串（界面输入框就是整串）时先包一层：``for w in "a,b"`` 会拆成字母
+    if isinstance(words, str):
+        words = [words]
+    asked = list(dict.fromkeys(_split_words(words)))
+    if not asked:
+        raise ValueError("先说要试哪些词，比如 t-shirt、shirt、top（只能英文，逗号或换行分隔）")
+    if len(asked) > MAX_PROBE_WORDS:
+        raise ValueError(f"一次最多试 {MAX_PROBE_WORDS} 个词，当前 {len(asked)} 个")
+
+    # 图名校验放在加载权重之前：开放词表第一次要下几百 MB 的文本编码器，
+    # 为一句"这张图不在库里"等上半分钟，比报错难看得多
+    source = resolve_image(root, image_rel)
+    if not os.path.exists(source):
+        # 只回一个文件名等于什么都没说：这里八成是图还在素材池、没进目标检测库
+        raise FileNotFoundError(f"目标检测库里找不到这张图：{image_rel}"
+                                "（先在界面「导入图片」或 autolabel import --lib detect 把它入库）")
+
+    settings = system_settings(model=resolve_model(model, root), device=device,
+                               imgsz=imgsz, conf=conf)
+    backend = _backend(settings, dir_)
+    kind = str(getattr(backend, "open_vocab", "") or "") or open_vocab_kind(backend.model_name)
+    threshold = float(settings.conf)
+    lift = _next_imgsz(int(settings.imgsz))
+    if kind:
+        # 开放词表：词表就是类别表，词的先后顺序就是类别号，所以"认不认"永远是认
+        vocab = clean_vocab(asked)
+        if len(vocab) > MAX_PROBE_WORDS:
+            raise ValueError(f"一次最多试 {MAX_PROBE_WORDS} 个词，当前 {len(vocab)} 个")
+        backend.set_vocab(vocab)
+        rows = [{"word": word, "model_id": index, "in_vocab": True}
+                for index, word in enumerate(vocab)]
+    else:
+        table = {str(name).lower(): int(cid) for cid, name in backend.class_names().items()}
+        rows = [{"word": word, "model_id": table.get(word.lower()), "in_vocab": word.lower() in table}
+                for word in asked]
+    pairs = [(row["word"], int(row["model_id"])) for row in rows if row["model_id"] is not None]
+    best: Dict[int, float] = {}
+    hits: Dict[int, int] = {}
+    if pairs:
+        image = np.asarray(_load_rgb(source), dtype=np.uint8)
+        for item in backend.predict(image, class_ids=[mid for _w, mid in pairs],
+                                    conf=threshold, floor=PROBE_FLOOR):
+            cid = int(item.class_id)
+            best[cid] = max(best.get(cid, 0.0), float(item.score))
+            if not getattr(item, "near_miss", False):
+                hits[cid] = hits.get(cid, 0) + 1
+
+    for row in rows:
+        score = best.get(int(row["model_id"]), 0.0) if row["model_id"] is not None else 0.0
+        row["best"] = round(score, 4)
+        row["boxes"] = hits.get(int(row["model_id"]), 0) if row["model_id"] is not None else 0
+        row["over"] = row["boxes"] > 0
+        row["advice"] = _probe_advice(row, threshold, kind, lift)
+    rows.sort(key=lambda row: (-row["best"], row["word"]))
+    top = max((row["best"] for row in rows), default=0.0)
+    # 建议阈值只给"一个框都没有"的场景：已经有词能出框了还建议降到 0.93，
+    # 等于让人为了一个检不出的词把整库框都放大十倍
+    missed = [row["best"] for row in rows if not row["over"] and row["best"] > 0]
+    suggested = max(PROBE_FLOOR, round(max(missed), 3) - 0.001) if missed else None
+    missed_best = round(max(missed), 4) if missed else None
+    described = backend.describe()
+    out = {"image": image_rel, "model": described["model"],
+           "task": described["task"], "task_name": described["task_name"],
+           "device": described["device"], "imgsz": int(settings.imgsz),
+           "conf": threshold, "open_vocab": kind, "words": rows,
+           "best": round(top, 4), "suggested_conf": suggested, "missed_best": missed_best,
+           "suggest_imgsz": lift,
+           "class_count": described["class_count"]}
+    if not kind:
+        out["model_classes"] = [str(name) for _cid, name in
+                                sorted(backend.class_names().items())][:PROBE_CLASS_SAMPLE]
+    return out
+
+
+def _next_imgsz(current: int) -> Optional[int]:
+    """比当前分辨率高的下一档；已经到顶就是 ``None``（不编一个"再提一档"出来）。"""
+    for size in PROBE_IMGSZ_LADDER:
+        if size > int(current or 0):
+            return size
+    return None
+
+
+def _probe_advice(row: dict, conf: float, kind: str, next_imgsz: Optional[int] = None) -> str:
+    """一个词的一句话结论：照着它做就能往下走，别再让人猜。"""
+    if not row["in_vocab"]:
+        return ("这个权重没有这一类：它是普通权重，类别表在权重里改不了。"
+                "换开放词表权重（yolov8x-worldv2.pt / yoloe-26x-seg.pt）就能自己填词")
+    if row["boxes"] > 0:
+        return f"能用：{row['boxes']} 个框过了阈值 {conf:g}"
+    if row["best"] > 0:
+        suggest = max(PROBE_FLOOR, round(row["best"], 3) - 0.001)
+        lift = (f"，同时把输入分辨率提到 {next_imgsz} 再试" if next_imgsz
+                else f"（输入分辨率已经提到 {PROBE_IMGSZ_LADDER[-1]}，没有更高一档了）")
+        return (f"检得出但被阈值挡住（最高 {row['best']:.3f} < {conf:g}）："
+                f"把置信度降到 {suggest:g}{lift}")
+    return ("这张图上一点分都没给：先确认图里真有这个目标，"
+            "再把词换成更常见的英文写法（shirt / top / jacket 这类），别用中文")
 
 
 def run_detect_labeling(

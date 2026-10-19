@@ -175,6 +175,52 @@ class Detection:
                          for px, py in self.points]}
 
 
+#: 界面手点的轮廓点数上限：拖几十个顶点已经到头了，再多就是数据异常
+POLY_MAX_POINTS = 200
+
+
+def poly_from_payload(values: object, width: int, height: int) -> List[float]:
+    """把界面回传的轮廓换成标签文件里的归一化点列 ``[x1, y1, x2, y2, ...]``。
+
+    界面读到的轮廓是**像素**点（``payload()`` 里乘过宽高，画在画布上正好用），
+    编辑完原样传回来，这里除回宽高。两种写法都认：点列表
+    ``[[12, 30], [88, 40]]`` 与摊平的 ``[12, 30, 88, 40]``——前者是界面给的格式，
+    后者省得手写脚本时被格式卡住。
+
+    少于 3 个点当"没有轮廓"（一条线算不上轮廓）；点数为奇数、混进非数字这些
+    真写坏了要报错，因为这时候用户是**明确在编辑轮廓**，默默丢掉等于没保存。
+    """
+    if values in (None, "", [], {}, 0):
+        return []
+    if not isinstance(values, (list, tuple)):
+        raise ValueError("轮廓得是点列表，比如 [[12, 30], [88, 40], [60, 95]]")
+    flat: List[float] = []
+    for position, point in enumerate(values):
+        if isinstance(point, (list, tuple)):
+            if len(point) != 2:
+                raise ValueError(f"轮廓第 {position + 1} 个点应该是 [x, y] 两个数，"
+                                 f"现在有 {len(point)} 个")
+            pair = list(point)
+        else:
+            pair = [point]
+        for number in pair:
+            if isinstance(number, bool) or not isinstance(number, (int, float)):
+                raise ValueError(f"轮廓第 {position + 1} 项不是坐标：{number!r}")
+        flat.extend(pair)
+    if len(flat) % 2:
+        raise ValueError("轮廓坐标得成对（x 配 y），现在多了半个")
+    points = len(flat) // 2
+    if points > POLY_MAX_POINTS:
+        raise ValueError(f"轮廓最多 {POLY_MAX_POINTS} 个点，现在有 {points} 个")
+    if points < 3:
+        return []
+    # 像素 → 归一化：先除回宽高再夹到 0–1，反过来夹会把所有像素值压成 1.0
+    scale = [float(width) if width and width > 0 else 1.0,
+             float(height) if height and height > 0 else 1.0]
+    return [round(min(1.0, max(0.0, float(value) / scale[index % 2])), 6)
+            for index, value in enumerate(flat)]
+
+
 def read_detections(root: str, image_rel: str, lib: str = LIB_OBJECTS) -> List[Detection]:
     path = label_path_for(root, image_rel, lib)
     return [Detection(cls=cls, cx=cx, cy=cy, w=w, h=h, poly=list(poly))

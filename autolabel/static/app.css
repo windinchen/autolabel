@@ -691,6 +691,20 @@ footer #hint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; whi
   margin-top: var(--s1); color: var(--ink-3); line-height: 1.6; }
 /* 页面顶栏下面那条「谁出框、快不快、类别谁说了算」的说明 */
 #lib-note { line-height: 1.6; gap: var(--s3); }
+/* 试词：一个词一行，分数条 + 一句话结论。"没框"的三种原因用颜色分开，扫一眼知道改哪 */
+#probe-words { width: 100%; font-family: var(--mono); margin-top: var(--s1); }
+#probe-modal .param-row { margin-bottom: var(--s1); }
+.probe-row { display: grid; grid-template-columns: minmax(80px, 1fr) 64px 46px 40px;
+  align-items: center; gap: var(--s2); padding: 5px 0; font-size: calc(12.5px * var(--fs)); }
+.probe-row + .probe-row { border-top: 1px solid color-mix(in srgb, var(--ink) 7%, transparent); }
+.probe-row b { overflow-wrap: anywhere; }
+.probe-bar { height: 6px; border-radius: 3px; overflow: hidden;
+  background: color-mix(in srgb, var(--ink) 12%, transparent); }
+.probe-bar i { display: block; height: 100%; border-radius: 3px; background: var(--coral); }
+.probe-row.low .probe-bar i { background: var(--amber); }
+.probe-row.ok .probe-bar i { background: var(--jade); }
+.probe-advice { grid-column: 1 / -1; line-height: 1.55; }
+#probe-result:not(.muted) { color: var(--ink-2); }
 #lib-note a { color: var(--amber); text-decoration: none; white-space: nowrap;
   border-bottom: 1px solid color-mix(in srgb, var(--amber) 40%, transparent); }
 #lib-note a:hover { border-bottom-color: var(--amber); }

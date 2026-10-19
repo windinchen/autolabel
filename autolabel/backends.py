@@ -629,6 +629,14 @@ def text_encoder_hint(exc: Exception) -> str:
             f"\n原始报错：{type(exc).__name__}: {detail[:200]}")
 
 
+def _file_size(path: str) -> int:
+    """一个文件多大；读不到就当没有（统计磁盘占用不值得为此报错）。"""
+    try:
+        return int(os.path.getsize(path))
+    except OSError:
+        return 0
+
+
 def text_encoder_status() -> dict:
     """开放词表的可用性概况（系统设置页用；不加载模型，几百毫秒）。"""
     installed = True
@@ -643,10 +651,15 @@ def text_encoder_status() -> dict:
     if os.path.isdir(weights):
         for base, _dirs, files in os.walk(weights):
             for name in files:
-                try:
-                    cached += os.path.getsize(os.path.join(base, name))
-                except OSError:
-                    continue
+                cached += _file_size(os.path.join(base, name))
+    # CLIP 走 ``weights/``，但 MobileCLIP 的 TorchScript 编码器由上游下载到**当前目录**，
+    # 只数 weights/ 会把磁盘上实打实躺着的两百多兆报成"还得下载"
+    try:
+        for name in os.listdir(os.getcwd()):
+            if name.startswith("mobileclip") and name.endswith(".ts"):
+                cached += _file_size(os.path.join(os.getcwd(), name))
+    except OSError:
+        pass
     if installed:
         note = ""
     elif cached:

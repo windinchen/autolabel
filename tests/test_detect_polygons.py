@@ -259,6 +259,86 @@ def test_saving_from_the_review_page_keeps_the_polygon(seg_ds):
 
 
 # --------------------------------------------------------------------------- #
+# 复核页拖轮廓顶点：界面回传的点列就是最终形状
+# --------------------------------------------------------------------------- #
+def test_poly_from_payload_turns_pixels_back_into_normalized_points():
+    """画布上的轮廓是像素点，回传后要按图宽高除回去（两种写法都认）。"""
+    assert pr.poly_from_payload([[64, 96], [320, 120], [160, 384]], 640, 480) == \
+        [0.1, 0.2, 0.5, 0.25, 0.25, 0.8]
+    assert pr.poly_from_payload([64, 96, 320, 120, 160, 384], 640, 480) == \
+        [0.1, 0.2, 0.5, 0.25, 0.25, 0.8]
+    # 拖出画外的点夹回画面里：标签文件里的坐标必须在 0–1，YOLO 加载器不认负数
+    assert pr.poly_from_payload([[-80, 900], [320, 120], [160, 384]], 640, 480)[:2] == [0.0, 1.0]
+    assert pr.poly_from_payload([], 640, 480) == [] and pr.poly_from_payload(None, 640, 480) == []
+    # 两个点连不成轮廓：当没轮廓，而不是写出一段线
+    assert pr.poly_from_payload([[64, 96], [320, 120]], 640, 480) == []
+
+
+def test_poly_from_payload_refuses_broken_shapes():
+    """用户明确在编辑轮廓，写坏了要报错——默默丢掉等于没保存。"""
+    with pytest.raises(ValueError) as odd:
+        pr.poly_from_payload([64, 96, 320], 640, 480)
+    assert "成对" in str(odd.value)
+    with pytest.raises(ValueError) as shape:
+        pr.poly_from_payload([[1, 2, 3], [4, 5, 6]], 640, 480)
+    assert "[x, y]" in str(shape.value)
+    with pytest.raises(ValueError) as junk:
+        pr.poly_from_payload([[64, 96], ["x", 1], [3, 4]], 640, 480)
+    assert "不是坐标" in str(junk.value)
+    with pytest.raises(ValueError) as kind:
+        pr.poly_from_payload({"x": 1}, 640, 480)
+    assert "点列表" in str(kind.value)
+    with pytest.raises(ValueError) as many:
+        pr.poly_from_payload([[i, i] for i in range(pr.POLY_MAX_POINTS + 1)], 640, 480)
+    assert "最多" in str(many.value)
+
+
+def test_saving_an_edited_outline_wins_over_the_one_on_disk(seg_ds):
+    """拖过顶点的轮廓必须以界面回传为准，并且方框收成轮廓的外接框。"""
+    rel = first_rel(seg_ds)
+    fd.upsert_field(seg_ds, name="car", label="车", lib=LIB_DETECT)
+    pr.write_detections(seg_ds, rel, [pr.Detection(cls=0, cx=0.5, cy=0.5, w=0.4, h=0.6,
+                                                   score=0.9,
+                                                   poly=[0.3, 0.2, 0.7, 0.25, 0.5, 0.8],
+                                                   flags=["masked"])], LIB_DETECT)
+    store = ReviewStore(seg_ds)
+    points = [p[:] for p in store.read_prompt_item(rel, LIB_DETECT)["objects"][0]["poly"]]
+    points[0] = [points[0][0] + 128.0, points[0][1] - 96.0]      # 把左上那个点往外拖
+    xs = [p[0] for p in points]
+    ys = [p[1] for p in points]
+    # 界面拖完顶点会把方框收成轮廓外接框一起回传（后端以回传为准，不再二次猜）
+    box = {"cls": 0, "cx": round((min(xs) + max(xs)) / 2 / 640, 6),
+           "cy": round((min(ys) + max(ys)) / 2 / 480, 6),
+           "w": round((max(xs) - min(xs)) / 640, 6), "h": round((max(ys) - min(ys)) / 480, 6),
+           "poly": points}
+    store.write_prompt_item(rel, [box], status="edited", lib=LIB_DETECT)
+    rows = fd.read_label_entries(fd_label(seg_ds, rel))
+    assert len(rows) == 1 and len(rows[0][5]) == 6
+    assert rows[0][5][:2] == [round(points[0][0] / 640, 6), round(points[0][1] / 480, 6)], \
+        "拖好的顶点被磁盘上那个老轮廓顶掉了"
+    # YOLO 那 4 列必须包住轮廓，否则训练时框与 mask 对不上
+    assert rows[0][1] == pytest.approx(box["cx"], abs=1e-6)
+    assert rows[0][3] == pytest.approx(box["w"], abs=1e-6)
+    assert rows[0][4] == pytest.approx(box["h"], abs=1e-6)
+    # 外接框确实包住了每个点：训练时框与 mask 对不上最難查
+    assert min(xs) >= (box["cx"] - box["w"] / 2) * 640 - 1
+    assert max(xs) <= (box["cx"] + box["w"] / 2) * 640 + 1
+
+
+def test_a_box_without_an_outline_still_gets_it_carried(seg_ds):
+    """只回传方框的老写法不能因为新通道而丢掉轮廓。"""
+    rel = first_rel(seg_ds)
+    fd.upsert_field(seg_ds, name="car", label="车", lib=LIB_DETECT)
+    pr.write_detections(seg_ds, rel, [pr.Detection(cls=0, cx=0.5, cy=0.5, w=0.4, h=0.6,
+                                                   poly=[0.3, 0.2, 0.7, 0.25, 0.5, 0.8])],
+                        LIB_DETECT)
+    ReviewStore(seg_ds).write_prompt_item(rel, [{"cls": 0, "cx": 0.5, "cy": 0.5,
+                                                 "w": 0.4, "h": 0.6, "poly": []}],
+                                          lib=LIB_DETECT)
+    assert len(fd.read_label_entries(fd_label(seg_ds, rel))[0][5]) == 6
+
+
+# --------------------------------------------------------------------------- #
 # 导出方框 / 分割两种口径
 # --------------------------------------------------------------------------- #
 class SegmentBackend(FakeBackend):

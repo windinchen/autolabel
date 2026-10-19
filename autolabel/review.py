@@ -96,6 +96,7 @@ from .prompt import (
     apply_scores,
     box_flags,
     carry_polygons,
+    poly_from_payload,
     image_flags,
     prompt_priority,
     prompt_summary,
@@ -681,14 +682,18 @@ class ReviewStore:
                                       w=max(0.0, min(1.0, float(raw.get("w", 0.0)))),
                                       h=max(0.0, min(1.0, float(raw.get("h", 0.0)))),
                                       score=float(raw.get("score") or 0.0),
-                                      flags=[str(f) for f in (raw.get("flags") or [])])
+                                      flags=[str(f) for f in (raw.get("flags") or [])],
+                                      # 界面拖过轮廓顶点后原样回传像素点：这里就是唯一的入口，
+                                      # 不带 poly 的旧前端仍然走下面 carry_polygons 按 IoU 认领
+                                      poly=poly_from_payload(raw.get("poly"), width, height))
                 if detection.w <= 0 or detection.h <= 0:
                     raise ValueError("框的宽高必须大于 0")
                 detections.append(detection)
             # 前端没带分数的框（手画的、或它自己也是从磁盘读来的）按几何签名认回来
             apply_scores(detections, item.get(key("scores")) or {})
-            # 复核页只回传方框，轮廓得从磁盘上的老标签认领回来，否则点一次「接受」
-            # 分割权重落的轮廓就没了（框被动过，轮廓跟着仿射拉伸到新框）
+            # 没带轮廓的框（手画的、或只会传方框的老前端）得从磁盘上的老标签认领回来，
+            # 否则点一次「接受」分割权重落的轮廓就没了（框被动过，轮廓跟着仿射拉伸到新框）。
+            # 界面上拖过顶点的框已经带了 poly，这里跳过它——按 IoU 认领会把刚拖好的点顶掉
             carry_polygons(detections, read_detections(self.root, image_rel, lib))
             per_box = box_flags(detections, width, height, list(registry))
             manual_indices = [index for index, raw in enumerate(objects or [])
@@ -777,6 +782,35 @@ class ReviewStore:
         from . import detect
 
         return detect.model_profile(model, device)
+
+    def probe_detect(self, payload: dict) -> dict:
+        """试词：拿本库一张图问权重「这些词认不认、最高给了多少分」，只读不写数据。
+
+        批量标注跑完只剩"0 个框"是这一版之前最难查的问题：权重没这一类、分被阈值
+        挡了、图里确实没目标，三种原因的下一步完全不同。这里一次把三种分开报。
+        """
+        from . import detect
+
+        payload = payload or {}
+        self._refresh_if_changed()
+        image = str(payload.get("image") or "").strip()
+        if not image:
+            raise ValueError("先说要拿哪张图试词：在检测页点开一张图再点「试词」")
+        self._require_item(self.detect_index, image, LIB_DETECT)
+        words = payload.get("words")
+        if words is None:
+            words = [str(payload.get("vocab") or "")]
+        if isinstance(words, str):
+            words = [words]
+        conf = None
+        if payload.get("conf") not in (None, ""):
+            conf = self._number(payload, "conf", 0.25, 0.0, 1.0, "置信度阈值")
+        imgsz = None
+        if payload.get("imgsz") not in (None, ""):
+            imgsz = int(self._number(payload, "imgsz", 640, 320, 1920, "输入分辨率", integer=True))
+        return detect.probe_words(self.root, image, model=str(payload.get("model") or ""),
+                                  words=list(words), conf=conf, imgsz=imgsz,
+                                  device=str(payload.get("device") or ""))
 
     def save_detect_prefs(self, payload: dict) -> dict:
         """把某个权重设成目标检测库的默认：页面下次打开选它，批量标注不选也用它。
@@ -1623,6 +1657,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     image, normalize(payload.get("lib") or LIB_OBJECTS)))
             elif parsed.path == "/api/detect/run":
                 self._send_json(self.store.run_detect_job(payload), status=202)
+            elif parsed.path == "/api/detect/probe":
+                self._send_json(self.store.probe_detect(payload))
             elif parsed.path == "/api/detect/upload":
                 self._send_json(self.store.run_detect_upload_job(payload), status=202)
             elif parsed.path == "/api/prompt/run":
