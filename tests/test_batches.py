@@ -466,9 +466,9 @@ def test_cli_batches_deletes_single_images(dataset, capsys):
     """命令行也能按张删：与门户「删这张」同一套口径、两种粒度与快照。"""
     batch, names = _batch_with_two_images(dataset)
 
-    assert main(["batches", dataset, "--delete-images", names[0]]) == 0
+    assert main(["batches", dataset, "--delete-images", names[0], "--lib", "pose"]) == 0
     out = capsys.readouterr().out
-    # 默认只摘姿态库引用：提示词库还引用着同一份素材，文件必须留着
+    # 指名只摘姿态库引用：提示词库还引用着同一份素材，文件必须留着
     assert "移除图片 1 张（仅姿态标注）" in out and "素材文件保留" in out
     assert names[0] not in idx_names(dataset)
     assert names[0] in objects_index(dataset).items
@@ -480,6 +480,72 @@ def test_cli_batches_deletes_single_images(dataset, capsys):
     assert main(["batches", dataset, "--delete-images", names[1], "--lib", "objects",
                  "--mode", "purge"]) == 0
     out = capsys.readouterr().out
-    assert "两个库都摘" in out and "清理文件 1 个" in out
+    assert "三个库都摘" in out and "清理文件 1 个" in out
     assert names[1] not in objects_index(dataset).items and names[1] not in idx_names(dataset)
     assert not os.path.exists(resolve_image(dataset, names[1]))
+
+
+def _three_libs(dataset):
+    """让同一批素材同时挂在三个库上，返回索引里的相对路径。"""
+    from autolabel.dataset import adopt_from_pool
+
+    names = sorted(idx_names(dataset))
+    adopt_from_pool(dataset, names, lib="detect")
+    return names
+
+
+def test_delete_images_all_libs_clears_every_reference(dataset):
+    """``--lib all``（默认值）必须三个库一起摘——以前会静默退化成只摘姿态。"""
+    names = _three_libs(dataset)
+    target = names[0]
+
+    result = delete_images(dataset, [target], lib="all", regenerate=False)
+
+    assert sorted(result["libs"]) == ["detect", "objects", "pose"]
+    assert result["removals"] == 3 and result["mode"] == "lib"
+    for lib in ("pose", "objects", "detect"):
+        assert target not in load_index(dataset, lib).items, lib
+        assert names[1] in load_index(dataset, lib).items, lib
+    # 素材本身是三个库共用的，只摘引用不该把文件删了
+    assert os.path.exists(resolve_image(dataset, target))
+
+
+def test_delete_images_all_finds_images_missing_from_pose(dataset):
+    """只在检测库出现的图，用默认的 all 也该删得掉，而不是报「不在索引里」。"""
+    names = _three_libs(dataset)
+    target = names[0]
+    delete_images(dataset, [target], lib="pose", regenerate=False)
+
+    result = delete_images(dataset, [target], lib="all", regenerate=False)
+
+    assert target not in load_index(dataset, "detect").items
+    assert target not in load_index(dataset, "objects").items
+    assert result["missing"] == []
+
+
+def test_delete_images_unknown_image_under_all_still_raises(dataset):
+    """三个库都没有才算缺图，报错口径不变。"""
+    _three_libs(dataset)
+
+    with pytest.raises(ValueError) as exc:
+        delete_images(dataset, ["查无此图.jpg"], lib="all")
+    assert "不在索引里" in str(exc.value)
+
+
+def test_cli_batches_all_deletes_from_every_library(dataset, capsys):
+    """命令行默认值就是 all：提示语要说「三个库都摘」，不能只报姿态。"""
+    names = _three_libs(dataset)
+
+    assert main(["batches", dataset, "--delete-images", names[0]]) == 0
+    out = capsys.readouterr().out
+
+    assert "三个库都摘" in out and "库引用 3 处" in out
+    assert names[0] not in load_index(dataset, "detect").items
+    assert names[0] not in load_index(dataset, "objects").items
+
+    capsys.readouterr()
+    assert main(["batches", dataset, "--delete-images", names[1], "--lib", "objects"]) == 0
+    out = capsys.readouterr().out
+    assert "仅提示词标注" in out and "库引用 1 处" in out
+    assert names[1] in load_index(dataset, "pose").items
+    assert names[1] not in load_index(dataset, "objects").items

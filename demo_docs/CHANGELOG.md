@@ -1,5 +1,90 @@
 # 变更记录
 
+## 2026-10-19 04:10 — 第 11–35 轮体检：图不在了要有人说、框数账要对得上、提示里的命令必须真存在
+
+接着上一轮的十个视角继续逐条实测，第 11 轮做到第 35 轮：每轮都在本机造数据集 / 起服务复现，抓到才动手，没抓到就在结论里写"查过、干净"。抓到 14 个，全改完。版本号仍记 `1.2.4`——这一版还没发布、没打 tag，体检结果直接并进来，不另占一号。
+
+- **第 11 轮 状态名拼错不再"假装执行过"（`cli._review_statuses`）**：`reset --status aprovied` 以前回一句「已退回 0 张」+ 退出码 0，用户以为跑过了。现在解析阶段就报「不认识的状态「aprovied」，可选：unreviewed、edited、approved、rejected」并以 2 结束。
+- **第 12 轮 `reset --labels` 只删真被退回的那些**：以前它无差别删光整库标签——`--status rejected --labels` 会把**已接受**样本的标签一起删掉。现在只删这次真被退回的那批，并且把索引里由标签派生的计数一起抹掉，否则 `status` 继续报「这张有 1 个人」。
+- **第 13 轮 `validate` 终于查三个库（新增 `--lib all/pose/objects/detect`）**：提示词库与目标检测库的五列标签以前根本没人查，而坏行在 `fields.read_label_rows` 里是**静默跳过**的——手改过 `prompt_labels/` 少了一行，直到训练集少框才被发现。现在逐行校验并点名 `文件:行号`，接口层「非法状态」也换成中文说明。
+- **第 14–15 轮 畸形请求不再把连接掐断**：请求体是合法 JSON 但**不是对象**（`[1,2]` / `"hi"` / `null`）时，`payload.get(...)` 抛 `AttributeError`，而那一行在所有 `try` 之外——连接被直接关掉、一个字节响应都没写，界面上只剩「Failed to fetch」，看着像服务挂了。`Content-Length` 写坏（`abc` / 负数）在 `int()` 上是同一个症状。现在统一按 400 回中文，连接照常复用；空 `status` 字段、拼错的状态各自有专属说明，未知接口 GET/POST 一律 404（以前同一个地址 GET 给 404、POST 给 400，前端按状态码分支就懵了）。
+- **第 16–17 轮 索引里记着、`images/` 里图没了：三处一起说话（新增 `dataset.source_missing()` / `missing_sources()`）**：把一张已接受的图从磁盘移走之后，`export --mode copy` / `hardlink` 直接崩在一句裸的 `[Errno 2]`（两万张的导出停在一半），`--mode symlink` 更阴——**静默产出一根指向空气的软链**，`manifest.json` 照报「train 4 张」；而 `status` 只说「缺标签 0」、`validate` 说没问题、`coords` 照旧给这帧写一行——整条工具链没一处告诉你图没了。现在缺源文件的帧不进导出集也不进坐标文件，`status` 单列「缺文件 N 张：…」、`validate` 报 `missing_file`、`qc/stats.json` 多出 `missing_files` / `missing_images`、`/api/dataset` 的 `stats` 一并带上，导出清单记 `missing_source`，`coords` 的 `summary.json` 的 `skipped` 里也有账。
+- **第 18 轮 更新缓存是用户机器上一个会坏掉的普通文件（`version._as_float` / `_as_text`）**：`~/.autolabel/update.json` 里 `checked_at` 是字符串时 `float()` 直接 ValueError、`latest` 是数组时被渲染成 `"['1.9.0']"`——顶栏那个版本徽标变成 500，界面上是「读取版本失败」。缓存字段现在逐个收敛类型，坏值一律当"没查过"重查，而不是把整页拖倒。
+- **第 19 轮 模型搜索框里打中文整句永远搜不到（`modelhub._slices()` / `_informative_windows()` / `_hint_score_partial()`）**：以前只做整串子串匹配，`能标轮廓的`、`最省显存的`、`精度高但别太大` 全部零结果——目录里的中文说明明明写着"分割""轮廓""轻量"。现在五字以上的中文切成二字窗口再打分，同时丢掉命中过半数条目的碎片词（否则「什么」这种词谁都命中、永远排第一），长句里的「快 / 精度 / 小 / 大」也计分。`旋转框`、`分类背景` 这类精确短词的排序不受影响，真的没有的还是空列表——**不硬凑**。送给 GitHub 的查询词一并截断（搜索词太长那边只会返回空）。
+- **第 27 轮 删类别之后索引里那笔框数账（`fields._strip_class()`）**：`fields --delete 类名 --drop-boxes` 会重写标签文件，但索引里的框数没跟着落——磁盘上 1 个框、索引记 3 个，于是**列表页写着 3、点开编辑器只剩 1**，`status` 的合计跟着虚高，同一个界面两个数。删完立刻按标签主干名回写真实框数。
+- **第 28 轮 `validate` 新增 `count_mismatch`（新增 `fields.box_counts_by_image()`）**：逐张比对「索引记的框数」与「标签文件里真实的框数」；索引写着「没标过」但文件里有框也报——这种帧导出时会被整张跳过，而用户只看到"导出的比库里的少"。缺标签文件的情况不重复报（上一条已经报了）。
+- **第 30 轮 删除快照的清理排序（`batches._snapshot_order()`）**：同一秒写的两份快照（`20261019-034941.json` 与 `-1.json`）以前按字符串排，后缀那份会插到前面，**先被删的是较新那份**。改成按 `(时间戳, 后缀序号)` 排，认不出的文件名排最后、永不被删。
+- **第 31 轮 界面拒收 `.tif/.tiff`，命令行却能导（`upload.IMAGE_EXTS = dataset.IMAGE_EXTS`）**：同一个后缀两种说法——`import` 收了并转成 JPEG 落库，网页上传直接拒。以后缀集**只有一处**为准，界面能传的必定就是命令行能导的。
+- **第 32 轮 提示让你跑一条不存在的命令**：导出空库时提示「先跑一次自动标注（命令行 `autolabel auto / annotate`）」，而 `annotate` 从来没注册过——照着敲只会得到第二次 `invalid choice`。改成 `auto 或 label`，并加了 `tests/test_hint_commands.py`：把 `autolabel/**`（含前端 JS/HTML）里所有 `autolabel <子命令>` 形式的提法抓出来，逐个比对 `build_parser()` 的真实子命令表。
+- **第 33 轮 `batches --delete-images` 的默认值骗人**：`--lib` 的默认值是 `all`，可它一路被换成空串再落到 `pose`——**「三个库都摘掉这张图」实际只摘了姿态库**，还回一句「仅姿态标注」，检测库和提示词库里那张图照旧躺着。现在 `all` 就是三个库的引用一起摘（素材文件仍由 `--mode` 决定），播报按真正动过的库来；「这张图只在别的库」也不再误报「查无此图」。
+- **第 35 轮 可重复参数一次写完 + `--keep-status` 校验**：`--delete-images a.jpg,b.jpg`、`pool --add a.jpg,b.jpg`、`batches --delete x,y`、`--keep-status rejected,edited` 都支持逗号写法（与 `detect --classes` 早就有的写法统一）；`--keep-status` 同时接入状态校验——以前 `--keep-status aprieved` 谁都匹配不上，等于没写，用户以为多留了一批。顺手把 `cmd_export` 里那份和 `_exclude_from_args()` 重复的折算逻辑合并掉。
+- **第 36 轮 把"全路由终检"变成常驻测试（新增 `tests/test_route_sweep.py`）**：以前每次终检都是一次性脚本。现在 5 个页面、20 多个只读接口、5 个坐标下载、19 条写接口垃圾参数全部定居：任何一条回 5xx 就红，报错文案里必须带中文、不许出现 `Traceback`，坐标下载必须真带上标注（不许只有表头就回 200），空库下载也要有正确文件名。
+- **查过、干净的**：缩略图缓存键含 `(相对路径, mtime_ns, 大小)`，改图会刷新、坏图回退原图、`prune_thumbs` 有兜底；前端主题/字号读 `localStorage` 有 try/catch 加白名单，四个 HTML 的内联首屏脚本同样；上传同名不覆盖（`safe_upload_name` + uuid 前缀）、超限走 413 且把请求体读干净；缺文件之后 `/image/` 与 `/thumb/` 回 404 中文说明而不是 500；`settings.resolve()` 选了 `cuda` 但这台机器没卡会降级并带回说明，`describe()` 打「[降级]」；`collect_image_files` 跳过点文件与非图片后缀，EXIF 在 `_load_rgb` 里已经 `exif_transpose`。
+- **测试 665 → 766 条**（+101，跳过 1 项仍是缺 ffmpeg）：新增 `tests/test_missing_source.py`（15 条：三种导出模式一致、不再产悬空软链、`copy` 不再抛、manifest 计数、`status`/`validate`/`coords` 都点名、检测库导出同样生效、越界路径）；`tests/test_hint_commands.py`（16 条：文案里的命令名全部真实存在）；`tests/test_route_sweep.py`（7 条）；`tests/test_reset_validate.py` 重写并扩到 16 条；`tests/test_version.py` +6（六种坏缓存值）、`tests/test_modelhub.py` +5（中文整句 / 模糊句 / 无意义句仍空 / 短词仍精确 / 超长查询词）、`tests/test_fields.py` +3（删类别后索引同步、孤儿标签不造索引、`box_counts_by_image`）、`tests/test_resource_robustness.py` +2（同秒快照排序、看不懂的文件不被删）、`tests/test_upload.py` +3（界面与命令行后缀集一致、TIFF 转 JPEG 落库、`.pdf` 仍拒）、`tests/test_batches.py` +4（`all` 三库一起摘、只在别的库也删得掉、缺图仍报错、命令行播报）、`tests/test_cli_validation.py` +5（逗号写法与状态校验）、`tests/test_library_split.py` +1（只在检测库有数据时，`status` 不再刷一行姿态库全 0）。`ruff` 全绿，5 个 JS 文件 `node --check` 全过。
+
+## 2026-10-19 01:20 — 十轮体检：并发落盘不再互相截断、导出不再悄悄少帧、下载不再自己截自己
+
+发版前按十个视角把整条链路各查一遍，每轮都在本机造数据集 / 起服务实测复现，抓到才动手：**① 接口参数与错误提示 ② 单位与阈值口径 ③ 复核状态机 ④ 磁盘与索引一致性 ⑤ 错误文案 ⑥ 前端交互 ⑦ 导出与训练可用性 ⑧ 模型与算力 ⑨ 版本·设置·隐私 ⑩ 全路由终检**。版本号仍记 `1.2.4`——这一版还没发布、没打 tag，体检结果直接并进来，不另占一号。
+
+- **① 六个写者共用同一个临时名，两个实例能合力写坏索引（新增 `autolabel/atomic.py`）**：三个库的索引、批次表、类别登记表、两份模型配置、Key 表原本都写成 `path + ".tmp"`——**同名**。一卡一实例是本项目的正常用法，界面跑着的同时命令行还在 `import` 也很常见，于是 A 刚打开 `index.json.tmp` 写了一半，B 用同一个名字 `"w"` 直接把它截断，谁后 `os.replace` 谁就把这份残缺文件变成正式索引。界面上的表现是「库突然空了」，而用户随手一保存就把这张空表写回磁盘，**真把标注记录冲掉**。现在临时名带上进程号 + 进程内自增序号（线程号会被 CPython 复用，光靠 `get_ident()` 照样撞车），整文件落盘统一走 `atomic_write_text()` / `atomic_write_json()`，Key 表的 0600 与索引的 `sort_keys` 都不退化。
+- **② 子目录压平后会吃掉同名文件（`export.unique_stem()`）**：`a/f.jpg` 压成 `a__f.jpg`，而库里恰好还有一张真实的 `a__f.jpg`——两个名字撞车，后写的盖掉先写的，**实测 3 张图导完磁盘只剩 2 个文件，`manifest.json` 还在报 3 张**，训练时没人知道少了一帧。撞车时加 `-2` 后缀，姿态与出框两条链路共用这套命名。
+- **③ 反复导到同一个 `--out`，被驳回的帧不会从磁盘消失（`export.prune_stale()`）**：上一版导出里有 `x.jpg`，这一版把它驳回了，新导出只写这次留下的文件，`x.jpg` 还躺在 `train/` 里——训练集悄悄带着人已驳回的帧去训练。现在按 split 清掉不属于本次导出的文件，数量记进 `counts["pruned"]`，命令行和 `manifest.json` 都看得见。
+- **④ 类名里一个 `:` 让整份 `data.yaml` 解析失败（`export.yaml_scalar()`）**：姿态库把类名原样拼进 YAML，`1: 安全帽: 大` 一 `yaml.safe_load` 就报 `mapping values are not allowed here`，Ultralytics 一帧都跑不起来；`true` / `no` / `null` / `3d` 更阴——YAML 悄悄改类型，训练时的类别名成了 `True`。现在只给会被误读的加引号（`person` 保持明文，人和 diff 都好读），注释里的换行一并压掉（`yaml_comment()`），检测库换成同一个 helper。
+- **⑤ `coords` 的 train/val 会张冠李戴（`coords.collect_records(splits=…)`）**：以前按**导出文件名**索引这次算好的划分，导出端一改名（就是上一条那种加后缀）就全落回默认值。改成按索引里的相对路径，导出端怎么改名都对得上。
+- **⑥ 服务器忽略 `Range` 时下载永远"不完整"（`backends._download_to()`）**：续传时总量算成 `start + length`，可不少镜像收了 `Range` 头照样回 `200` 整包——总量多算了已下好的那一截，校验永远差一截，**重下几次都是「下载不完整」**，只能删掉 `.pt.part` 从头再来。改成只有续传真的生效才加 `start`。
+- **⑦ 两个实例同时下同一个权重会互相截断（`backends.claim_download()`）**：共用 `x.pt.part` 这个固定名，两边往同一个文件写不同偏移。现在用 `fcntl.flock` 独占，抢不到锁的那方**等对方下完**再复用结果，不重复下一遍。`.pt.part` 的名字保持固定——重启续传靠的就是这个可预测的名字，换成随机名反而退化。
+- **⑧ `AUTOLABEL_WEIGHTS_DIR` 以前只有一半的地方认（`backends.default_weights_dir()`）**：改了这个变量的用户，模型管理页说权重「就绪」，跑标注却又往默认 `models/` 下一份。现在 `resolve_model_path()` / `ensure_weights()` / `model_status()` / `model_inventory()` / `weights_hint_retryable()` 的权重目录默认全部走 `models.weights_dir()`（延迟导入避开循环依赖），界面与推理同一个口径。顺带新增 `partial_paths()` 把半截的 `.part` / `.bad` 报给界面显示，`delete_weight()` 删除时连带清理——它以前拿到空目录时 `os.path.dirname(None)` 直接 TypeError。
+- **⑨ 删了多模态配置，明文 Key 还留在磁盘上（`models.delete_profile()`）**：配置里只存 `vlm:<配置ID>` 引用，真 Key 在 `~/.autolabel/secrets.json`。以前只删配置，那串明文再没人引用——界面里看不见、也删不掉，用户以为换掉了，其实躺着一把幽灵密钥。现在删配置连带 `delete_secret(key_ref)`。
+- **⑩ 版本号写 `1.2` 也算合法（`version.rewrite()`）**：写进去之后比较时按 `1.2.0` 处理，顶栏显示 `v1.2`、更新提示按 `1.2.0` 判，看着像版本号没生效。改成只收三段数字，`v1.3.0` 收下来并归一化成 `1.3.0` 写回。
+- **⑪ 数字参数没兜底，`0` 和负数一路穿到图像库里炸英文栈（`review._number()` / `_positive()`）**：抽帧频率填 `0` 是 `fps=0` 除零、最长边填 `0` 是 PIL 缩放报错，界面上只剩一行 traceback。现在统一在接口层校验并回中文（`抽帧频率要大于 0，现在是 0`），范围越界同样（`置信度阈值不能大于 1`）。而且**先校验参数再查库存**——以前阈值填错却报「库里还没有图片」，把真正填错的那个框盖住了。
+- **⑫ 半精度关了却没关上（`settings.FALSE_WORDS`）**：界面上把开关拨到关，请求里带的是字符串 `"false"`，而 `bool("false") == True`——存下来是**开着**的，界面还回一句「已保存」。现在开关类字段按词表认（`0/false/no/off/n/关/否`）；前端也不再让 `parseFloat` 出来的 `NaN` 经 `JSON` 变成 `null`（那头的 `float(None)` 又是一段英文栈）。
+- **⑬ 未知接口只回一句英文 `not found`（`review.UnknownEndpoint`）**：界面上只剩「失败：not found」，分不清是没这个接口还是数据出了问题。改成「没有这个接口：/api/xxx」。
+- **⑭ 上传进度是假的、日志区无限增长（`static/common.js`）**：进度以前按**文件个数**算，120 MB 的视频和一张 200 KB 的图一样只占一格，看着像卡死；现在走 XHR 的 `upload.onprogress` 拿**真实字节**（`fetch` 没有这个回调，只能换 XHR）。日志只留最后 400 条并写明「更早 N 条已折叠」——一次视频导入几千行日志全塞进 DOM，页面越滚越卡；点「清空」后行缓存跟着归零，否则下一次追加会把刚清掉的又写回来。
+- **⑮ 「人工成果不许覆盖」这条线三库各抄一遍**：`HUMAN_STATUSES` 以前定义在 `pipeline.py` 里只有姿态认，检测库和提示词库各自又写了一遍同样的判断——改一处忘两处就是「重标吃掉手工框」。现在上收到 `dataset.py` 一处，三条标注链路和 `qc` 都从这里取。
+- **⑯ 终检**：两个实例（8765 走 MPS / 8766 走 CUDA）16 个页面与接口全 200；30 多条 GET/POST 打遍全部路由，**0 个 5xx**，非 2xx 全是中文校验提示。联网状态下 `/api/version` 如实报「GitHub 上最新是 1.2.3，本机 1.2.4 更新」，不谎报。
+- **测试 603 → 665 条**（+62，跳过 1 项仍是缺 ffmpeg）：新增 `tests/test_atomic_write.py`（两个子进程各写 40 份 1 MB 索引，比的是谁都没写出残缺文件、换名后不留临时文件、Key 表 0600 没退化）；`tests/test_export_names.py` +4 条（8 个怪类名过 `yaml.safe_load`、`a/f.jpg` 与 `a__f.jpg` 互不吃、反复导出清掉驳回帧且检测库同样生效）；`tests/test_weights.py` +4 条（忽略 `Range` 的镜像能下完、下载锁只放一个持有者、`AUTOLABEL_WEIGHTS_DIR` 推理侧同样认、残留 `.part` 能删干净）；`tests/test_version.py`、`tests/test_models.py`、`tests/test_business_rules.py`、`tests/test_review_export.py`、`tests/test_label_pipeline.py` 补上三段版本号、删配置带走 Key、强制重标作废旧批准、已删除图不接受复核 / 撤销等回归。`ruff` 全绿，5 个 JS 文件 `node --check` 全过。
+
+## 2026-10-18 22:35 — 新增「目标检测」模块，模型管理改成能搜
+
+需求两条：① 加一个**非姿态**的目标检测标注模块——先选可用的 YOLO 权重、再选这个权重能标哪些类别，并且有自己的上传入口和**独立素材库**；② 模型管理改成能**搜**——在官网 / GitHub 上找 YOLO 模型，给出介绍和列表，能下载，下来之后标图片、标姿态都用同一份权重库。版本 `1.2.3 → 1.2.4`（按约定 +0.01）。
+
+- **① 第三个标注库落地**：新增 `autolabel/detect.py`（权重清单与任务判定、类别登记、批量出框、本库默认权重偏好、分库汇总）+ `autolabel/static/detect.html`（第五个页面 `/detect`）。库骨架全在 `library.LIB_SPECS` 加一行：标签 `detect_labels/`、索引 `.autolabel/detect/index.json`、批次表、原件与撤销快照各自一套，只和姿态库、提示词库共用 `images/` 素材池。**独立素材库**是真的独立：`/detect` 有自己的上传口（`/api/detect/upload`）和「从素材池添加」，不用先跑去姿态页传一遍。
+- **② 前端没有复制第二份**：`objects.js` 顶部改成一张 `LIB_CONFIG` 表（库名 / 接口 / 文案 / 标签目录 / 计量单位），同一个脚本同时服务 `/objects` 和 `/detect`，分界线以下的代码不许再出现写死的库名。顺带在 `common.js` 加 `ensureRailModules()` / `ensureMenuModules()` 兜底补齐每页的导航条与 `⋯` 菜单——上次加提示词标注时就漏了模型管理页的入口，这次让漏了也能自己长出来。
+- **③ 类别号由本库登记表说了算，不是权重说了算**：`.autolabel/detect/classes.json` 记类名 → 类别号，**同名永不换号、删号不回收**。COCO 里 `bus=5`，你的登记表可能给 `bus=0`，标签文件里写的是登记表的号——这样换权重（COCO-80 → 自训练 3 类）时同名的 `person` 继续用同一个号，先前标好的框不会一夜之间指错东西。
+- **④ 新增 `autolabel/modelhub.py` 当搜索的数据层**（不改 `models.py`）：目录从只有姿态 13 档扩到五种任务（人体姿态 / 目标检测 / 实例分割 / 旋转框检测 / 图像分类）。体积按 `ultralytics/assets` release v8.4.0 的真实字节数逐条 HEAD 核实，参数与精度取官方模型表，官方没给的填 `None` 并在中文说明里写明；`sha256` 只填本机已有的真实值，其余留空串（留空即跳过校验，不会拿错哈希否掉好文件）。离线匹配是主路径，联网搜索是加分项：断网 / 超时 / 限流一律安静降级，照常返回本地结果并说明原因，不抛异常。下载不另起一套，仍走 `models.start_download()` / `backends.ensure_weights()`。
+- **⑤ 模型管理页加搜索框**：输 `yolo11` / `姿态` / `分割` 就搜（0.4 秒防抖），「任务」下拉框按五种任务筛，勾「联网搜 GitHub」把官方仓库的自制权重一起列进来——第三方来源只给**打开主页**和**复制地址**，不代下载（来源与许可不由本软件担保）。结果卡片带中文介绍、参数量、预计体积、自带类别表规模、在本机的状态。命令行同一个入口：`autolabel models --search 关键词 [--task detect] [--remote]`。
+- **⑥ 两个「默认」分开**：`POST /api/models/default` 是**这台机器**的姿态默认（`configs/models.json`），新增的 `POST /api/detect/prefs` 是**当前数据集目标检测库**的默认权重（`.autolabel/detect/prefs.json`）。数据集 A 用 `yolo11n.pt`、数据集 B 用 `yolov8x.pt`，姿态默认不受影响。给它姿态权重或未下载的权重直接 400 并说明原因。
+- **⑦ 命令行补 `autolabel detect`**：`--list-models`（姿态权重列出来说明为什么用不了）、`--model-classes 权重`、`--add-classes all`、`--no-label`、`--classes`、`--images`、`--overwrite`、`--coords`、`--export`、`--status`。没写 `--model` 时的顺序：显式指定 → 本库 prefs → `yolo11n.pt`。
+- **⑧ 抓到 4 个真 bug**（都补了回归测试）：
+  - `run_prompt_job` / `run_detect_job` 读的是内存里那份旧索引——命令行刚 `import` 完就点「开始标注」，会误报「库里还没有图片」。加上 `_refresh_if_changed()` 先比对磁盘再决定要不要重读。
+  - `module_summary()` 的 `labeled` 取了顶层的 `labeled`（那是**姿态库**的无前缀键），门户上出现「标注 0 张 · 却有 5 个框」。改成读本库小计。
+  - `fields.normalize_name()` 一刀切要求单 token 类名，COCO 里 `traffic light`、`potted plant` 这 **15 个带空格的名字全被拒**，`detect --add-classes all` 80 类只收进 65 类，训练时才暴露。改成按库分档（检测库放开词间空格，提示词库仍严格），写 `data.yaml` 时对非纯 token 的名字加引号，`yaml.safe_load` 原样读回。
+  - `detect.add_model_classes()` 把权重报不出的类别也收了进来，导致「按全部类别标注」整批报错。改成只登记该权重真报得出的类别，其余进 `not_in_model` 并回落到原始英文写法。
+- **⑨ 顺手对齐的两处小口径**：`/api/fields/delete` 的 `id` 改成显式判 `None`（`0` 号类别不再被当假值丢掉）；`/api/prompt/export` 返回体补 `kind`，前端不再靠导出目录名猜这是哪个库。
+- **⑩ 文档**：新增 `demo_docs/11-目标检测.md`（三库分工表、类别号规则、`/detect` 操作、`autolabel detect` 全参数、产物与接口、FAQ）；`README.md` 与 `demo_docs/README.md` 改成「三条标注链路 / 五个页面」；`02-命令行参考.md` 加 `detect` 行与 `--search`，并且**整节「帮助快照」按 `argparse` 真实输出重新生成**（原来还停在 `--lib {pose,objects}`，与代码已经不一致）；`04` 四页 → 五页并补 `/detect` 操作段；`06` 补三个库的目录/索引键/新模块/新接口；`07` 并入目标检测 FAQ 6 条；`08` 补搜索、联网搜索与「两个默认」的区别。
+- **测试 456 → 597 条**（+141，跳过 1 项仍是缺 ffmpeg）：`tests/test_detect.py` 34 条（假后端 monkeypatch，覆盖任务判定、权重清单里姿态权重被挡并带原因、`resolve_model` 三级兜底、类别登记的换号规则与 `not_in_model`、批量出框与索引字段、三库互不干扰、人工保护与 `--overwrite` 后转 `edited`、坏图不拖垮整批、分割权重、坐标与导出、`module_summary` 分库）、`tests/test_detect_web.py` 14 条（页面与接口往返：`/detect` 首屏、`/api/detect/models|classes/add|prefs|run`、`/api/fields?lib=detect`、`/api/prompt/item|export` 带 `lib`）、`tests/test_modelhub.py` 93 条（五种任务、体积/参数出处、离线匹配、联网失败安静降级、字段别名齐全）。`ruff` 全绿，5 个 JS 文件 `node --check` 全过。
+- **已知边界**：目标检测库只吃检测 / 分割 / 旋转框三档权重，姿态权重进不来（会明确说「回姿态标注」）；类别表上限 200，超出说明该自训练专属权重而不是硬塞进 COCO。GitHub 搜索按仓库级匹配，不下钻到具体文件，所以列出的仓库可能不含你找的那一档——点开自己核对。旋转框（obb）权重现在按水平框出框，不导出旋转角。
+
+### 同日复检（23:55）——不发新版，并进来；又抓到 14 处
+
+这一轮不加功能，只把 ①~⑩ 留下的接口口径、命令行输出、提示文案逐条对着实机链路核（80 类登记表 + `bus.jpg` 出框的副本数据集，`/detect` 全链路走一遍）。**根因高度集中：第三个库加进来了，但很多地方还停在"两个库"的算式里。**
+
+- **① `-seg` 分割权重每张图必崩（P1）**：`backends.py` 用 `bool(result.masks.data)` 判断有没有轮廓，而它是个 `(N,H,W)` 张量——真值判断直接抛 `truth value is ambiguous`，分割权重标一张失败一张。改成先看 `len()`、拿不到再按 `TypeError` 兜底；用假结果探针复现（改前必失败、改后出框）。
+- **② `masked` 是个黑洞**：分割权重出框时会打 `masked`，但 `image_flags` 不聚合它、`DETECT_FLAG_HINTS` 里也没有它——界面上出现一枚没人能解释的标记。现在聚合进整图标记，并写清「多边形轮廓只按外接水平框记录，想要轮廓得换标注方式」。
+- **③ 复核计数根本不认检测库**：`qc._lib_key()` 只认 `objects`，`detect` 落回姿态口径去读 `flags`/`score`，于是 `review.detect_flagged` **恒为 0**，和同一页批次表里的「带标记 1」当面对质。改成 `library.normalize` + 按 `field_key(lib, …)` 取键。实机核对：改前 0、改后 1，与 `by_module.detect.flagged` 一致。
+- **④ 启动横幅与日志少一个库**：`review_counts()` 少传 `store.detect_index`，`数据集 …` 那行没有检测库张数，`二级模块` 那行没有 `/detect 目标检测`。三处补齐。
+- **⑤ `autolabel status` 完全不报目标检测库**：现在多一行「目标检测 已标 x/y 张 · 框 · 已确认 · 未标 · 没复核 · 上次权重」，外加类别分布与检测标记行。
+- **⑥ 素材池统计把检测库的素材说成没人引用**：`in_pose and in_objects` 是两个字库时代的算式，只在检测库里的图会被报成「无人引用」，骗人去重新认领已经在用的文件。改成看 `row["libs"]`；输出加「检测库 N」，「两库共用」改成「多库共用」（`pool` / `status` / `--add` 提示一起跟上）。
+- **⑦ `batches` 表列错位**：`已标` 读的是姿态的 `labeled`、`检测框` 读 `prompt_boxes`，检测批次永远显示「已标 0 · 检测框 0」。改成按 `MODULE_ROW_KEYS[module]` 取本库小计、框数取 `prompt_boxes + detect_boxes`；「两个库合计」→「三个库合计」；未分组提示补上 `__ungrouped__:detect`。
+- **⑧ `detect --add-classes` 的文案在说谎**：该权重报不出的类别其实**没有登记**（只登记权重真报得出的），文案却写「已登记但标不出框」。改准。
+- **⑨ `detect --status` 把「还没标注」印成「待复核」**：读的是 `summary["unreviewed"]`（未标注张数）。拆成「未标」与「没复核」（`labeled - reviewed`）两列，提示词那行同改。
+- **⑩ 坐标 `meta.json` 的列说明串库**：检测库的 `columns` 还在教用户 `prompt_stale`/`vlm_failed`，可 CSV 里躺着的是 `model_stale`/`model_failed`。新增 `object_column_doc(lib)` 按库发口径，复检时再把 `masked` 补进整图标记那行。
+- **⑪ `cli.py` 里有两个 `def _pad`**：后定义的覆盖前一个，带 `unicodedata` 的那份是死代码。删掉旧 def，`_display_width` 改走 `east_asian_width`；新增 `LIB_TAGS`（姿态/提示词/检测）；补上漏掉的 `LIB_POSE` import（不补会 `NameError`）；模块 docstring 的 22 个子命令补全。
+- **⑫ 幽灵行：复核 / 撤销会把已删除的图凭空建回来（本轮新抓）**：`set_status` / `set_prompt_status` / `undo` / `undo_prompt` 都走 `upsert`，图不在了也照建。多开一个标签页就能撞上——那边删掉图，这边点一下「接受」，库里就从 1 张变 2 张，多出来的那张打不开，门户的「未标注」和缩略图列表跟着全错（实测 1 张变 2 张、框数从 5 掉到 0）。新增 `_require_item()` 守卫四个入口，直接回 400 并说「这张图已不在目标检测里（可能刚被另一个页面删除），刷新页面就好：xxx.jpg」。
+- **⑬ `export` / `coords` 只管姿态库却不告诉你**：只在检测库干过活的人敲 `autolabel export`，会得到一句「库里一张图都还没有」——可素材池里明明有图。新增 `other_library_hint()`：空结果时按库指路（`autolabel detect <数据集> --export` / `prompt … --coords`），并把这句报错改准。顺带 `batches` 删除输出里的「两个库都摘」→「三个库都摘」（这是会打印给用户看的）。
+- **⑭ 12 处陈旧的「两个库」**：`dataset.py`（目录树 / 素材池并集 / 落盘条件）、`batches.py`（模块头 / `DELETE_PURGE` / 批次锁）、`review.py`（`reload()` 说明）、`common.js`（素材池注释）、`test_business_rules.py` 等处的注释与 docstring 全部改成三库口径；`06` 里「批次分两张表登记」也补成三张（`detect/batches.json` 早就存在了）。
+- **测试 597 → 603 条**（+6，跳过 1 项仍是缺 ffmpeg）：`tests/test_detect.py` +3（分割权重不崩、分割框在图片级打 `masked`、检测库坐标列说检测库的话）、`tests/test_business_rules.py` +2（`review_counts` 读检测库字段且两框库互不串味、`status`/`pool` 把第三个库算进去）、`tests/test_review_export.py` +1（已删除的图不接受复核 / 撤销，四个入口全覆盖）。全量 602 passed / 1 skipped，`ruff` 全绿，5 个 JS 文件 `node --check` 全过。
+
 ## 2026-10-18 19:10 — 工作台改走本地 HTTPS，多卡可以一块卡开一个实例
 
 从「双击打开网页却提示不安全 / 录不了摄像头 / 想用上第二块显卡只能改全局设置」这三件事出发。版本 `1.2.2 → 1.2.3`（按约定 +0.01）。

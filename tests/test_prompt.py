@@ -456,3 +456,23 @@ def test_prompt_summary_counts_status_flags_and_per_field(dataset):
     assert summary["flag_counts"] == {"small_box": 1}
     assert summary["per_field"] == {"bottle": 1}
     assert summary["flag_hints"]["small_box"]
+
+
+def test_edited_boxes_count_as_human_work_too(dataset, one_profile, monkeypatch):
+    """提示词库那份保护名单同样漏过 edited：状态只到「已修改」也必须绕开。"""
+    fields = two_fields(dataset)
+    calls = []
+    monkeypatch.setattr("autolabel.vlm.chat",
+                        lambda profile, prompt, data_url: calls.append(prompt)
+                        or '{"objects":[{"field":"bottle","bbox":[100,100,300,500]}]}')
+    pr.run_prompt_labeling(dataset, fields=fields, profile=one_profile)
+    assert len(calls) == 2
+
+    idx = load_index(dataset, "objects")
+    idx.upsert("img0.jpg", prompt_status="edited")
+    idx.save()
+
+    stats = pr.run_prompt_labeling(dataset, fields=fields, profile=one_profile,
+                                   extra_hint="只标桌上的", verbose=False)
+    assert stats["protected"] == 1 and stats["labeled"] == 1, stats
+    assert len(calls) == 3, "只有没被人工碰过的那张该再问一次模型"

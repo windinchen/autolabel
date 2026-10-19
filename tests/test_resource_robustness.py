@@ -20,7 +20,7 @@ from PIL import Image
 from _helpers import idx_names
 from autolabel import batches as bt
 from autolabel import dataset as ds
-from autolabel.library import deleted_dir
+from autolabel.library import LIBRARIES, deleted_dir
 from test_prompt_web import get
 
 STATIC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "autolabel", "static")
@@ -57,8 +57,9 @@ def test_reconcile_reads_the_other_index_once_per_library(interrupted_import, mo
     monkeypatch.setattr(bt, "load_index_or_none", counting)
     report = bt.reconcile_with_disk(interrupted_import)
     assert report["recovered"] == 40
-    # 每个库各一次 + 批次收尾时的一两次；旧实现这里会是 40 张 × 每张一次
-    assert len(calls) <= 8, f"index.json 被解析了 {len(calls)} 次，退化成按张重读"
+    # 每个库各读屈指可数的几次（对账 + 批次收尾），上限按库数放大；
+    # 旧实现这里会是 40 张 × 每张一次，那才是用户眼里的"点了没反应"
+    assert len(calls) <= 4 * len(LIBRARIES), f"index.json 被解析了 {len(calls)} 次，退化成按张重读"
     assert len(idx_names(interrupted_import)) == 40
 
 
@@ -178,3 +179,36 @@ def test_leftover_upload_files_are_swept_at_startup(dataset):
     assert up.prune_stale_uploads(dataset)["files"] == 0
     review_py = open(os.path.join(os.path.dirname(STATIC), "review.py"), encoding="utf-8").read()
     assert "prune_stale_uploads(" in review_py, "启动流程没接上传清理"
+
+
+def test_snapshot_pruning_orders_same_second_files_by_write_order(dataset):
+    """同一秒里的多份快照按 ``-1``、``-2`` 分先后，按字符串排会乱。
+
+    ``-10`` 会排到 ``-2`` 前面，而没后缀的那一份（其实是这一秒里最先写的）会排到最后。
+    清理从旧往新删，切点落在同一秒里时就会删掉更新的、留下更旧的。
+    """
+    from autolabel.batches import _snapshot_order
+
+    names = [f"20261019-093000{n}.json" for n in ["", "-1", "-2", "-10", "-11"]]
+    assert sorted(names, key=_snapshot_order) == [
+        "20261019-093000.json", "20261019-093000-1.json", "20261019-093000-2.json",
+        "20261019-093000-10.json", "20261019-093000-11.json"]
+    assert sorted(names, key=_snapshot_order)[-1] == "20261019-093000-11.json"
+
+
+def test_snapshot_pruning_keeps_files_it_does_not_understand(dataset):
+    """目录里躺着一个看不懂的文件：宁可一直留着，也不能当成旧快照删掉。"""
+    import autolabel.batches as batches
+
+    folder = deleted_dir(dataset)
+    os.makedirs(folder, exist_ok=True)
+    for index in range(batches.DELETE_SNAPSHOT_KEEP + batches.DELETE_SNAPSHOT_PRUNE_MARGIN + 5):
+        with open(os.path.join(folder, f"20261019-{index:06d}.json"), "w", encoding="utf-8") as fh:
+            json.dump({}, fh)
+    with open(os.path.join(folder, "手工备份.json"), "w", encoding="utf-8") as fh:
+        json.dump({}, fh)
+
+    removed = bt._prune_snapshots(folder)
+
+    assert removed > 0
+    assert "手工备份.json" in os.listdir(folder)

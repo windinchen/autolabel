@@ -6,7 +6,7 @@
 
 删除批次时连带删掉本库的标签与复核历史，并在 ``.autolabel/deleted/`` 留一份快照
 （索引字段 + 标签原文，快照里记 ``lib``），误删可以照着快照恢复。
-素材图片是**两个库共享的池**：只有两个库都不再引用同一帧时才会真的删文件，
+素材图片是**三个库共享的池**：只有所有库都不再引用同一帧时才会真的删文件，
 否则只是把本库的引用摘掉（界面上分别叫「从本库移除」和「删素材」）。
 """
 
@@ -38,17 +38,22 @@ from .dataset import (
     now_str,
     resolve_image,
 )
+from .atomic import atomic_write_json
 from .library import (
     LIBRARIES,
+    LIB_DETECT,
     LIB_NAMES,
     LIB_OBJECTS,
     LIB_POSE,
     backups_dir,
     batches_path,
     deleted_dir,
+    field_key,
     history_root,
     normalize,
+    other_libs,
     qc_dir,
+    spec,
 )
 
 # 索引里没有 batch_id 的历史数据，归到这个虚拟批次里，同样可以整批删除
@@ -56,15 +61,19 @@ UNGROUPED_ID = "__ungrouped__"
 UNGROUPED_NAME = "未分组（历史导入）"
 STATUS_RUNNING = "running"
 STATUS_INTERRUPTED = "interrupted"
-# 批次归属的二级模块就是它所属的标注库：姿态标注与提示词标注各自独立成库
+# 批次归属的二级模块就是它所属的标注库：每个库一批批次，互不掺水
 MODULE_POSE = LIB_POSE
 MODULE_PROMPT = LIB_OBJECTS
+MODULE_DETECT = LIB_DETECT
 MODULE_UNKNOWN = "unknown"
-MODULE_NAMES = {MODULE_POSE: LIB_NAMES[LIB_POSE], MODULE_PROMPT: LIB_NAMES[LIB_OBJECTS],
-                MODULE_UNKNOWN: "未识别"}
+MODULE_NAMES = dict(LIB_NAMES)
+MODULE_NAMES[MODULE_UNKNOWN] = "未识别"
+#: 门户批次表里各模块小计的键名。提示词库历史上叫 ``prompt``，沿用不改，
+#: 免得前端和导出脚本跟着一起抖；新库按库名给键。
+MODULE_ROW_KEYS = {LIB_POSE: "pose", LIB_OBJECTS: "prompt", LIB_DETECT: "detect"}
 # 按张删除的两种粒度
 DELETE_LIB = "lib"        # 只摘本库引用，素材文件留在池里
-DELETE_PURGE = "purge"    # 两个库一起摘，并把素材文件删掉
+DELETE_PURGE = "purge"    # 三个库一起摘，并把素材文件删掉
 DELETE_MODES = (DELETE_LIB, DELETE_PURGE)
 _SAFE = re.compile(r"[^0-9A-Za-z._\u4e00-\u9fff-]+")
 _LOCK = threading.RLock()
@@ -74,7 +83,7 @@ _HELD = threading.local()
 
 @contextmanager
 def _file_lock(root: str) -> Iterator[None]:
-    """批次表的跨进程可重入锁（两个库共用一把，避免互相踩写）。
+    """批次表的跨进程可重入锁（三个库共用一把，避免互相踩写）。
 
     ``_LOCK`` 只挡得住同一个进程里的线程；命令行 ``autolabel import`` 和复核服务
     是两个进程，各自「读全表 → 改 → 写全表」，撞上就会把对方刚写的批次记录覆盖掉。
@@ -114,8 +123,20 @@ def _file_lock(root: str) -> Iterator[None]:
 
 
 def _other(lib: str) -> str:
-    """另一个库，用来判断素材文件还有没有别人在引用。"""
-    return LIB_OBJECTS if normalize(lib) == LIB_POSE else LIB_POSE
+    """老调用名：返回"排在第一位的其它库"。三个库之后别再用它做判断，
+    判断素材还有没有人引用要看 ``other_libs``（见 ``_holder_count``）。"""
+    peers = other_libs(lib)
+    return peers[0] if peers else normalize(lib)
+
+
+def _peers(root: str, lib: str) -> Dict[str, object]:
+    """其它库的索引副本（读不到的库直接不给，调用方按"没人引用"处理）。"""
+    peers: Dict[str, object] = {}
+    for other in other_libs(lib):
+        idx = load_index_or_none(root, other)
+        if idx is not None:
+            peers[other] = idx
+    return peers
 
 
 # --------------------------------------------------------------------------- #
@@ -137,13 +158,8 @@ def load_batches(root: str, lib: str = LIB_POSE) -> List[dict]:
 
 
 def save_batches(root: str, batches: Sequence[dict], lib: str = LIB_POSE) -> None:
-    path = batches_path(root, lib)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"batches": list(batches), "updated_at": now_str()},
-                  fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    atomic_write_json(batches_path(root, lib),
+                      {"batches": list(batches), "updated_at": now_str()})
 
 
 def module_for(record: dict) -> str:
@@ -162,6 +178,8 @@ def module_for(record: dict) -> str:
             except ValueError:
                 continue
     kind = str(record.get("kind") or "")
+    if kind.startswith("detect"):
+        return MODULE_DETECT
     if kind.startswith("prompt") or kind.startswith("object"):
         return MODULE_PROMPT
     if kind in ("image", "video", "pose", "pool"):
@@ -247,14 +265,14 @@ def finish_batch(root: str, batch_id: str, status: str = "done", message: str = 
 # --------------------------------------------------------------------------- #
 
 def reconcile_with_disk(root: str) -> dict:
-    """启动对账（两个库都跑）：补齐已落盘但索引缺席的图，并给中断批次收尾。
+    """启动对账（三个库都跑）：补齐已落盘但索引缺席的图，并给中断批次收尾。
 
     导入/标注跑到一半被打断（重启复核服务、断电、强杀进程）时，图片副本往往已经
     写进共享素材池 ``images/`` 而索引还没来得及保存，界面上看着像素材凭空消失，
     批次也会一直挂在"标注中"删不掉。这里以磁盘为准补索引，并把无人认领的 running
     批次判定为中断。
 
-    素材池是两个库共用的，所以「孤儿」的定义是**两个库的索引都不要这张图**；
+    素材池几个库共用，所以「孤儿」的定义是**所有库的索引都不要这张图**；
     补进哪个库看当时还有没有正在跑的批次，都没有就归到姿态库的未分组。
 
     :return: ``{"recovered": 补回张数, "items": 补回的相对路径样本,
@@ -277,7 +295,7 @@ def reconcile_with_disk(root: str) -> dict:
             report["items"].extend(one["items"])
             report["interrupted"].extend(one["interrupted"])
         report["items"] = report["items"][:20]
-        # 同一帧两个库都记着，只缺一块盘，按张数说人才不会被数字吓到
+        # 同一帧可能被几个库都记着，只缺一块盘，按张数说人才不会被数字吓到
         report["missing_files"] = len(missing)
     return report
 
@@ -300,9 +318,10 @@ def _reconcile_lib(root: str, lib: str, tombstones: set,
             referenced.append(rel)
     # 对面库的索引读一次就够：以前每扫到一张图就重新解析一遍它的 index.json，
     # 1500 张的库光启动对账就要 1 秒、两万张要几分钟（实测是 O(N^2)）。
-    other_idx = load_index_or_none(root, _other(lib)) or _EmptyIndex()
+    other_indexes = [load_index_or_none(root, other) or _EmptyIndex()
+                     for other in other_libs(lib)]
     orphans = [rel for rel in referenced
-               if idx.get(rel) is None and other_idx.get(rel) is None]
+               if idx.get(rel) is None and all(o.get(rel) is None for o in other_indexes)]
     one["missing"] = [rel for rel in idx.items if not os.path.exists(resolve_image(root, rel))]
     batches = load_batches(root, lib)
     running = [row for row in batches if row.get("status") == STATUS_RUNNING]
@@ -341,7 +360,7 @@ class _EmptyIndex:
 
 def _should_claim(lib: str, running: Sequence[dict],
                   other_running: Sequence[dict] = ()) -> bool:
-    """孤儿图归谁：有在跑批次的库优先，都没有才归姿态库。
+    """孤儿图归谁：有在跑批次的库优先，都没有才归姿态库（姿态库是这套工具的老房东）。
 
     ``other_running`` 是对面库里还在跑的批次：本库闲着、对面正在标这批素材时，
     先让对面认领，否则姿态库会按遍历顺序把提示词库跑了一半的图抢走。
@@ -395,71 +414,94 @@ def _recovered_fields(root: str, image_rel: str, lib: str = LIB_POSE) -> Optiona
 # 汇总与列表
 # --------------------------------------------------------------------------- #
 
-# 跨库补齐时各自该看哪一侧的字段
-_POSE_FIELDS = ("status", "objects", "score", "visible_ratio", "flags", "object_flags")
-_PROMPT_FIELDS = ("prompt_status", "prompt_objects", "prompt_score", "prompt_flags")
+#: 补齐时每个库要搬过去的字段：本库自己那份永远为准，别库的只补缺。
+#: 姿态库额外带 ``visible_ratio`` 与历史遗留的 ``object_flags``。
+_EXTRA_FIELDS = ("score", "visible_ratio", "object_flags", "manual", "manual_boxes", "signature")
 
 
-def _cross_view(item: dict, peer: Optional[dict], lib: str) -> dict:
-    """把本库条目和对面对同一条素材的条目合成"这条素材的完整进度"。
+def _lib_fields(lib: str) -> Tuple[str, ...]:
+    """该库在索引条目里占用的键名（跨库补齐时用）。"""
+    name = normalize(lib)
+    keys = [field_key(name, item) for item in ("status", "objects", "flags", "score")]
+    keys += [item for item in _EXTRA_FIELDS
+             if item in ("visible_ratio", "object_flags") and name == LIB_POSE
+             or item in ("manual", "manual_boxes", "signature") and name != LIB_POSE]
+    return tuple(keys)
 
-    门户一行里同时显示骨骼与检测框两列，只读本库字段就会出现「文件清单写着已标
-    1 人，批次行却写 0 人」的自相矛盾。两个库都引用的素材以各自负责的那一侧为准。
+
+def _cross_view(item: dict, peers: Optional[Dict[str, dict]], lib: str) -> dict:
+    """把本库条目和其它库对同一条素材的条目合成"这条素材的完整进度"。
+
+    门户一行里并排显示骨骼 / 提示词框 / 检测框三列，只读本库字段就会出现
+    「文件清单写着已标 1 人，批次行却写 0 人」的自相矛盾。每一列都以负责它的
+    那个库为准，本库读不到就从对应库的条目里补。
     """
-    if not peer:
+    if not peers:
         return item
-    pose_src = item if lib == LIB_POSE else peer
-    prompt_src = item if lib == LIB_OBJECTS else peer
     merged = dict(item)
-    for key in _POSE_FIELDS:
-        merged[key] = pose_src.get(key)
-    for key in _PROMPT_FIELDS:
-        merged[key] = prompt_src.get(key)
+    for other in LIBRARIES:
+        src = item if other == normalize(lib) else (peers.get(other) or {})
+        for key in _lib_fields(other):
+            merged[key] = src.get(key)
     return merged
+
+
+#: 复核状态四种，每个库各计一份
+STATUS_TALLY = ("approved", "rejected", "edited", "unreviewed")
+
+
+def _unit_key(lib: str) -> str:
+    """该库的"标了多少个东西"叫什么：姿态数骨骼，框类库数框。"""
+    return "people" if spec(lib)["unit"] == "骨骼" else "boxes"
+
+
+def _tally_key(lib: str, name: str) -> str:
+    """汇总结果里该库某一项的键名：姿态库不带前缀（老键名），其余带库前缀。"""
+    prefix = spec(lib)["prefix"]
+    return f"{prefix}_{name}" if prefix else name
+
+
+def _summarize_lib(items: Sequence[dict], lib: str) -> Dict[str, int]:
+    name = normalize(lib)
+    unit = _unit_key(name)
+    tally = {_tally_key(name, key): 0 for key in ("labeled", unit, "flagged") + STATUS_TALLY}
+    for item in items:
+        objects = item.get(field_key(name, "objects"))
+        status = str(item.get(field_key(name, "status")) or "")
+        if objects is None and not status:
+            continue                        # 这条素材在本库里还没开始
+        if objects is not None:
+            tally[_tally_key(name, "labeled")] += 1
+            tally[_tally_key(name, unit)] += int(objects or 0)
+        flags = set(item.get(field_key(name, "flags")) or [])
+        if name == LIB_POSE:
+            flags |= set(item.get("object_flags") or [])
+        if flags:
+            tally[_tally_key(name, "flagged")] += 1
+        if status in STATUS_TALLY:
+            tally[_tally_key(name, status)] += 1
+        else:
+            tally[_tally_key(name, "unreviewed")] += 1
+    return tally
 
 
 def summarize(items: Sequence[dict]) -> dict:
     """按索引条目汇总批次规模（不解析标签）。
 
-    分库之后姿态库条目只有 ``status/objects/flags``，提示词库条目只有
-    ``prompt_*``，同一套统计代码对两个库都成立，各自只会算出自己那一半。
+    每个库的条目只带自己那一组键（姿态库不带前缀、提示词库 ``prompt_*``、
+    目标检测库 ``detect_*``），这里逐库套同一套算法，加库不用改这里。
     """
-    counts = {"items": len(items), "labeled": 0, "people": 0, "flagged": 0,
-              "approved": 0, "rejected": 0, "edited": 0, "unreviewed": 0,
-              "prompt_labeled": 0, "prompt_boxes": 0, "prompt_flagged": 0,
-              "prompt_approved": 0, "prompt_rejected": 0, "prompt_edited": 0,
-              "prompt_unreviewed": 0}
-    for item in items:
-        if item.get("objects") is not None:
-            counts["labeled"] += 1
-            counts["people"] += int(item.get("objects") or 0)
-        has_prompt = "prompt_status" in item or item.get("prompt_objects") is not None
-        if has_prompt and item.get("prompt_objects") is not None:
-            counts["prompt_labeled"] += 1
-            counts["prompt_boxes"] += int(item.get("prompt_objects") or 0)
-        if set(list(item.get("flags") or []) + list(item.get("object_flags") or [])):
-            counts["flagged"] += 1
-        status = item.get("status") or ""
-        if status:
-            counts[status if status in counts else "unreviewed"] += 1
-        elif not item.get("prompt_status"):
-            counts["unreviewed"] += 1
-        if not has_prompt:
-            continue
-        if set(item.get("prompt_flags") or []):
-            counts["prompt_flagged"] += 1
-        # 提示词侧的复核状态单独计数：门户要能分开看两个模块各推进到哪一步
-        prompt_status = str(item.get("prompt_status") or STATUS_UNREVIEWED)
-        key = "prompt_" + prompt_status
-        counts[key if key in counts else "prompt_unreviewed"] += 1
+    counts: Dict[str, int] = {"items": len(items)}
+    for lib in LIBRARIES:
+        counts.update(_summarize_lib(items, lib))
     return counts
 
 
 def list_batches(root: str, lib: str = "") -> List[dict]:
-    """批次列表（新→旧），带实时统计；``lib`` 为空时合并两个库。
+    """批次列表（新→旧），带实时统计；``lib`` 为空时合并三个库。
 
     合并时每个库都跳过「登记表的 ID 已被另一个库认领」的情况，避免同一素材在
-    两个库互相引用批次时出现重复行。未挂批次的数据归入各自库的「未分组」。
+    几个库互相引用批次时出现重复行。未挂批次的数据归入各自库的「未分组」。
     """
     root = os.path.abspath(root)
     wanted = [normalize(lib)] if lib else list(LIBRARIES)
@@ -467,7 +509,7 @@ def list_batches(root: str, lib: str = "") -> List[dict]:
     rows: List[dict] = []
     for target in wanted:
         idx = load_index_or_none(root, target)
-        peer = load_index_or_none(root, _other(target))
+        peer_indexes = _peers(root, target)
         # 合并列出时，某个库索引里引用了「其实属于另一个库」的批次 ID 就不再补虚行，
         # 否则主页会出现两条同名批次
         others = {str(row.get("id")) for other in LIBRARIES if other != target
@@ -476,7 +518,9 @@ def list_batches(root: str, lib: str = "") -> List[dict]:
         ungrouped: List[dict] = []
         if idx is not None:
             for rel, item in idx.ordered_items():
-                view = _cross_view(item, peer.get(rel) if peer is not None else None, target)
+                view = _cross_view(
+                    item, {own: (idx2.get(rel) if idx2 is not None else None)
+                           for own, idx2 in peer_indexes.items()}, target)
                 batch_id = str(item.get("batch_id") or "")
                 if batch_id:
                     members.setdefault(batch_id, []).append(view)
@@ -526,30 +570,34 @@ def batch_file_rows(root: str, batch_id: str, lib: str = "") -> List[dict]:
     """某批次下的单张清单，给门户「展开文件」和按张删除用（新→旧按入库时间）。"""
     lib = normalize(lib) if lib else resolve_lib(root, batch_id)
     idx = load_index_or_none(root, lib)
-    other = load_index_or_none(root, _other(lib))
+    peers = _peers(root, lib)
     rows: List[dict] = []
     for rel in batch_items(root, batch_id, lib):
         item = idx.get(rel) if idx else None
         if item is None:
             continue
-        peer = (other.get(rel) if other else None) or {}
-        flags = sorted(set(list(item.get("flags") or []) + list(item.get("object_flags") or [])))
-        own_pose = item if lib == LIB_POSE else peer
-        own_prompt = item if lib == LIB_OBJECTS else peer
-        rows.append({
+        # 每一列都以负责它的那个库为准：本库就用自己的条目，别库去别库的索引里取
+        views = {own: (item if own == lib else ((peers[own].get(rel) if own in peers else None) or {}))
+                 for own in LIBRARIES}
+        flags = sorted(set(list(views[LIB_POSE].get("flags") or [])
+                           + list(views[LIB_POSE].get("object_flags") or [])))
+        row = {
             "image": rel, "name": os.path.basename(rel), "lib": lib,
             "bytes": int(item.get("bytes") or 0), "imported_at": item.get("imported_at"),
             "width": item.get("width"), "height": item.get("height"),
-            "status": own_pose.get("status") or (STATUS_UNREVIEWED if lib == LIB_POSE else ""),
-            "objects": own_pose.get("objects"), "flags": flags,
-            "prompt_status": own_prompt.get("prompt_status") or (
-                STATUS_UNREVIEWED if lib == LIB_OBJECTS else ""),
-            "prompt_objects": own_prompt.get("prompt_objects"),
-            "prompt_flags": sorted(set(own_prompt.get("prompt_flags") or [])),
-            # 另一库是否也引用了这张图：决定"删素材"会不会影响对面
-            "shared": bool(other and other.get(rel) is not None),
+            "flags": flags,
+            # 其它库是否也引用了这张图：决定"删素材"会不会影响对面
+            "shared": any(other is not None and other.get(rel) is not None
+                          for other in peers.values()),
             "video": os.path.basename(str(item.get("video"))) if item.get("video") else "",
-        })
+        }
+        for own in LIBRARIES:
+            row[field_key(own, "status")] = views[own].get(field_key(own, "status")) or (
+                STATUS_UNREVIEWED if own == lib else "")
+            row[field_key(own, "objects")] = views[own].get(field_key(own, "objects"))
+            if own != LIB_POSE:
+                row[field_key(own, "flags")] = sorted(set(views[own].get(field_key(own, "flags")) or []))
+        rows.append(row)
     rows.sort(key=lambda r: str(r.get("imported_at") or ""), reverse=True)
     return rows
 
@@ -576,15 +624,19 @@ def delete_images(root: str, image_rels: Sequence[str], *, lib: str = LIB_POSE,
     """按单张删除图片与标注，批次记录保留，只把这些图从批次 ``items`` 里摘掉。
 
     与 :func:`delete_batches` 的区别是粒度——门户「文件管理」里勾掉几张传错的图，
-    不该连带丢掉整批。删除前同样在 ``.autolabel/deleted/`` 写快照（含两套标签原文）。
+    不该连带丢掉整批。删除前同样在 ``.autolabel/deleted/`` 写快照（含各库标签原文）。
 
-    :param lib: 从哪个库删（``pose`` / ``objects``）
-    :param mode: ``lib`` 只摘本库引用、素材留在池里；``purge`` 两个库一起摘并删素材文件
+    :param lib: 从哪个库删（``pose`` / ``objects`` / ``detect``），给 ``all`` 表示三个库的引用一起摘
+    :param mode: ``lib`` 只摘引用、素材留在池里；``purge`` 三个库一起摘并删素材文件
     :param keep_files: 仅 ``purge`` 有效，保留 ``images/`` 下的原图只删记录
     :param active_ids: 仍在跑任务的批次 ID；这些批次里的图默认拒绝删除
     """
     root = os.path.abspath(root)
-    lib = normalize(lib)
+    # ``batches`` 的 ``--lib`` 默认值就是 all。以前它一路 ``normalize("all")`` 之前
+    # 被 CLI 换成空串、再落到 pose——「三个库都摘掉这张图」于是变成只摘了姿态，
+    # 还回一句「仅姿态标注」，检测库和提示词库里那张图照旧躺着。
+    all_libs = str(lib or "").strip().lower() in ("", "all", "*")
+    lib = LIB_POSE if all_libs else normalize(lib)
     mode = str(mode or DELETE_LIB).strip().lower()
     if mode not in DELETE_MODES:
         raise ValueError(f"未知删除方式: {mode}（可用：{'、'.join(DELETE_MODES)}）")
@@ -594,12 +646,14 @@ def delete_images(root: str, image_rels: Sequence[str], *, lib: str = LIB_POSE,
     if not rels:
         raise ValueError("没有指定要删除的图片")
     live = None if active_ids is None else {str(b) for b in active_ids}
-    targets = list(LIBRARIES) if mode == DELETE_PURGE else [lib]
+    targets = list(LIBRARIES) if (mode == DELETE_PURGE or all_libs) else [lib]
     with _file_lock(root):
         snapshots: Dict[str, dict] = {}
         chosen: Dict[str, List[str]] = {}
         missing: List[str] = []
         busy: List[str] = []
+        absent: set = set()
+        found: set = set()
         owner_before: Dict[str, Dict[str, str]] = {}
         removed_files = 0
         for target in targets:
@@ -609,15 +663,20 @@ def delete_images(root: str, image_rels: Sequence[str], *, lib: str = LIB_POSE,
             keys = [_index_key(idx, rel) for rel in rels]
             for rel in keys:
                 if idx.get(rel) is None:
-                    if target == lib:
+                    absent.add(rel)
+                    if target == lib and not all_libs:
                         missing.append(rel)
                     continue
+                found.add(rel)
                 if live and str(idx.items[rel].get("batch_id") or "") in live:
                     busy.append(rel)
                     continue
                 chosen.setdefault(target, []).append(rel)
             owner_before[target] = {rel: str(idx.items[rel].get("batch_id") or "")
                                     for rel in chosen.get(target, [])}
+        if all_libs:
+            # 三个库都翻过了还没这张图，才算"不在索引里"
+            missing = sorted(absent - found)
         if busy:
             raise ValueError(f"{len(set(busy))} 张图片正在标注中（批次还在跑任务），"
                              f"先在主页点「清除任务」再删，例如 {os.path.basename(busy[0])}")
@@ -638,7 +697,7 @@ def delete_images(root: str, image_rels: Sequence[str], *, lib: str = LIB_POSE,
                 idx.remove(rel)
             _drop_from_batches(root, target, owner_before.get(target, {}), snapshot, idx)
             idx.save()
-        # 素材文件：只有两个库都不再引用（且这次是 purge）才真删
+        # 素材文件：只有所有库都不再引用（且这次是 purge）才真删
         if mode == DELETE_PURGE and not keep_files:
             for rel in sorted({rel for group in chosen.values() for rel in group}):
                 removed_files += _maybe_remove_pool(root, lib, rel)
@@ -646,7 +705,7 @@ def delete_images(root: str, image_rels: Sequence[str], *, lib: str = LIB_POSE,
         snapshot_path = _write_snapshot(root, snapshot) if snapshots else ""
 
     result = {"items": len(snapshots),
-              # 同一张素材可能从两个库各摘一次，removals 记"库×图"的粒度
+              # 同一张素材可能从几个库各摘一次，removals 记"库×图"的粒度
               "removals": sum(len(group) for group in chosen.values()),
               "files_removed": removed_files,
               "snapshot": snapshot_path, "keep_files": keep_files, "mode": mode, "lib": lib,
@@ -718,7 +777,7 @@ def delete_batches(root: str, batch_ids: Sequence[str], *, keep_files: bool = Fa
     if not ids:
         raise ValueError("没有指定要删除的批次")
     live = None if active_ids is None else {str(b) for b in active_ids}
-    # 「未分组」在每个库里各有一个桶，不带库名的写法等价于两个库一起清
+    # 「未分组」在每个库里各有一个桶，不带库名的写法等价于三个库一起清
     expanded: List[str] = []
     for batch_id in ids:
         if batch_id == UNGROUPED_ID:
@@ -794,6 +853,17 @@ def delete_batches(root: str, batch_ids: Sequence[str], *, keep_files: bool = Fa
 # 内部工具
 # --------------------------------------------------------------------------- #
 
+def module_counts(counts: Dict[str, int], lib: str) -> dict:
+    """从汇总结果里挑出某个库的进度小计（门户批次表一行里并排显示用）。"""
+    name = normalize(lib)
+    unit = _unit_key(name)
+    picked = {key: int(counts.get(_tally_key(name, key)) or 0)
+              for key in ("labeled", unit, "flagged") + STATUS_TALLY}
+    return {unit: picked[unit], "labeled": picked["labeled"],
+            "reviewed": sum(picked[key] for key in ("approved", "rejected", "edited")),
+            "unreviewed": picked["unreviewed"], "flagged": picked["flagged"]}
+
+
 def _row(record: dict, items: Sequence[dict], *, virtual: bool = False,
          lib: str = LIB_POSE) -> dict:
     files = [display_name(u) for u in record.get("uploads", [])][:6]
@@ -803,14 +873,8 @@ def _row(record: dict, items: Sequence[dict], *, virtual: bool = False,
         "id": str(record.get("id")), "name": record.get("name") or str(record.get("id")),
         "kind": record.get("kind", "unknown"), "source": record.get("source", "unknown"),
         "lib": lib, "module": module, "module_name": MODULE_NAMES.get(module, module),
-        # 两个模块各自的进度小计，门户批次表一行里并排显示
-        "pose": {"labeled": counts["labeled"], "people": counts["people"],
-                 "reviewed": counts["approved"] + counts["rejected"] + counts["edited"],
-                 "unreviewed": counts["unreviewed"], "flagged": counts["flagged"]},
-        "prompt": {"labeled": counts["prompt_labeled"], "boxes": counts["prompt_boxes"],
-                   "reviewed": counts["prompt_approved"] + counts["prompt_rejected"]
-                               + counts["prompt_edited"],
-                   "unreviewed": counts["prompt_unreviewed"], "flagged": counts["prompt_flagged"]},
+        # 每个模块各自的进度小计：pose / prompt / detect
+        **{MODULE_ROW_KEYS[item]: module_counts(counts, item) for item in LIBRARIES},
         "status": record.get("status", "unknown"), "created_at": record.get("created_at"),
         "finished_at": record.get("finished_at"), "message": record.get("message", ""),
         "params": record.get("params", {}), "files": files, "file_count": len(record.get("uploads", [])),
@@ -830,6 +894,7 @@ def batch_name(kind: str, names: Sequence[str], override: str = "") -> str:
         return str(override)[:80]
     names = [str(n) for n in names if n]
     label = {"video": "视频", "prompt": "提示词标注", "prompt_upload": "提示词素材",
+             "detect": "目标检测", "detect_upload": "检测素材",
              "pool": "素材池"}.get(kind, "图片")
     count = len(names) or 1
     head = names[0][:40] if names else "未命名"
@@ -837,7 +902,7 @@ def batch_name(kind: str, names: Sequence[str], override: str = "") -> str:
 
 
 def _item_snapshot(root: str, rel: str, item: dict, lib: str = LIB_POSE) -> dict:
-    """删除前的可恢复记录：两个库的标签原文都留着，事后能分开找回。"""
+    """删除前的可恢复记录：各库的标签原文都留着，事后能分开找回。"""
     entry = dict(item)
     entry["lib"] = lib
     entry["label_lines"] = _read_text(label_path_for(root, rel, lib))
@@ -847,9 +912,9 @@ def _item_snapshot(root: str, rel: str, item: dict, lib: str = LIB_POSE) -> dict
 
 
 def _merge_snapshot(existing: dict, new: dict) -> dict:
-    """同一张图被两个库同批删除时合并记录，标签原文以非空的那份为准。"""
+    """同一张图被几个库同批删除时合并记录，标签原文以非空的那份为准。"""
     merged = {**existing, **new}
-    for key in ("pose_label_lines", "objects_label_lines", "label_lines"):
+    for key in tuple(f"{name}_label_lines" for name in LIBRARIES) + ("label_lines",):
         merged[key] = existing.get(key) or new.get(key) or []
     return merged
 
@@ -884,7 +949,7 @@ def _remove_lib_files(root: str, lib: str, rel: str) -> int:
 
 
 def _remove_pool_files(root: str, rel: str) -> int:
-    """删掉共享素材池里的图片本体（只在两个库都不要时调用）。"""
+    """删掉共享素材池里的图片本体（只在所有库都不要时调用）。"""
     try:
         os.remove(resolve_image(root, rel))
         return 1
@@ -893,10 +958,10 @@ def _remove_pool_files(root: str, rel: str) -> int:
 
 
 def _maybe_remove_pool(root: str, lib: str, rel: str) -> int:
-    """另一个库还引用这张图就只摘引用，不删文件。"""
-    other = load_index_or_none(root, _other(lib))
-    if other and other.get(rel) is not None:
-        return 0
+    """还有别的库引用这张图就只摘本库引用，不删文件。"""
+    for other in _peers(root, lib).values():
+        if other.get(rel) is not None:  # type: ignore[union-attr]
+            return 0
     removed = _remove_pool_files(root, rel)
     if removed:
         stem = os.path.splitext(rel)[0]
@@ -926,6 +991,23 @@ def _write_snapshot(root: str, snapshot: dict) -> str:
     return path
 
 
+_SNAPSHOT_NAME = re.compile(r"^(\d{8}-\d{6})(?:-(\d+))?\.json$")
+
+
+def _snapshot_order(name: str) -> Tuple[str, int]:
+    """按"哪一份先写"给快照文件名排序。
+
+    同一秒里的多份靠 ``-1``、``-2`` 后缀区分，但按字符串排会乱：``-10`` 排在
+    ``-2`` 前面，而没有后缀的那一份（其实是一个秒里**最先**写的）反倒排到最后。
+    清理是从旧往新删，切点正好落在同一秒里时就会删掉更新的、留下更旧的。
+    认不出的名字排到最后，永远不会被当成旧快照删掉。
+    """
+    match = _SNAPSHOT_NAME.match(name)
+    if not match:
+        return (name, 10 ** 9)
+    return (match.group(1), int(match.group(2) or 0))
+
+
 def _prune_snapshots(folder: str) -> int:
     """删除快照只留最近 ``DELETE_SNAPSHOT_KEEP`` 份，返回清掉的份数。
 
@@ -934,7 +1016,8 @@ def _prune_snapshots(folder: str) -> int:
     一次清一批，免得每次删除都去动整个目录。
     """
     try:
-        names = sorted(name for name in os.listdir(folder) if name.endswith(".json"))
+        names = sorted((name for name in os.listdir(folder) if name.endswith(".json")),
+                       key=_snapshot_order)
     except OSError:
         return 0
     if len(names) <= DELETE_SNAPSHOT_KEEP + DELETE_SNAPSHOT_PRUNE_MARGIN:

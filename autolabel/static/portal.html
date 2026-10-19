@@ -7,7 +7,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230E1113'/%3E%3Cg fill='none' stroke='%23F5A524' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M16 12v8M16 14l-5 3M16 14l5 3M16 20l-4 6M16 20l4 6'/%3E%3C/g%3E%3Ccircle cx='16' cy='8' r='3.2' fill='%23F5A524'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/app.css">
 <script>
-/* 首屏先把主题与字号定好，免得先黑后白闪一下；选择存在这台浏览器，四个页面共用 */
+/* 首屏先把主题与字号定好，免得先黑后白闪一下；选择存在这台浏览器，五个页面共用 */
 (function () {
   try {
     var a = JSON.parse(localStorage.getItem("autolabel.appearance") || "{}") || {};
@@ -97,6 +97,7 @@
     <span class="sep"></span>
     <a class="iconbtn" href="/pose" title="姿态标注"><svg class="ic"><use href="#ic-target"/></svg></a>
     <a class="iconbtn" href="/objects" title="提示词标注"><svg class="ic"><use href="#ic-boxes"/></svg></a>
+    <a class="iconbtn" href="/detect" title="目标检测"><svg class="ic"><use href="#ic-cube"/></svg></a>
     <a class="iconbtn" href="/models" title="模型管理"><svg class="ic"><use href="#ic-cube"/></svg></a>
     <span class="sep"></span>
     <button class="iconbtn" id="rail-help" title="本页操作说明（?）"><svg class="ic"><use href="#ic-key"/></svg></button>
@@ -119,9 +120,9 @@
 
       <div class="model-section">
         <div class="model-section-head">
-          <span class="panel-title">两个标注库</span>
+          <span class="panel-title">三个标注库</span>
           <span class="spacer"></span>
-          <span class="muted small">各自记一本清单和标好的结果，图片存在同一个 <span class="mono">images/</span> 文件夹里不占双份</span>
+          <span class="muted small">各自记一本清单和标好的结果，图片存在同一个 <span class="mono">images/</span> 文件夹里不占双份；差别只在谁出框：骨骼靠姿态权重、提示词框靠大模型按描述找、检测框靠本机 YOLO 权重按自带类别出</span>
         </div>
         <div id="module-cards" class="module-grid"></div>
       </div>
@@ -130,6 +131,9 @@
         <div class="model-section-head">
           <span class="panel-title">导出训练用文件</span>
           <span class="spacer"></span>
+          <label class="muted small" title="留作验证集的比例：0.2 = 每 5 张抽 1 张做验证；填 0 就全部当训练集">验证集比例
+            <input type="number" id="export-val-ratio" value="0.2" min="0" max="0.9" step="0.05">
+          </label>
           <span class="muted small">按现在磁盘上标好的结果现算，含手工改过的内容</span>
         </div>
         <div id="export-rows"></div>
@@ -144,6 +148,7 @@
               <option value="all" selected>全部模块</option>
               <option value="pose">姿态标注</option>
               <option value="objects">提示词标注</option>
+              <option value="detect">目标检测</option>
             </select>
           </label>
           <span id="batch-count" class="muted small"></span>
@@ -154,12 +159,12 @@
           <button id="batch-delete" class="danger" disabled>删除所选批次</button>
           <button id="file-delete" class="danger" disabled>删除所选图片</button>
           <label class="muted small" title="不勾=只把图从当前库移除，图片文件和另一个库的标注都留着">
-            <input type="checkbox" id="purge-files"> 连图片文件一起删（两个库都移除）
+            <input type="checkbox" id="purge-files"> 连图片文件一起删（每个库都移除）
           </label>
         </div>
         <div class="muted small">每次导入算一批，点「看文件」展开就能逐张勾着删。默认只把图从它所在的那个库摘掉，
           <span class="mono">images/</span> 里的原图和另一个库已经标好的结果都不动；
-          勾上「连图片文件一起删」才会两个库一起摘掉并删文件。删掉的东西在
+          勾上「连图片文件一起删」才会把所有库一起摘掉并删文件。删掉的东西在
           <span class="mono">.autolabel/deleted/</span> 留有快照，误删能捞回来。</div>
       </div>
     </div>
@@ -178,13 +183,13 @@
 
 <div id="help-modal" class="modal hidden">
   <div class="modal-card">
-    <div class="modal-title">工作台怎么用<span class="muted small"> · 这里只是总览，改图要去两个标注库</span></div>
+    <div class="modal-title">工作台怎么用<span class="muted small"> · 这里只是总览，改图要去各个标注库</span></div>
     <div class="help-grid">
       <div class="panel-title">页面</div>
-      <div><span>共 4 个页面</span><span>工作台总览、姿态标注、提示词标注、模型管理</span></div>
-      <div><span>左侧竖条</span><span>随时在四个页面之间跳</span></div>
+      <div><span>共 5 个页面</span><span>工作台总览、姿态标注、提示词标注、目标检测、模型管理</span></div>
+      <div><span>左侧竖条</span><span>随时在五个页面之间跳</span></div>
       <div class="panel-title">快捷</div>
-      <div><span>⌘K</span><span>命令面板：导出、刷新、跳页面都能搜</span></div>
+      <div><span>⌘K</span><span>命令面板：导出、刷新、跳页面（含目标检测）都能搜</span></div>
         <div><span>⌥T</span><span>白天 / 夜晚</span></div>
         <div><span>⌥= / ⌥-</span><span>字号放大 / 缩小</span></div>
         <div><span>⌥S</span><span>系统设置（外观 + 推理算力）</span></div>

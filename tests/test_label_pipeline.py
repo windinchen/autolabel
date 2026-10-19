@@ -156,3 +156,32 @@ def test_ensemble_merge_box_follows_merged_keypoints():
     assert out.cx == pytest.approx(0.5)
     assert out.w == pytest.approx(0.1)
     assert "odd_aspect" not in person_sanity_flags(out, 1920, 1080)
+
+
+def test_forced_relabel_with_new_params_voids_the_old_approval(dataset, fake_backend):
+    """参数换了，框就是新的：当初那句「接受」作废，退回待复核重新确认。
+
+    以前 `--force` 换个 imgsz 重标，标签文件被模型改写、状态却还写着「已接受」，
+    导出 scope=approved 会把没人看过的框当人工确认过的成果送进训练集。
+    """
+    assert label(dataset)["labeled"] == 2
+    rel = next(iter(load_index(dataset).items))
+    approve_with_human_edit(dataset, rel)
+
+    stats = pipeline.label_dataset(dataset, BackendSettings(device="cpu", imgsz=960),
+                                   only_missing=False, verbose=False)
+    assert stats["labeled"] == 2
+    assert stats["verdict_reset"] == 1, stats
+    assert load_index(dataset).get(rel)["status"] == "unreviewed"
+
+
+def test_forced_relabel_with_the_same_params_keeps_the_approval(dataset, fake_backend):
+    """同一套参数重跑，结果本就一样，不该把人工接受的帧统统退回队列。"""
+    assert label(dataset)["labeled"] == 2
+    rel = next(iter(load_index(dataset).items))
+    approve_with_human_edit(dataset, rel)
+
+    stats = label(dataset, only_missing=False)
+    assert stats["verdict_reset"] == 0, stats
+    assert stats["skipped_reviewed"] == 1
+    assert load_index(dataset).get(rel)["status"] == "approved"

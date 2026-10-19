@@ -370,5 +370,25 @@ def test_dataset_status_tells_where_to_upload_empty_libs(tmp_path, capsys):
 
     assert main(["status", root]) == 0
     out = capsys.readouterr().out
-    assert "--lib pose" in out and "--lib objects" in out
+    assert "--lib pose" in out and "--lib objects" in out and "--lib detect" in out
     assert "每图人数" not in out and "框高度px" not in out
+    # 空着的库只给一行指路，不许再刷一行全 0：一屏 0 加一句"还没有素材"，
+    # 用户分不清是没数据还是软件读丢了
+    assert "姿态库 图片 0" not in out
+
+
+def test_status_of_detect_only_dataset_does_not_look_like_lost_data(tmp_path, capsys):
+    """只在目标检测库干过活：姿态库那两行全 0 最容易让人以为标注丢了。"""
+    root, rels = _shared_dataset(tmp_path)
+    from autolabel.dataset import adopt_from_pool
+
+    adopt_from_pool(root, list(rels), lib="detect")
+    idx = load_index(root)
+    for rel in list(idx.items):      # 清空姿态库，只留检测库
+        idx.remove(rel)
+    idx.save()
+
+    assert main(["status", root]) == 0
+    out = capsys.readouterr().out
+    assert "姿态库还没有素材" in out and "姿态库 图片 0" not in out
+    assert "目标检测 已标" in out

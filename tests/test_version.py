@@ -187,3 +187,73 @@ def test_frontend_never_hardcodes_a_version():
         "版本控件没挂进四个页面共用的 initNav()"
     assert "checkForUpdates" in common.split("function appearanceCommands() {", 1)[1], \
         "命令面板搜不到检查更新"
+
+
+def test_rewrite_only_accepts_three_part_versions(tmp_path):
+    """``version --bump`` 之外还有人手填版本号：``1.2`` 得挡住。
+
+    比较时 ``1.2`` == ``1.2.0``，写成 ``1.2`` 之后顶栏显示 v1.2、更新提示按 1.2.0
+    算，用户只觉得版本号没生效。四段同理，别让它悄悄进 main。
+    """
+    target = tmp_path / "version_copy.py"
+    target.write_text('VERSION = "1.2.4"\n', encoding="utf-8")
+
+    for bad in ("1.2", "1.2.3.4", "abc", "", "1.2.x"):
+        with pytest.raises(ValueError, match="三段数字"):
+            versioning.rewrite(bad, path=str(target))
+
+    old, new = versioning.rewrite("v1.3.0", path=str(target))
+    assert (old, new) == ("1.2.4", "1.3.0"), "带 v 前缀要归一化后再写回文件"
+    assert target.read_text(encoding="utf-8") == 'VERSION = "1.3.0"\n'
+
+
+# --- 第 18 轮体检：更新缓存是用户机器上一个会坏掉的普通文件 --------------- #
+
+def _write_cache(payload):
+    with open(versioning.cache_path(), "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+
+
+@pytest.mark.parametrize("checked_at", ["abc", {"x": 1}, [1], True, None, "", "2026-10-19"])
+def test_broken_checked_at_does_not_break_the_badge(checked_at):
+    """``checked_at`` 认不出来只能当"没查过"，不能让 ``float()`` 当场炸。
+
+    ``~/.autolabel/update.json`` 会被手改、被半截写入污染。以前 ``checked_at``
+    是字符串时 ``status()`` 直接 ValueError，``/api/version`` 变 500，顶栏版本
+    徽标和启动时的后台检查线程一起没——一个徽标拖垮一整页。
+    """
+    _write_cache({"latest": "9.9.9", "checked_at": checked_at, "source": "release"})
+
+    info = versioning.status()
+
+    assert info["current"] == versioning.VERSION
+    assert isinstance(info["checked_at"], float)
+
+
+def test_non_scalar_latest_is_not_rendered_as_a_python_literal():
+    """``{"latest": ["1.9.0"]}`` 以前会被 ``str()`` 渲染成 ``"['1.9.0']"``。"""
+    _write_cache({"latest": ["1.9.0"], "checked_at": 2 ** 31 + 1})
+
+    info = versioning.status()
+
+    assert info["latest"] == "" and info["checked"] is False
+    assert "[" not in json.dumps(info)
+
+
+def test_half_written_cache_file_is_just_an_empty_cache():
+    """JSON 只写了一半：按"没查过"处理，不抛。"""
+    with open(versioning.cache_path(), "w", encoding="utf-8") as fh:
+        fh.write('{"latest": "1.9.0", "checked_')
+
+    info = versioning.status(fetcher=lambda url: '{"tag_name": "v2.0.0"}')
+
+    assert info["latest"] == "2.0.0" and info["update_available"] is True
+
+
+def test_offline_with_a_broken_cache_still_explains_itself(monkeypatch):
+    monkeypatch.setenv("AUTOLABEL_OFFLINE", "1")
+    _write_cache({"latest": "1.9.0", "checked_at": "昨天"})
+
+    info = versioning.status(force=True)
+
+    assert info["latest"] == "1.9.0" and "离线" in info["note"]

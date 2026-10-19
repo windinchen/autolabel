@@ -96,6 +96,29 @@ def test_status_validation_and_unknown_image(dataset):
         store.read_item("nope.jpg")
 
 
+def test_review_actions_reject_images_deleted_elsewhere(dataset):
+    """另一页删掉图之后，这边点「接受」/「撤销」不能把没文件的幽灵行建回来。
+
+    实测过：接口用 upsert，1 张的库点一下就变成 2 张，多出来的那张打不开，
+    门户的「未标注」和缩略图列表跟着一起错。
+    """
+    from autolabel.batches import delete_images
+
+    first = seed(dataset)[0]
+    store = rv.ReviewStore(dataset)
+    store.write_item(first, store.read_item(first)["objects"], status="approved")
+    delete_images(dataset, [first], mode="purge")
+
+    for action in (lambda: store.set_status(first, "approved"),
+                   lambda: store.undo(first),
+                   lambda: store.set_prompt_status(first, "approved", "detect"),
+                   lambda: store.undo_prompt(first, "detect")):
+        with pytest.raises(ValueError, match="已不在"):
+            action()
+    assert ds.load_index(dataset).get(first) is None
+    assert ds.load_index(dataset, "detect").get(first) is None
+
+
 def test_dataset_payload_shape(dataset):
     seed(dataset)
     payload = rv.ReviewStore(dataset).dataset_payload()

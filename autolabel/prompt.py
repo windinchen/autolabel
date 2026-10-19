@@ -7,6 +7,10 @@
 - 类别表来自 ``autolabel/fields.py`` 的字段登记表，类别号 = 字段的 ``class_id``；
 - 索引里另开一组 ``prompt_*`` 字段记复核状态，姿态的 ``status`` 不受影响。
 
+本模块的检测框机制（读写标签、逐框质量标记、坐标导出、导出训练集）是**按库参数化**的：
+默认 ``lib=objects`` 服务提示词标注，目标检测库（``lib=detect``）由
+``autolabel/detect.py`` 带同样的参数复用同一套代码，不复制第二份。
+
 坐标约定与 ``vlm.py`` 一致：内部全用 0-1 归一化，提示词里让模型回 0-1000 整数。
 """
 
@@ -21,17 +25,26 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import fields as field_store
-from .library import LIB_OBJECTS
+from .library import (
+    LIB_DETECT,
+    LIB_OBJECTS,
+    field_key,
+    label_path_for,
+    labels_dir,
+    lib_name,
+    normalize as normalize_lib,
+    spec,
+)
 from .dataset import (
+    HUMAN_STATUSES,
     STATUS_APPROVED,
     STATUS_EDITED,
     STATUS_REJECTED,
     STATUS_UNREVIEWED,
     load_index,
     now_str,
-    prompt_label_path_for,
-    prompt_labels_dir,
     resolve_image,
+    source_missing,
 )
 
 VALID_PROMPT_STATUS = {STATUS_UNREVIEWED, STATUS_APPROVED, STATUS_EDITED, STATUS_REJECTED}
@@ -51,6 +64,21 @@ PROMPT_FLAG_HINTS = {
     "unknown_class": "标签里有登记表里不存在的类别号（字段被删过或手工改过盘）",
     "prompt_stale": "标注用的字段/描述与当前设置不一致，建议重新标注",
     "vlm_failed": "多模态大模型这次没答上（网络/超时/解析失败），框是旧的或缺失",
+    "manual": "人工补画或重画的框（不是模型给的），导出时置信度按 1 计",
+}
+
+#: 目标检测库的标记说明：框的质量标记与上面同一套，只有"整图级"的两条换了名字，
+#: 因为失败原因是本地模型而不是多模态大模型。
+DETECT_FLAG_HINTS = {
+    "no_classes": "还没有类别：先在「目标检测」页从模型类别表里勾选要标的类别",
+    "none_found": "这张图一个框都没有：可能画面里确实没有，也可能模型没认出来",
+    "small_box": "有框太小（短边不足 12 像素），训练时容易学不动",
+    "edge_box": "有框贴着画面边缘，目标可能被裁断",
+    "dup_box": "同类别有两个高度重叠的框，重复标注",
+    "unknown_class": "标签里有登记表里不存在的类别号（类别被删过或手工改过盘）",
+    "model_stale": "标注用的权重/类别/阈值与当前设置不一致，建议重新标注",
+    "model_failed": "这次推理失败（权重缺失/显存不足/读图失败），框是旧的或缺失",
+    "masked": "这一轮出自分割权重：多边形轮廓只按外接水平框记录，想要轮廓得换标注方式",
     "manual": "人工补画或重画的框（不是模型给的），导出时置信度按 1 计",
 }
 
@@ -75,6 +103,23 @@ OBJECT_COLUMN_DOC = {
     "image_flags": "整图标记（none_found/prompt_stale/vlm_failed）",
     "image_score": "该图所有框的平均置信度，人工补画的框按 1 计",
 }
+
+
+def object_column_doc(lib: str = LIB_OBJECTS) -> dict:
+    """列说明按库改口径：状态字段与整图标记的键名两个框类库不一样。
+
+    照抄提示词库那份给目标检测库，``meta.json`` 会告诉用户标记叫
+    ``prompt_stale``/``vlm_failed``，而 CSV 里躺着的是 ``model_stale``/``model_failed``。
+    """
+    name = normalize_lib(lib)
+    doc = dict(OBJECT_COLUMN_DOC)
+    if name == LIB_OBJECTS:
+        return doc
+    doc["status"] = "目标检测的复核状态 unreviewed/approved/edited/rejected"
+    doc["class_id"] = "YOLO detection 类别号（= 本库类别登记表里的 class_id，同名永不换号）"
+    doc["image_flags"] = "整图标记（none_found/model_stale/model_failed/masked）"
+    doc["image_score"] = "该图所有框的平均置信度（模型给的分数），人工补画的框按 1 计"
+    return doc
 
 
 # --------------------------------------------------------------------------- #
@@ -112,8 +157,8 @@ class Detection:
                 "xyxy": [round(v, 2) for v in (x1, y1, x2, y2)]}
 
 
-def read_detections(root: str, image_rel: str) -> List[Detection]:
-    path = prompt_label_path_for(root, image_rel)
+def read_detections(root: str, image_rel: str, lib: str = LIB_OBJECTS) -> List[Detection]:
+    path = label_path_for(root, image_rel, lib)
     return [Detection(cls=cls, cx=cx, cy=cy, w=w, h=h)
             for cls, cx, cy, w, h in field_store.read_label_rows(path)]
 
@@ -137,8 +182,9 @@ def apply_manual_marks(detections: List[Detection], indices: Sequence[int]) -> L
     return detections
 
 
-def write_detections(root: str, image_rel: str, detections: Sequence[Detection]) -> str:
-    return field_store.write_label_rows(prompt_label_path_for(root, image_rel),
+def write_detections(root: str, image_rel: str, detections: Sequence[Detection],
+                     lib: str = LIB_OBJECTS) -> str:
+    return field_store.write_label_rows(label_path_for(root, image_rel, lib),
                                        [d.row() for d in detections])
 
 
@@ -400,8 +446,14 @@ def box_flags(detections: Sequence[Detection], width: int, height: int,
 
 
 def image_flags(detections: Sequence[Detection], flags_per_box: Sequence[Sequence[str]],
-                signature: str = "", item_signature: str = "", failed: bool = False) -> List[str]:
-    """整图级标记，和姿态那套 flags 分开命名，避免界面筛选串味。"""
+                signature: str = "", item_signature: str = "", failed: bool = False,
+                stale_flag: str = "prompt_stale", failed_flag: str = "vlm_failed") -> List[str]:
+    """整图级标记，和姿态那套 flags 分开命名，避免界面筛选串味。
+
+    ``stale_flag``/``failed_flag`` 按库换名：提示词库是 ``prompt_stale``/``vlm_failed``，
+    目标检测库是 ``model_stale``/``model_failed``——同样是"这批框过期了"，
+    但原因和补救动作完全不同，界面要能一眼分开说。
+    """
     flags: List[str] = []
     if not detections:
         flags.append("none_found")
@@ -413,26 +465,33 @@ def image_flags(detections: Sequence[Detection], flags_per_box: Sequence[Sequenc
         flags.append("dup_box")
     if any("unknown_class" in f for f in flags_per_box):
         flags.append("unknown_class")
+    if any("masked" in f for f in flags_per_box):
+        flags.append("masked")
     if signature and item_signature and signature != item_signature:
-        flags.append("prompt_stale")
+        flags.append(stale_flag)
     if failed:
-        flags.append("vlm_failed")
+        flags.append(failed_flag)
     return sorted(set(flags))
 
 
-def prompt_priority(item: dict) -> int:
-    """提示词标注的复核优先级（越大越该先看）。"""
-    flags = set(item.get("prompt_flags") or [])
-    score = float(item.get("prompt_score") or 0.0)
-    if item.get("prompt_status") in (STATUS_REJECTED,):
+def prompt_priority(item: dict, lib: str = LIB_OBJECTS) -> int:
+    """检测框类库的复核优先级（越大越该先看）；``lib`` 决定读哪一组状态字段。
+
+    两个框库的标记名有一部分是同义的（``vlm_failed``/``model_failed``、
+    ``prompt_stale``/``model_stale``），这里一次认全，避免新库进来时漏项。
+    """
+    status = item.get(field_key(lib, "status"))
+    flags = set(item.get(field_key(lib, "flags")) or [])
+    score = float(item.get(field_key(lib, "score")) or 0.0)
+    if status == STATUS_REJECTED:
         return 0
-    weight = 60 if "vlm_failed" in flags else 0
+    weight = 60 if flags & {"vlm_failed", "model_failed"} else 0
     weight += 40 if "unknown_class" in flags else 0
     weight += 30 if flags & {"dup_box", "small_box"} else 0
-    weight += 20 if "prompt_stale" in flags else 0
+    weight += 20 if flags & {"prompt_stale", "model_stale"} else 0
     weight += 10 if "none_found" in flags else 0
     weight += 5 if "edge_box" in flags else 0
-    if item.get("prompt_status") == STATUS_UNREVIEWED:
+    if status == STATUS_UNREVIEWED:
         weight += 3
     weight += max(0.0, 30 - score * 30)
     return int(weight)
@@ -512,14 +571,14 @@ def run_prompt_labeling(
     signature = signature_for(picked, profile["id"], extra_hint)
     protected = 0
     if not overwrite:
-        # 重复跑只补新图：同签名标过的、人工接受过的、人工画过框的都不动，
+        # 重复跑只补新图：同签名标过的、人工接受过 / 改过的、人工画过框的都不动，
         # 否则模型一句"没找到"就把人花过时间的框抹掉了（实测踩过）
         kept = []
         for rel in targets:
             item = idx.get(rel) or {}
             relabeled = (item.get("prompt_signature") == signature
                          and item.get("prompt_objects") is not None)
-            human = (item.get("prompt_status") == STATUS_APPROVED
+            human = (item.get("prompt_status") in HUMAN_STATUSES
                      or int(item.get("prompt_manual") or 0) > 0)
             if relabeled or human:
                 protected += 1
@@ -592,56 +651,64 @@ def run_prompt_labeling(
 # 汇总与坐标导出
 # --------------------------------------------------------------------------- #
 
-def prompt_summary(root: str) -> dict:
-    """提示词标注总览（不解析标签以外的信息，成本低）。"""
-    idx = load_index(root, LIB_OBJECTS)
+def prompt_summary(root: str, lib: str = LIB_OBJECTS) -> dict:
+    """本库总览（只数索引与标签行数，不额外解码图片，成本低）。"""
+    lib = normalize_lib(lib)
+    idx = load_index(root, lib)
     counts = {"images": len(idx.items), "labeled": 0, "unreviewed": 0, "reviewed": 0}
     status_counts: Dict[str, int] = {}
     flag_counts: Dict[str, int] = {}
     per_field: Dict[str, int] = {}
     boxes = 0
-    names = {int(f.get("class_id", -1)): f.get("name", "") for f in field_store.list_fields(root)}
+    names = {int(f.get("class_id", -1)): f.get("name", "") for f in field_store.list_fields(root, lib)}
     for _rel, item in idx.ordered_items():
-        if item.get("prompt_objects") is None:
+        if item.get(field_key(lib, "objects")) is None:
             counts["unreviewed"] += 1
             continue
         counts["labeled"] += 1
-        status = str(item.get("prompt_status") or STATUS_UNREVIEWED)
+        status = str(item.get(field_key(lib, "status")) or STATUS_UNREVIEWED)
         status_counts[status] = status_counts.get(status, 0) + 1
         if status in (STATUS_APPROVED, STATUS_EDITED):
             counts["reviewed"] += 1
-        for flag in item.get("prompt_flags") or []:
+        for flag in item.get(field_key(lib, "flags")) or []:
             flag_counts[flag] = flag_counts.get(flag, 0) + 1
-    for _rel, rows in field_store._iter_prompt_labels(root):
+    for _rel, rows in field_store._iter_box_labels(root, lib):
         boxes += len(rows)
         for row in rows:
             name = names.get(row[0]) or f"class_{row[0]}"
             per_field[name] = per_field.get(name, 0) + 1
     return {**counts, "boxes": boxes, "status_counts": status_counts,
-            "flag_counts": flag_counts, "per_field": per_field,
-            "flag_hints": PROMPT_FLAG_HINTS,
-            "orphans": field_store.orphan_class_ids(root)}
+            "flag_counts": flag_counts, "per_field": per_field, "per_class": per_field,
+            "lib": lib, "lib_name": lib_name(lib),
+            "flag_hints": DETECT_FLAG_HINTS if lib == LIB_DETECT else PROMPT_FLAG_HINTS,
+            "orphans": field_store.orphan_class_ids(root, lib)}
 
 
-def collect_object_records(root: str, exclude_status: Sequence[str] = ("rejected",)) -> Tuple[List[dict], dict]:
-    """把 ``prompt_labels/`` 解析成带像素坐标的记录，供 CSV/JSONL 与界面复用。"""
-    idx = load_index(root, LIB_OBJECTS)
-    names = {int(f.get("class_id", -1)): f for f in field_store.list_fields(root)}
+def collect_object_records(root: str, exclude_status: Sequence[str] = ("rejected",),
+                           lib: str = LIB_OBJECTS) -> Tuple[List[dict], dict]:
+    """把本库标签目录解析成带像素坐标的记录，供 CSV/JSONL 与界面复用。"""
+    lib = normalize_lib(lib)
+    idx = load_index(root, lib)
+    names = {int(f.get("class_id", -1)): f for f in field_store.list_fields(root, lib)}
+
+    def key(name: str) -> str:
+        return field_key(lib, name)
+
     skip = set(exclude_status)
     records: List[dict] = []
     skipped: List[dict] = []
     for rel, item in idx.ordered_items():
-        status = str(item.get("prompt_status") or STATUS_UNREVIEWED)
+        status = str(item.get(key("status")) or STATUS_UNREVIEWED)
         if status in skip:
-            skipped.append({"image": rel, "reason": f"prompt_status={status}"})
+            skipped.append({"image": rel, "reason": f"{key('status')}={status}"})
             continue
-        if item.get("prompt_objects") is None:
-            skipped.append({"image": rel, "reason": "未做提示词标注"})
+        if item.get(key("objects")) is None:
+            skipped.append({"image": rel, "reason": f"未做{lib_name(lib)}"})
             continue
         width = int(item.get("width") or 0)
         height = int(item.get("height") or 0)
-        detections = apply_manual_marks(read_detections(root, rel),
-                                       item.get("prompt_manual_boxes") or [])
+        detections = apply_manual_marks(read_detections(root, rel, lib),
+                                       item.get(key("manual_boxes")) or [])
         per_box = box_flags(detections, width, height, list(names))
         objects = []
         for index, detection in enumerate(detections):
@@ -657,15 +724,20 @@ def collect_object_records(root: str, exclude_status: Sequence[str] = ("rejected
             })
         records.append({
             "image": rel, "status": status, "width": width, "height": height,
-            "image_score": item.get("prompt_score"), "image_flags": list(item.get("prompt_flags") or []),
-            "prompt_profile": item.get("prompt_profile") or "", "time_sec": item.get("time_sec"),
+            "image_score": item.get(key("score")), "image_flags": list(item.get(key("flags")) or []),
+            # 这批框出自谁：提示词库是多模态配置名，目标检测库是权重文件名
+            "prompt_profile": item.get("prompt_profile") or "",
+            "labeled_by": item.get(key("profile")) or item.get(key("model")) or "",
+            "time_sec": item.get("time_sec"),
             "video": item.get("video"), "source": item.get("source"), "objects": objects,
         })
     meta = {
+        "lib": lib, "lib_name": lib_name(lib),
         "fields": [{"class_id": cid, "name": row.get("name"), "label": row.get("label"),
-                    "prompt_hint": row.get("prompt_hint", "")} for cid, row in sorted(names.items())],
+                    "prompt_hint": row.get("prompt_hint", ""),
+                    "source": row.get("source", "")} for cid, row in sorted(names.items())],
         "source_dataset": os.path.abspath(root), "generated_at": now_str(),
-        "filter": {"exclude_status": sorted(skip)}, "columns": OBJECT_COLUMN_DOC,
+        "filter": {"exclude_status": sorted(skip)}, "columns": object_column_doc(lib),
         "skipped": skipped,
     }
     return records, meta
@@ -699,13 +771,15 @@ def _write_object_wide(path: str, records: Sequence[dict]) -> int:
 
 
 def write_object_coordinate_files(root: str, out: Optional[str] = None, tag: Optional[str] = None,
-                                  exclude_status: Sequence[str] = ("rejected",)) -> dict:
-    """生成提示词标注的坐标文件（CSV + JSONL + meta + summary）。"""
+                                  exclude_status: Sequence[str] = ("rejected",),
+                                  lib: str = LIB_OBJECTS) -> dict:
+    """生成本库的坐标文件（CSV + JSONL + meta + summary）。"""
     from .coords import coords_dir
 
-    records, meta = collect_object_records(root, exclude_status=exclude_status)
+    lib = normalize_lib(lib)
+    records, meta = collect_object_records(root, exclude_status=exclude_status, lib=lib)
     stamp = tag or now_str().replace(" ", "_").replace(":", "")
-    out_root = os.path.abspath(out or os.path.join(coords_dir(root), f"{stamp}-prompt"))
+    out_root = os.path.abspath(out or os.path.join(coords_dir(root), f"{stamp}-{spec(lib)['prefix']}"))
     os.makedirs(out_root, exist_ok=True)
     files = {
         "objects.csv": os.path.join(out_root, "objects.csv"),
@@ -726,6 +800,8 @@ def write_object_coordinate_files(root: str, out: Optional[str] = None, tag: Opt
         summary["status_counts"][rec["status"]] = summary["status_counts"].get(rec["status"], 0) + 1
         for obj in rec["objects"]:
             summary["per_field"][obj["class_name"]] = summary["per_field"].get(obj["class_name"], 0) + 1
+    summary["lib"] = meta["lib"]
+    summary["lib_name"] = meta["lib_name"]
     with open(os.path.join(out_root, "meta.json"), "w", encoding="utf-8") as fh:
         json.dump(meta, fh, ensure_ascii=False, indent=2)
     with open(os.path.join(out_root, "summary.json"), "w", encoding="utf-8") as fh:
@@ -739,20 +815,24 @@ OBJECT_DOWNLOAD_NAMES = {"csv": "objects.csv", "jsonl": "objects.jsonl"}
 
 
 def render_object_coords(root: str, fmt: str = "csv",
-                         exclude_status: Sequence[str] = ("rejected",)) -> Tuple[str, bytes]:
+                         exclude_status: Sequence[str] = ("rejected",),
+                         lib: str = LIB_OBJECTS) -> Tuple[str, bytes]:
     """按需生成单个坐标文件（不落盘），给界面的「下载坐标」用。"""
     if fmt not in OBJECT_DOWNLOAD_NAMES:
         raise ValueError(f"未知格式: {fmt}（可选 {', '.join(OBJECT_DOWNLOAD_NAMES)}）")
-    tmp = tempfile.mkdtemp(prefix="autolabel_objects_")
+    lib = normalize_lib(lib)
+    tmp = tempfile.mkdtemp(prefix="autolabel_%s_" % spec(lib)["prefix"])
     try:
         result = write_object_coordinate_files(os.path.abspath(root), out=tmp,
-                                               exclude_status=exclude_status)
+                                               exclude_status=exclude_status, lib=lib)
         with open(result["files"][OBJECT_DOWNLOAD_NAMES[fmt]], "rb") as fh:
             body = fh.read()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in os.path.basename(os.path.abspath(root)))
-    return f"{safe or 'dataset'}-{OBJECT_DOWNLOAD_NAMES[fmt]}", body
+    prefix = spec(lib)["prefix"]
+    name = OBJECT_DOWNLOAD_NAMES[fmt] if prefix == "prompt" else f"{prefix}-{OBJECT_DOWNLOAD_NAMES[fmt]}"
+    return f"{safe or 'dataset'}-{name}", body
 
 
 def export_detection_dataset(
@@ -765,19 +845,32 @@ def export_detection_dataset(
     max_empty_ratio: float = 0.15,
     mode: str = "symlink",
     tag: Optional[str] = None,
+    lib: str = LIB_OBJECTS,
 ) -> dict:
     """导出可直接喂 ``yolo detect train`` 的目录（train/val + data.yaml）。
 
     类别号会被重映射成连续的 0..N-1：登记表里删过字段时，标签里的 ``class_id``
     可能不连续，而 YOLO 要求 ``names`` 的键从 0 连续递增。
     """
-    from .export import (_place, content_fingerprint, find_reusable_export, rank_for_split,
-                         skipped_summary, split_val_set, unique_export_dir)
+    from .export import (MISSING_SOURCE_REASON, _place, content_fingerprint,
+                         find_reusable_export, prune_stale, rank_for_split, skipped_summary,
+                         split_val_set, unique_export_dir, unique_stem, yaml_comment, yaml_scalar)
 
-    records, meta = collect_object_records(root, exclude_status=exclude_status)
+    lib = normalize_lib(lib)
+    records, meta = collect_object_records(root, exclude_status=exclude_status, lib=lib)
+    # 与姿态库同一口径：源图已经不在磁盘上的帧不进导出集（宁可少一帧，也不能让
+    # 训练集里躺一张读不出来的图），原因照样写进 skipped 给用户看。
+    missing = [rec["image"] for rec in records
+               if source_missing(root, str(rec["image"] or ""))]
+    if missing:
+        gone = set(missing)
+        records = [rec for rec in records if rec["image"] not in gone]
     used = sorted({obj["cls"] for rec in records for obj in rec["objects"]})
     if not used:
-        raise ValueError("还没有任何提示词标注框可导出：先跑一次标注（界面「提示词标注」或 autolabel prompt）")
+        raise ValueError(f"还没有任何{lib_name(lib)}框可导出：先跑一次标注"
+                         f"（界面「{lib_name(lib)}」，命令行 autolabel "
+                         f"{'prompt' if lib == LIB_OBJECTS else 'detect'}）"
+                         + (f"；另有 {len(missing)} 帧的源文件在 images/ 里找不到了" if missing else ""))
     remap = {cls: index for index, cls in enumerate(used)}
     names = {row["class_id"]: row for row in meta["fields"]}
 
@@ -800,29 +893,34 @@ def export_detection_dataset(
          for rec in selected],
         params=json.dumps({"val_ratio": val_ratio, "max_empty_ratio": max_empty_ratio,
                            "mode": mode, "seed": seed, "exclude": sorted(exclude_status),
-                           "used": used, "filter": meta.get("filter")},
+                           "used": used, "filter": meta.get("filter"), "lib": lib},
                           sort_keys=True, default=str))
     # 与姿态库同理：内容没变就复用最近那份，别在 exports/ 里堆重复目录
+    kind = "detect" if lib == LIB_OBJECTS else "yolo_detect"
+    meta_name = "prompt_meta.json" if lib == LIB_OBJECTS else "yolo_meta.json"
+    suffix = "detect" if lib == LIB_OBJECTS else "yolo-detect"
     if not out and not tag:
-        reused = find_reusable_export(root, fingerprint, kind="detect")
+        reused = find_reusable_export(root, fingerprint, kind=kind)
         if reused is not None:
             return reused
     tag = tag or now_str().replace(" ", "_").replace(":", "")
     if out:
         out_root = os.path.abspath(out)
     else:
-        out_root = unique_export_dir(os.path.abspath(os.path.join(root, "exports", f"{tag}-detect")))
+        out_root = unique_export_dir(os.path.abspath(os.path.join(root, "exports", f"{tag}-{suffix}")))
     for split in ("train", "val"):
         os.makedirs(os.path.join(out_root, "images", split), exist_ok=True)
         os.makedirs(os.path.join(out_root, "labels", split), exist_ok=True)
 
     counts = {"train": 0, "val": 0, "boxes": {"train": 0, "val": 0}, "empty": len(empty),
-              "empty_dropped": len(empty_dropped), "dropped": 0}
+              "empty_dropped": len(empty_dropped), "dropped": 0, "missing_source": len(missing)}
+    written: Dict[str, set] = {"train": set(), "val": set()}
+    taken: Dict[str, str] = {}
     for rec in selected:
         split = "val" if rec["image"] in val_set else "train"
         from .export import export_stem
 
-        stem = export_stem(rec["image"])
+        stem = unique_stem(taken, export_stem(rec["image"]), rec["image"])
         dst_img = os.path.join(out_root, "images", split, stem + os.path.splitext(rec["image"])[1])
         dst_lbl = os.path.join(out_root, "labels", split, stem + ".txt")
         _place(resolve_image(root, rec["image"]), dst_img, mode)
@@ -837,23 +935,31 @@ def export_detection_dataset(
             fh.write("".join(line + "\n" for line in lines))
         counts[split] += 1
         counts["boxes"][split] += len(lines)
+        written[split].add(stem)
+    # 与姿态库一致：重复导到同一个目录时，这一版不要的帧得从磁盘上清掉
+    counts["pruned"] = prune_stale(out_root, written)
 
-    lines = [f"# 由自动标注系统生成 on {now_str()}（提示词标注 / YOLO detection）",
+    lines = [f"# 由自动标注系统生成 on {now_str()}（{lib_name(lib)} / YOLO detection）",
              f"path: {out_root}", "train: images/train", "val: images/val"]
     labels = []
     for cls in used:
         field_row = names.get(cls) or {}
         name = str(field_row.get("name") or f"class_{cls}")
-        labels.append(f"# names 显示名：{name} = {field_row.get('label') or name}")
+        labels.append("# names 显示名：%s = %s"
+                      % (yaml_comment(name), yaml_comment(field_row.get("label") or name)))
     lines.append("names:")
     for cls in used:
         field_row = names.get(cls) or {}
-        lines.append(f"  {remap[cls]}: {field_row.get('name') or f'class_{cls}'}")
+        label = str(field_row.get("name") or f"class_{cls}")
+        # 带空格的类别名（COCO 的 potted plant 之类）在 YAML 里是合法明文，
+        # 但含 : # 等符号就会解析错位，交给 export.yaml_scalar 统一判断
+        lines.append(f"  {remap[cls]}: {yaml_scalar(label)}")
     data_yaml = "\n".join(lines[:1] + labels + lines[1:]) + "\n"
     with open(os.path.join(out_root, "data.yaml"), "w", encoding="utf-8") as fh:
         fh.write(data_yaml)
-    with open(os.path.join(out_root, "prompt_meta.json"), "w", encoding="utf-8") as fh:
+    with open(os.path.join(out_root, meta_name), "w", encoding="utf-8") as fh:
         json.dump({"generated_at": now_str(), "source_dataset": meta["source_dataset"],
+                   "lib": lib, "lib_name": lib_name(lib),
                    "fields": meta["fields"], "class_remap": {str(k): v for k, v in remap.items()},
                    "counts": counts, "filter": meta["filter"],
                    "max_empty_ratio": max_empty_ratio,
@@ -864,6 +970,7 @@ def export_detection_dataset(
                for row in (meta.get("skipped") or []) if isinstance(row, dict)]
     reasons += [(rec["image"], f"背景图超出比例上限（上限 {max_empty_ratio:.0%}）")
                 for rec in empty_dropped]
+    reasons += [(rel, MISSING_SOURCE_REASON) for rel in missing]
     return {"out": out_root, "images": len(selected), "train": counts["train"], "val": counts["val"],
             "skipped": len(reasons), "skipped_note": skipped_summary(reasons),
             "boxes": counts["boxes"], "classes": [
@@ -872,17 +979,18 @@ def export_detection_dataset(
             "counts": counts, "data_yaml": os.path.join(out_root, "data.yaml")}
 
 
-def write_prompt_files(root: str) -> int:
+def write_prompt_files(root: str, lib: str = LIB_OBJECTS) -> int:
     """给标注过但缺文件的图补空标签，返回补建数量（空文件=看过确实没目标）。"""
-    idx = load_index(root, LIB_OBJECTS)
+    lib = normalize_lib(lib)
+    idx = load_index(root, lib)
     made = 0
     for rel, item in idx.ordered_items():
-        if item.get("prompt_objects") is None:
+        if item.get(field_key(lib, "objects")) is None:
             continue
-        path = prompt_label_path_for(root, rel)
+        path = label_path_for(root, rel, lib)
         if not os.path.exists(path):
             field_store.write_label_rows(path, [])
             made += 1
     if made:
-        os.makedirs(prompt_labels_dir(root), exist_ok=True)
+        os.makedirs(labels_dir(root, lib), exist_ok=True)
     return made

@@ -112,7 +112,7 @@ def test_pose_page_no_longer_houses_model_panel(server):
 
 def test_unknown_route_returns_json_404(server):
     status, payload, _ = get(server[0], "/nope")
-    assert status == 404 and "not found" in payload["error"]
+    assert status == 404 and "没有这个接口" in payload["error"]
 
 
 # --------------------------------------------------------------------------- //
@@ -405,8 +405,11 @@ def test_batches_payload_groups_progress_by_module(server):
     rows = {row["id"]: row for row in payload["batches"]}
     assert rows[batch["id"]]["module"] == "pose"
     # 姿态库 = 这次建的批次 + 剩下 1 张的"未分组"虚拟行，两本账分开算
-    assert payload["by_module"]["pose"] == {"label": "姿态标注", "batches": 2, "items": 2,
-                                            "labeled": 0, "prompt_labeled": 0, "prompt_boxes": 0}
+    pose_side = {key: payload["by_module"]["pose"][key]
+                 for key in ("label", "batches", "items", "labeled", "people",
+                             "reviewed", "unreviewed", "flagged")}
+    assert pose_side == {"label": "姿态标注", "batches": 2, "items": 2, "labeled": 0,
+                         "people": 0, "reviewed": 0, "unreviewed": 2, "flagged": 0}
     assert payload["by_module"]["objects"]["batches"] == 1
     assert payload["by_module"]["objects"]["items"] == 2
     assert payload["module_names"]["objects"] == "提示词标注"

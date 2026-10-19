@@ -15,16 +15,19 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence
 
-from .dataset import now_str
+from .dataset import IMAGE_EXTS as IMPORTABLE_IMAGE_EXTS, now_str
 from .batches import attach_items, batch_name, create_batch, display_name, finish_batch
 
-from .library import LIB_OBJECTS, LIB_POSE
+from .library import LIB_DETECT, LIB_OBJECTS, LIB_POSE
 
 UPLOAD_CHUNK = 1 << 20  # 上传落盘时的分块大小：1 MB
 # 上次进程被打断时留下的上传临时文件，超过这个小时数就在启动时清掉
 STALE_UPLOAD_HOURS = 24
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+#: 浏览器能传的 = 命令行能导的，两处同一个口径。导入时统一转码成 JPEG，
+#: 界面从不直接看原图，所以 ``<img>`` 渲染不出来的 TIFF 照样能收——以前就差
+#: ``.tif``/``.tiff`` 两个后缀，同一个文件命令行导得进、界面里报"不支持的文件类型"。
+IMAGE_EXTS = set(IMPORTABLE_IMAGE_EXTS)
 VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".flv", ".wmv",
               ".mts", ".m2ts", ".ts", ".mpg", ".mpeg", ".3gp"}
 # 保留中文与常见安全字符，其余替换为下划线
@@ -72,8 +75,13 @@ def prune_stale_uploads(root: str, max_age_hours: float = STALE_UPLOAD_HOURS) ->
 
 
 def lib_for_kind(kind: str) -> str:
-    """任务类型 → 标注库：``prompt*`` 归提示词库，其余归姿态库。"""
-    return LIB_OBJECTS if str(kind or "").startswith("prompt") else LIB_POSE
+    """任务类型 → 标注库：``prompt*`` 归提示词库，``detect*`` 归目标检测库，其余归姿态库。"""
+    name = str(kind or "")
+    if name.startswith("prompt"):
+        return LIB_OBJECTS
+    if name.startswith("detect"):
+        return LIB_DETECT
+    return LIB_POSE
 
 
 def uploads_dir(root: str) -> str:
@@ -232,17 +240,18 @@ class JobStore:
 
     # --- 对外 ---
     def submit(self, kind: str, files: Sequence[str], params: Optional[dict] = None) -> Job:
-        if kind not in ("image", "video", "prompt", "prompt_upload"):
+        if kind not in ("image", "video", "prompt", "prompt_upload", "detect", "detect_upload"):
             raise ValueError(f"未知任务类型: {kind}")
-        if kind == "prompt":
-            # 提示词标注跑的是已入库的图片，files 是 images/ 下的相对路径，不能被 basename 削掉子目录
+        # 只跑标注不入库的那两类，files 是本库索引里的相对路径，不能被 basename 削掉子目录
+        rel_paths = kind in ("prompt", "detect")
+        if rel_paths:
             files = [str(f).replace("\\", "/") for f in files if str(f).strip()]
             files = self._known_images(files, lib_for_kind(kind))
         else:
             files = [os.path.basename(f) for f in files if f]
         if not files:
             raise ValueError("没有收到文件")
-        if kind != "prompt":
+        if not rel_paths:
             for name in files:
                 if not os.path.exists(os.path.join(uploads_dir(self.root), name)):
                     raise FileNotFoundError(f"上传文件不存在或已清理: {name}")
@@ -265,7 +274,9 @@ class JobStore:
         missing = [rel for rel in rels if index.get(rel) is None]
         known = [rel for rel in rels if index.get(rel) is not None]
         if missing:
-            print(f"[warn] 提示词任务跳过不存在的图片 {len(missing)} 张，例如 {missing[0]}")
+            from .library import lib_name
+
+            print(f"[warn] {lib_name(lib)}任务跳过不存在的图片 {len(missing)} 张，例如 {missing[0]}")
         return known
 
     @staticmethod
@@ -351,6 +362,10 @@ class JobStore:
                 self._run_prompt(job)
             elif job.kind == "prompt_upload":
                 self._run_prompt_upload(job)
+            elif job.kind == "detect":
+                self._run_detect(job)
+            elif job.kind == "detect_upload":
+                self._run_detect_upload(job)
             else:
                 self._run_import(job)
         except JobCancelled as exc:
@@ -416,6 +431,8 @@ class JobStore:
                     "video_dedupe": params.get("video_dedupe"),
                     "vlm_profile": params.get("vlm_profile") or "",
                     "prompt_fields": params.get("prompt_fields") or [],
+                    "detect_classes": params.get("detect_classes") or [],
+                    "conf": params.get("conf"),
                     "overwrite": bool(params.get("overwrite")),
                     "prompt_extra": params.get("prompt_extra") or "",
                     "targets": len(job.files)},
@@ -624,8 +641,121 @@ class JobStore:
         job.finished, job.ok = True, True
         finish_batch(self.root, job.batch_id, "done", job.message)
 
+    # --- 目标检测任务：本地 YOLO 权重出它自带的类别，不联网、比多模态快一个数量级 ---
+    def _detect_targets(self, job: Job):
+        """这次任务用哪个权重、标哪些类别、跑在什么算力上。"""
+        from . import detect
+        from . import settings as system
+
+        model = detect.resolve_model(str(job.params.get("model") or ""), self.root)
+        wanted = job.params.get("detect_classes") or []
+        if isinstance(wanted, str):
+            wanted = [item.strip() for item in wanted.split(",") if item.strip()]
+        device = str(job.params.get("device") or "") or system.label_defaults().get("device", "")
+        conf = job.params.get("conf")
+        return model, [str(item) for item in wanted], device, (float(conf) if conf not in (None, "") else None)
+
+    def _detect_label(self, job: Job, model: str, classes: Sequence[str], device: str,
+                      conf: Optional[float], images: Optional[List[str]] = None) -> dict:
+        from . import detect
+
+        targets = list(images) if images is not None else (list(job.files) or None)
+        return detect.run_detect_labeling(
+            self.root, model=model, classes=list(classes), images=targets,
+            overwrite=bool(job.params.get("overwrite")), device=device, conf=conf,
+            progress=self._progress_writer(job),
+            should_stop=lambda: bool(job.cancel_requested), verbose=False)
+
+    def _progress_writer(self, job: Job):
+        def progress(done: int, total: int) -> None:
+            job.set_stage("labeling", f"目标检测 {done}/{total}", done=done, total=total)
+
+        return progress
+
+    def _detect_coords(self, job: Job) -> str:
+        from .detect import write_detect_coordinate_files
+
+        return str(write_detect_coordinate_files(self.root, tag=f"detect-{job.id}")["out"])
+
+    def _detect_done_text(self, stats: dict, ingested: int = 0) -> str:
+        """完成消息：把"多少张没覆盖"讲清楚，否则用户以为任务没跑。"""
+        parts = [f"入库 {ingested} 张"] if ingested else []
+        parts.append(f"标注 {stats.get('labeled', 0)} 张，产出 {stats.get('boxes', 0)} 个框")
+        if stats.get("protected"):
+            parts.append(f"{stats['protected']} 张人工接受过或画过框的图未覆盖（勾「覆盖已有框」可重标）")
+        if stats.get("failed"):
+            parts.append(f"{stats['failed']} 张推理失败")
+        if stats.get("missing_classes"):
+            parts.append(f"该权重认不出 {'、'.join(str(x) for x in stats['missing_classes'])}")
+        return "完成：" + "；".join(parts)
+
+    def _run_detect(self, job: Job) -> None:
+        """已入库的图批量跑目标检测：不导入、不跑姿态，产出只进 ``detect_labels/``。"""
+        model, classes, device, conf = self._detect_targets(job)
+        total = len(job.files)
+        names = "、".join(classes) or "（本库类别表里全部）"
+        job.set_stage("labeling",
+                      f"用 {os.path.basename(model)} 标注【{names}】，共 {total} 张"
+                      f"（本地推理，比多模态大模型快得多）0/{total}",
+                      done=0, total=total)
+        stats = self._detect_label(job, model, classes, device, conf)
+        self._check(job)
+        job.set_stage("coords", "生成坐标文件")
+        coords = self._detect_coords(job)
+        job.result = {"labeled": stats.get("labeled", 0), "boxes": stats.get("boxes", 0),
+                      "failed": stats.get("failed", 0), "protected": stats.get("protected", 0),
+                      "missing_classes": stats.get("missing_classes", []),
+                      "model": stats.get("model", model), "coords": coords,
+                      "batch_id": job.batch_id, "classes": names}
+        job.set_stage("done", self._detect_done_text(stats))
+        job.finished, job.ok = True, True
+        finish_batch(self.root, job.batch_id, "done", job.message)
+
+    def _run_detect_upload(self, job: Job) -> None:
+        """目标检测模块的上传：入库 →（可选）本地权重出框 → 写检测框坐标。"""
+        job.set_stage("importing", f"导入 {len(job.files)} 个文件")
+        ingested = self._ingest(job)
+        rels = list(job.ingested)
+        job.set_stage("importing", f"入库 {ingested} 张", done=0, total=len(rels))
+        if not rels:
+            self._cleanup(job)
+            job.result = {"imported": 0, "labeled": 0, "boxes": 0, "batch_id": job.batch_id}
+            job.set_stage("done", "完成：没有新图入库（可能与已有图片重复，或文件里没有可用图片）")
+            job.finished, job.ok = True, True
+            finish_batch(self.root, job.batch_id, "done", job.message)
+            return
+
+        self._check(job)
+        stats = {"labeled": 0, "boxes": 0, "failed": 0, "protected": 0, "missing_classes": []}
+        model, classes, device, conf = self._detect_targets(job)
+        names = "、".join(classes) or "（本库类别表里全部）"
+        if job.params.get("label", True):
+            def progress(done: int, total: int) -> None:
+                job.set_stage("labeling", f"目标检测 {done}/{total} · {os.path.basename(model)}",
+                              done=done, total=total)
+
+            job.set_stage("labeling",
+                          f"用 {os.path.basename(model)} 标注【{names}】，共 {len(rels)} 张"
+                          f"（本地推理，比多模态大模型快得多）0/{len(rels)}",
+                          done=0, total=len(rels))
+            stats = self._detect_label(job, model, classes, device, conf, images=rels)
+            self._check(job)
+
+        job.set_stage("coords", "生成检测框坐标文件")
+        coords = self._detect_coords(job)
+        self._cleanup(job)
+        job.result = {"imported": ingested, "labeled": stats.get("labeled", 0),
+                      "boxes": stats.get("boxes", 0), "failed": stats.get("failed", 0),
+                      "protected": stats.get("protected", 0),
+                      "missing_classes": stats.get("missing_classes", []),
+                      "model": stats.get("model", model),
+                      "coords": coords, "batch_id": job.batch_id, "classes": names}
+        job.set_stage("done", self._detect_done_text(stats, ingested))
+        job.finished, job.ok = True, True
+        finish_batch(self.root, job.batch_id, "done", job.message)
+
     def _cleanup(self, job: Job) -> None:
-        if job.kind == "prompt":  # 提示词任务没有临时上传文件要清
+        if job.kind in ("prompt", "detect"):  # 只跑标注的任务没有临时上传文件要清
             return
         for name in job.files:
             try:
@@ -635,9 +765,14 @@ class JobStore:
 
     def _salvage(self, job: Job) -> dict:
         """任务取消后，仍把已经标好的部分写进坐标文件。"""
-        prompt_kind = job.kind.startswith("prompt")
+        kind = str(job.kind)
         try:
-            coords = self._prompt_coords(job) if prompt_kind else self._coords(job)
+            if kind.startswith("detect"):
+                coords = self._detect_coords(job)
+            elif kind.startswith("prompt"):
+                coords = self._prompt_coords(job)
+            else:
+                coords = self._coords(job)
             self._cleanup(job)
             return {"coords": coords, "cancelled": True}
         except Exception:  # noqa: BLE001 收尾失败不影响取消本身

@@ -1,6 +1,6 @@
 "use strict";
 
-// 上层门户：下一步行动流 + 概览数字 + 两个标注库入口 + 坐标/训练集导出 + 批次管理。
+// 上层门户：下一步行动流 + 概览数字 + 三个标注库入口 + 坐标/训练集导出 + 批次管理。
 
 /** 模块卡片配置：文案与统计口径都在这里，避免和 common.js 的导航漂移。 */
 const MODULE_CARDS = [
@@ -15,16 +15,24 @@ const MODULE_CARDS = [
     upload: true, lib: "objects",
   },
   {
+    id: "detect", href: "/detect", name: "目标检测", tag: "标注库",
+    desc: "本机 YOLO 权重按它自带的类别表（COCO-80 等）出检测框：不联网、单张几十毫秒，"
+      + "类别由权重决定，复核时删错框、补漏框。",
+    upload: true, lib: "detect",
+  },
+  {
     id: "models", href: "/models", name: "模型管理", tag: "公共配置",
-    desc: "姿态权重的下载/删除、本地权重登记，以及本地多模态服务与云端多模态 API 的配置和连通性测试。",
+    desc: "按关键词搜五种任务的模型（姿态 / 检测 / 分割 / 旋转框 / 分类）、下载与删除权重、"
+      + "本地权重登记，以及本地多模态服务与云端多模态 API 的配置和连通性测试。",
   },
 ];
 
-/** 概览数字：只留看得懂且会用五条，实现细节词一律不上界面。 */
+/** 概览数字：只留看得懂且会用的这几条，实现细节词一律不上界面。 */
 const STAT_STRIP = [
   { key: "files", name: "图片文件", unit: "张" },
   { key: "pose_items", name: "姿态库", unit: "帧" },
   { key: "object_items", name: "提示词库", unit: "帧" },
+  { key: "detect_items", name: "检测库", unit: "帧" },
   { key: "pending", name: "等你复核", unit: "帧" },
   { key: "batches", name: "导入批次", unit: "批" },
 ];
@@ -38,6 +46,7 @@ const STAT_STRIP = [
 function buildStats(ds) {
   const pose = ds.pose_items || ds.items || [];
   const objects = ds.object_items || [];
+  const detect = ds.detect_items || [];
   const pool = ds.pool || {};
   const positive = new Set(ds.positive_flags || ["multi_model_confirmed"]);
   const lowScore = typeof ds.low_score === "number" ? ds.low_score : 0.4;
@@ -45,9 +54,10 @@ function buildStats(ds) {
   const values = {
     files: pool.files !== undefined ? pool.files : (ds.pool_files || []).length,
     pool_shared: pool.shared || 0,
-    pose_items: pose.length, object_items: objects.length,
+    pose_items: pose.length, object_items: objects.length, detect_items: detect.length,
     pose_labeled: 0, pose_unreviewed: 0, pose_flagged: 0, pending: 0,
     prompt_labeled: 0, prompt_boxes: 0, prompt_flagged: 0, prompt_unreviewed: 0,
+    detect_labeled: 0, detect_boxes: 0, detect_flagged: 0, detect_unreviewed: 0,
     batches: (ds.batches || []).length,
   };
   for (const item of pose) {
@@ -66,21 +76,33 @@ function buildStats(ds) {
     const unlabeled = item.prompt_objects === null || item.prompt_objects === undefined;
     if (!settled(item.prompt_status) && (issues.length || unlabeled)) values.prompt_flagged += 1;
   }
-  values.pending = values.pose_unreviewed + values.prompt_unreviewed;
+  for (const item of detect) {
+    if (item.detect_objects !== null && item.detect_objects !== undefined) {
+      values.detect_labeled += 1;
+      values.detect_boxes += Number(item.detect_objects || 0);
+    }
+    const issues = (item.detect_flags || []).filter((f) => !positive.has(f));
+    const unlabeled = item.detect_objects === null || item.detect_objects === undefined;
+    if (!settled(item.detect_status) && (issues.length || unlabeled)) values.detect_flagged += 1;
+  }
+  values.pending = values.pose_unreviewed + values.prompt_unreviewed + values.detect_unreviewed;
   const review = ds.review || {};
-  for (const key of ["pose_pending", "pose_flagged", "prompt_pending", "prompt_flagged", "pending"]) {
+  for (const key of ["pose_pending", "pose_flagged", "prompt_pending", "prompt_flagged",
+                     "detect_pending", "detect_flagged", "pending"]) {
     if (typeof review[key] === "number") values[key === "pose_pending" ? "pose_unreviewed"
-      : key === "prompt_pending" ? "prompt_unreviewed" : key] = review[key];
+      : key === "prompt_pending" ? "prompt_unreviewed"
+        : key === "detect_pending" ? "detect_unreviewed" : key] = review[key];
   }
   return values;
 }
 function renderStats(ds) {
   const values = buildStats(ds);
   const hints = {
-    files: "两个库共用同一份，不占双份",
+    files: "几个库共用同一份，不占双份",
     pose_items: "已标 " + values.pose_labeled + " · 带标记 " + values.pose_flagged,
     object_items: "已标 " + values.prompt_labeled + " · 框 " + values.prompt_boxes,
-    pending: "两个库都没点接受 / 驳回的，与页内队列同口径",
+    detect_items: "本机权重出的框 已标 " + values.detect_labeled + " · 框 " + values.detect_boxes,
+    pending: "三个库都没点接受 / 驳回的，与页内队列同口径",
     batches: "每次导入算一批",
   };
   const box = $("portal-stats");
@@ -124,6 +146,11 @@ function nextActions(ds, values) {
     acts.push({ icon: "ic-boxes", chip: "提示词标注", title: "有 " + values.prompt_flagged + " 帧检测框待复核",
       sub: "漏标 / 小框 / 贴边的排在最前面",
       href: "/objects", go: "去复核" });
+  }
+  if (values.detect_unreviewed) {
+    acts.push({ icon: "ic-boxes", chip: "目标检测", title: "有 " + values.detect_unreviewed + " 帧本机权重出的框没复核",
+      sub: "本地图已入库的，点批量目标检测几十秒就出一轮",
+      href: "/detect", go: "去复核" });
   }
   if (!acts.length) {
     acts.push({ icon: "ic-export", title: "都处理完了，可以导出训练集",
@@ -181,6 +208,9 @@ function renderCards(ds) {
             待复核: (status.unreviewed || 0) + (status.edited || 0) },
     objects: { 图片: (ds.object_items || []).length, 已标: prompt.labeled || 0,
                框: prompt.boxes || 0, 字段: ((ds.fields || {}).fields || []).length },
+    detect: { 图片: (ds.detect_items || []).length, 已标: (ds.detect || {}).labeled || 0,
+              框: (ds.detect || {}).boxes || 0,
+              类别: ((ds.detect_classes || {}).fields || []).length },
     models: { 权重: (ds.models || []).length, 多模态: ((ds.vlm || {}).profiles || []).length },
   };
   const box = $("module-cards");
@@ -233,6 +263,15 @@ function renderExports(ds) {
       action: { id: "export-detect", label: "导出 YOLO 训练集", kind: "detect" },
       count: (ds.prompt && ds.prompt.boxes) || 0, unit: "框",
     },
+    {
+      name: "检测框（目标检测）",
+      desc: "坐标：一行一个框（class_id + 权重自带英文类名 + 中文显示名 + 两套坐标）。"
+        + "训练集：train/val 切分 + data.yaml（类别名取本库类别表），与提示词库那份互不覆盖。",
+      links: [["CSV", "/api/prompt/coords?format=csv&lib=detect"],
+              ["JSONL", "/api/prompt/coords?format=jsonl&lib=detect"]],
+      action: { id: "export-yolo-detect", label: "导出 YOLO 训练集", kind: "yolo_detect", lib: "detect" },
+      count: (ds.detect && ds.detect.boxes) || 0, unit: "框",
+    },
   ];
   for (const row of rows) {
     const el = document.createElement("div");
@@ -271,14 +310,14 @@ function renderExports(ds) {
       b.className = "btn primary";
       b.id = row.action.id;
       b.textContent = row.action.label;
-      b.onclick = () => exportDataset(b, row.action.kind, scope);
+      b.onclick = () => exportDataset(b, row.action.kind, scope, row.action.lib);
       actions.append(scope, b);
     }
     box.append(el);
   }
 }
 
-async function exportDataset(button, kind, scopeSelect) {
+async function exportDataset(button, kind, scopeSelect, lib) {
   if (button.disabled) return;
   const label = button.textContent;
   button.disabled = true;
@@ -286,7 +325,10 @@ async function exportDataset(button, kind, scopeSelect) {
   const scope = scopeSelect ? scopeSelect.value : "reviewed";
   try {
     const url = kind === "pose" ? "/api/export" : "/api/prompt/export";
-    const info = (await postJson(url, { val_ratio: 0.2, scope })).export || {};
+    // 提示词库与目标检测库共用同一个导出接口，不带 lib 就永远导出提示词库那份
+    const body = { val_ratio: clamp(readNumber("export-val-ratio", DEFAULT_VAL_RATIO), 0, 0.9), scope };
+    if (lib) { body.lib = lib; }
+    const info = (await postJson(url, body)).export || {};
     const opened = await revealExport(info.out, { quiet: true });
     const verb = info.reused ? "内容没变，已复用上次那份" : "YOLO 训练集已导出";
     toast(`${verb}（${scopeLabel(scope)}）：${exportSummary(info, kind)} → ${info.out}`
@@ -308,15 +350,18 @@ const REVIEW_LABEL = { unreviewed: "待复核", approved: "已接受", edited: "
 const batchState = { ds: null, module: "all", selected: new Set(), expanded: "",
                      files: {}, fileSel: new Set(), loading: "" };
 
-/** 批次汇总：两个模块各自推进到哪一步，一行说清。 */
+/** 批次汇总：三个模块各自推进到哪一步，一行说清。 */
 function renderBatchSummary(ds) {
   const info = (ds.batches || []).length ? (ds.by_module || {}) : {};
   const parts = [];
-  for (const key of ["pose", "objects"]) {
+  for (const key of ["pose", "objects", "detect"]) {
     const row = info[key];
     if (!row) continue;
+    // 老键名 prompt_labeled 只有提示词库有，检测库读的是 labeled / boxes
     parts.push(`${row.label} ${row.batches} 批 / ${row.items} 张`
-      + (key === "pose" ? ` / 已标 ${row.labeled} 张` : ` / 已标 ${row.prompt_labeled} 张 · ${row.prompt_boxes} 框`));
+      + (key === "pose" ? ` / 已标 ${row.labeled} 张`
+        : ` / 已标 ${row.prompt_labeled !== undefined ? row.prompt_labeled : row.labeled} 张`
+          + ` · ${row.prompt_boxes !== undefined ? row.prompt_boxes : row.boxes} 框`));
   }
   $("batch-summary").textContent = parts.length ? "按模块汇总：" + parts.join(" · ") : "";
 }
@@ -331,7 +376,7 @@ function renderBatches(ds) {
   const box = $("portal-batches");
   box.innerHTML = "";
   if (!all.length) {
-    box.innerHTML = '<div class="batch-empty muted small">还没有批次：去「姿态标注」或「提示词标注」点「导入素材」上传图片和视频。</div>';
+    box.innerHTML = '<div class="batch-empty muted small">还没有批次：去「姿态标注」「提示词标注」或「目标检测」点「导入素材」上传图片和视频。</div>';
   } else if (!rows.length) {
     box.innerHTML = '<div class="batch-empty muted small">这个模块还没有批次记录。</div>';
   }
@@ -373,11 +418,13 @@ function batchRow(batch) {
 
   const nums = document.createElement("div");
   nums.className = "batch-nums";
-  const pose = batch.pose || {}, prompt = batch.prompt || {};
+  const pose = batch.pose || {}, prompt = batch.prompt || {}, detect = batch.detect || {};
+  const boxBits = module === "detect" ? detect : prompt;
   const bits = [
     ["素材", batch.items],
     ["骨骼", `${pose.labeled || 0}/${batch.items} 张 · ${pose.people || 0} 人`],
-    ["检测框", `${prompt.labeled || 0}/${batch.items} 张 · ${prompt.boxes || 0} 框`],
+    [module === "detect" ? "检测框（本机权重）" : "检测框",
+     `${boxBits.labeled || 0}/${batch.items} 张 · ${boxBits.boxes || 0} 框`],
   ];
   for (const [label, value] of bits) {
     const span = document.createElement("span");
@@ -400,7 +447,7 @@ function batchRow(batch) {
 
   const link = document.createElement("a");
   link.className = "btn";
-  link.href = module === "objects" ? "/objects" : "/pose";
+  link.href = module === "objects" ? "/objects" : module === "detect" ? "/detect" : "/pose";
   link.textContent = "去复核";
 
   row.append(check, main, nums, status, peek, link);
@@ -451,6 +498,10 @@ function batchFileList(batch) {
     prompt.className = "chip" + (file.prompt_flags && file.prompt_flags.length ? " warn" : "");
     prompt.textContent = `检测框 ${REVIEW_LABEL[file.prompt_status] || file.prompt_status} · `
       + `${file.prompt_objects === null || file.prompt_objects === undefined ? "未标" : file.prompt_objects + " 框"}`;
+    const detect = document.createElement("span");
+    detect.className = "chip" + (file.detect_flags && file.detect_flags.length ? " warn" : "");
+    detect.textContent = `本机框 ${REVIEW_LABEL[file.detect_status] || file.detect_status || "待复核"} · `
+      + `${file.detect_objects === null || file.detect_objects === undefined ? "未标" : file.detect_objects + " 框"}`;
     const shared = document.createElement("span");
     shared.className = "chip" + (file.shared ? " warn" : "");
     shared.textContent = file.shared ? "另一个库也在用" : "只在这个库";
@@ -461,7 +512,7 @@ function batchFileList(batch) {
       ? "两个库一起移除，并删掉 images/ 里的这份文件"
       : "只把这张从当前库移除，素材文件与另一个库的标注都留着";
     del.onclick = () => deleteFiles([file.image], file.name, file.lib);
-    line.append(check, name, meta, pose, prompt, shared, del);
+    line.append(check, name, meta, pose, prompt, detect, shared, del);
     box.append(line);
   }
   return box;
@@ -582,6 +633,7 @@ function portalCommands() {
     { label: "导入图片 / 视频 / 目录", tag: "姿态标注", run: () => { location.href = "/pose?upload=1"; } },
     { label: "去姿态标注复核", tag: "姿态标注", run: () => { location.href = "/pose"; } },
     { label: "去提示词标注", tag: "提示词标注", run: () => { location.href = "/objects"; } },
+    { label: "去目标检测", tag: "目标检测", run: () => { location.href = "/detect"; } },
     { label: "去模型管理", tag: "模型管理", run: () => { location.href = "/models"; } },
     { label: "跳到「导出训练用文件」", run: () => scrollToSection("sec-export") },
     { label: "跳到「批次管理」", run: () => scrollToSection("sec-batches") },

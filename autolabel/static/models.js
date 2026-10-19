@@ -7,6 +7,12 @@ const modelState = {
   weights: [], weightsDir: "", downloads: {}, presets: [], profiles: [], defaultId: null,
   selected: new Set(), polling: null,
   rows: [], catalog: [], defaults: {}, filter: "", secretsPath: "", configPath: "",
+  // 目录搜索：query 只做本地模糊匹配；remote 打开后请求才带 remote=1 去搜 GitHub
+  query: "", remote: false, searching: false, searchSeq: 0, searchTimer: null,
+  // loaded：成功拿到过一次目录结果；没拿到之前只能退回本机登记表粗筛
+  hub: { ok: true, loaded: false, query: "", task: "", local: [], results: [], note: "", error: "" },
+  // 目标检测库当前用的权重：存在数据集 .autolabel/detect/prefs.json，跟姿态默认是两件事
+  detectPrefs: {},
 };
 
 const MODEL_HINTS = { "yolo11n-pose.pt": "快", "yolo11s-pose.pt": "更准", "yolo11m-pose.pt": "最准" };
@@ -46,6 +52,7 @@ async function refreshModels() {
   if (secretsBox && modelState.secretsPath) secretsBox.textContent = modelState.secretsPath;
   const configBox = $("model-config-path");
   if (configBox && modelState.configPath) configBox.textContent = modelState.configPath;
+  await loadDetectPrefs();
   if (data.vlm) {
     modelState.presets = data.vlm.presets || modelState.presets;
     modelState.profiles = data.vlm.profiles || [];
@@ -60,10 +67,41 @@ async function refreshModels() {
   $("model-dir").textContent = modelState.weightsDir || "models/";
   renderWeights();
   renderCatalog();
+  hubSearch({ immediate: true });   // 本机装了什么，搜索结果里的「已在本机」要跟着变
   renderVlmList();
   renderModelNote();
   if (Object.values(modelState.downloads).some((t) => t.stage === "running")) startModelPolling();
   else stopModelPolling();
+}
+
+/** 目标检测页当前用哪个权重：接口不存在或没选过都算正常，界面就不显示检测默认徽标。 */
+async function loadDetectPrefs() {
+  try {
+    const data = await getJson("/api/detect/models");
+    modelState.detectPrefs = data.prefs || {};
+  } catch (err) {
+    modelState.detectPrefs = {};   // 还没建检测库 / 老版本后端，静默降级
+  }
+}
+
+/** 设为检测默认：写的是数据集里的检测偏好，不是这台机器的姿态默认权重。 */
+async function setDetectDefault(filename) {
+  let data;
+  try {
+    data = await postJson("/api/detect/prefs", { model: filename });
+  } catch (err) {
+    // 后端已经把话说清楚了（「本机没有 X：先在模型管理页搜到它并下载」「这是「人体姿态」权重…」），照原文显示
+    const msg = String(err.message || "");
+    toast(msg.includes("not found")
+      ? "设为检测默认失败：这个服务还是旧版本，重启后才有该接口"
+      : msg || "设为检测默认失败", true);
+    return;
+  }
+  const model = (data && data.model) || filename;
+  modelState.detectPrefs = (data && data.prefs) || { model };
+  modelState.detectPrefs.model = model;
+  toast(`已设为检测默认：${model}`);
+  renderCatalog();
 }
 
 /** 顶栏副标题里报一句「默认模型 / 多模态配置」，省得用户去目录里翻。 */
@@ -155,103 +193,451 @@ async function downloadWeight(name, force) {
   modelState.downloads[name] = data.task;
   toast(force ? `重新下载 ${name}` : `开始下载 ${name}（进度在本页「姿态权重」里）`);
   renderWeights();
+  renderCatalog();
   startModelPolling();
 }
 
-/** 「模型目录」区块：中文名 + 中文说明 + 参数/体积/关键点 + 备注输入框 + 下载/设为默认。 */
+// --------------------------------------------------------------------------- //
+// 模型目录搜索：本地目录模糊匹配（离线也能用），联网搜 GitHub 是可选增强
+// --------------------------------------------------------------------------- //
+
+const TASK_LABEL = {
+  pose: "姿态估计", detect: "目标检测", segment: "实例分割", obb: "旋转框",
+  classify: "图像分类", vlm: "多模态", custom_task: "自定义任务",
+};
+// 任务徽标只复用 app.css 里已有的 badge module 变体，本页不新造配色
+const TASK_BADGE_CLASS = {
+  pose: "module pose", segment: "module objects", obb: "module objects",
+  vlm: "module objects", detect: "module", classify: "module", custom_task: "module",
+};
+// 这几个字段只有 /api/models 登记表里有，搜索结果要按文件名把它们并回来
+const REGISTRY_KEYS = ["ready", "status", "status_label", "size_mb", "partial_mb", "default",
+  "note", "last_used", "registered", "compatible", "compatibility_reasons", "map_pose",
+  "keypoint_set", "source", "source_label"];
+const MODEL_EMPTY_HINT = "本地目录没有匹配的权重。可以换个说法（分割 / 旋转框 / 骨骼 / 分类 / nano / v8），"
+  + "或打开「联网搜 GitHub」找社区权重；从 GitHub 下下来丢进 models/ 再点下面的「登记本地模型」也能用。";
+
+/** 搜索请求失败时的兜底：拿本机登记表粗筛一遍，列表不至于整块空白。 */
+function fallbackRows(query, task) {
+  const q = String(query || "").trim().toLowerCase();
+  return registryRows().filter((row) => {
+    const capability = row.capability || "pose";
+    if (task && capability !== task) return false;
+    if (!q) return true;
+    return [row.id, row.filename, row.display_name, row.description, row.recommended_for,
+      row.keypoint_set, TASK_LABEL[capability] || ""]
+      .join(" ").toLowerCase().includes(q);
+  });
+}
+
+/** 搜索接口没回来时，拿上一次成功取到的目录在本机再粗筛一遍，列表不会整块消失。 */
+function refilterLocal(rows, query, task) {
+  const q = String(query || "").trim().toLowerCase();
+  return (rows || []).filter((row) => {
+    if (task && String(row.task || "") !== task) return false;
+    if (!q) return true;
+    return [row.filename, row.display_name, row.task_label, row.task_name, row.intro,
+      row.description, row.recommended_for, row.class_note]
+      .join(" ").toLowerCase().includes(q);
+  });
+}
+
+/** 目录行 = 搜索结果的中文介绍/下载地址 ∪ 登记表的本机状态/备注/默认标记。 */
+function catalogRows() {
+  const known = new Map();
+  for (const row of registryRows()) {
+    known.set(String(row.filename || "").toLowerCase(), row);
+    known.set(String(row.id || "").toLowerCase(), row);
+  }
+  const source = modelState.hub.loaded
+    ? (modelState.hub.local || []) : fallbackRows(modelState.query, modelState.filter);
+  const rows = [];
+  for (const item of source) {
+    const hit = known.get(String(item.filename || "").toLowerCase())
+      || known.get(String(item.id || "").toLowerCase()) || null;
+    const row = Object.assign({}, item);
+    row.known = Boolean(hit);
+    for (const key of REGISTRY_KEYS) if (hit && key in hit) row[key] = hit[key];
+    row.task = item.task || (hit && (hit.capability || hit.task)) || "pose";
+    row.task_label = item.task_label || item.task_name || TASK_LABEL[row.task] || row.task;
+    row.registry_capability = hit ? (hit.capability || "pose") : "";
+    row.filename = item.filename || (hit && hit.filename) || `${row.id || ""}.pt`;
+    row.installed = Boolean(item.installed || row.ready);
+    if (!row.known) row.ready = row.installed;
+    row.intro = item.intro || item.description || (hit && hit.description) || "";
+    rows.push(row);
+  }
+  return rows;
+}
+
+/** 多模态 / 自定义任务是另一条链路：没搜索、没筛任务时原样附在目录末尾。 */
+function extraCatalogRows(covered) {
+  if (String(modelState.query || "").trim() || modelState.filter) return [];
+  return registryRows()
+    .filter((row) => ["vlm", "custom_task"].includes(row.capability || "pose"))
+    .filter((row) => !covered.has(String(row.id || "").toLowerCase()))
+    .map((row) => Object.assign({}, row, {
+      known: true,
+      registry_capability: row.capability || "pose",
+      task: row.capability || "pose",
+      task_label: TASK_LABEL[row.capability || "pose"] || row.capability,
+      intro: row.description || "",
+      installed: Boolean(row.ready),
+    }));
+}
+
+/** 状态徽标文案：登记表认识的沿用后台判定，纯目录条目只说在本机 / 没下过。 */
+function catalogStateText(row, isVlm) {
+  if (row.known && (row.status_label || row.status)) return row.status_label || row.status;
+  if (isVlm) return row.ready ? "可用" : "未就绪";
+  if (row.installed) {
+    const short = row.expected_mb && row.size_mb && row.size_mb + 1 < row.expected_mb;
+    return short ? "文件不完整" : "已在本机";
+  }
+  return row.downloadable ? "未下载" : "需自行获取";
+}
+
+/** 备注框：改过才允许保存，Enter 直接存；取消登记只动登记表不删权重文件。 */
+function bindModelNote(row, noteInput, noteSave, forget) {
+  noteInput.value = row.note || "";
+  const sync = () => { noteSave.disabled = noteInput.value.trim() === String(row.note || "").trim(); };
+  // 启用条件只能绑在输入框上：绑在按钮自身的 change 永远不触发，备注会一直存不了
+  noteInput.oninput = sync;
+  noteInput.onchange = sync;
+  noteInput.onkeydown = (e) => {
+    if (e.key !== "Enter") return;
+    e.preventDefault();
+    if (!noteSave.disabled) saveModelNote(row.id, noteInput.value.trim());
+  };
+  noteSave.onclick = (e) => { e.preventDefault(); saveModelNote(row.id, noteInput.value.trim()); };
+  if (row.registered) {
+    forget.classList.remove("hidden");
+    forget.onclick = (e) => { e.preventDefault(); forgetLocalModel(row.id); };
+  }
+}
+
+/** 目录卡片：任务标签 + 中文名 + 中文介绍 + 能标哪些类别 + 参数/体积/速度 + 下载/设为默认。 */
+function catalogCard(row) {
+  const task = row.task || row.capability || "pose";
+  const isVlm = task === "vlm";
+  const detectDefault = String(modelState.detectPrefs.model || "").toLowerCase();
+  const el = document.createElement("div");
+  el.className = "model-row model-catalog-row" + (row.default ? " selected" : "");
+  el.innerHTML = `
+    <div class="model-main">
+      <div class="model-title-line">
+        <span class="badge task-badge ${TASK_BADGE_CLASS[task] || "module"}"></span>
+        <span class="model-name"></span>
+        <span class="chip ok installed-flag hidden">已在本机</span>
+        <span class="chip detect-flag hidden">当前检测默认</span>
+        <span class="muted small mono model-file"></span>
+        <a class="home hidden" target="_blank" rel="noopener noreferrer">官方文档</a>
+      </div>
+      <div class="model-desc muted small"></div>
+      <div class="muted small model-class-note hidden"></div>
+      <div class="muted small model-meta"></div>
+      <div class="progress model-progress hidden"><div class="bar"></div></div>
+      <div class="model-note-row">
+        <input type="text" class="note" spellcheck="false"
+          placeholder="备注说明：例如「只在内网机器下」「显存吃紧别用」">
+        <button class="note-save" disabled>保存备注</button>
+        <button class="forget danger hidden">取消登记</button>
+      </div>
+    </div>
+    <span class="badge state"></span>
+    <button class="dl"></button>
+    <button class="def"></button>`;
+  const q = (sel) => el.querySelector(sel);
+  q(".task-badge").textContent = row.task_label || TASK_LABEL[task] || task;
+  q(".model-name").textContent = row.display_name || row.filename || row.id;
+  const file = q(".model-file");
+  file.textContent = isVlm ? (row.base_url || "") : (row.filename || "");
+  if (!file.textContent) file.classList.add("hidden");
+  if (row.installed) q(".installed-flag").classList.remove("hidden");
+  if (row.homepage) {
+    const home = q(".home");
+    home.href = row.homepage;
+    home.classList.remove("hidden");
+  }
+  q(".model-desc").textContent = row.intro || "（目录里没写说明）";
+  // 最要紧的一行：这个权重到底能标哪些类别，单独摆出来，别埋进参数里
+  if (row.class_note) {
+    const line = q(".model-class-note");
+    line.classList.remove("hidden");
+    line.textContent = "能标什么：";
+    const strong = document.createElement("b");
+    strong.textContent = row.class_note;
+    line.appendChild(strong);
+  }
+  const facts = isVlm
+    ? [`${VLM_KIND_LABEL[row.kind] || row.kind} · ${row.base_url || "未填地址"} · ${row.model || "未填模型名"}`,
+      `Key ${row.api_key_masked || "未设置"}`, row.last_used ? `最后使用 ${row.last_used}` : "还没用过"]
+    : [row.params_m == null ? "参数量官方未公布" : `参数约 ${row.params_m}M`,
+      row.score == null ? "精度官方未公布" : `${task === "classify" ? "top-1" : "mAP50-95"} 约 ${row.score}`,
+      row.installed ? `本机已占 ${mb(row.size_mb || row.expected_mb || 0)} MB`
+        : `下载约 ${mb(row.expected_mb || 0)} MB`,
+      row.speed ? `速度 ${row.speed}` : "",
+      row.recommended_for ? `适合 ${row.recommended_for}` : "",
+      row.size_verified === false ? "体积待核对" : "",
+      row.last_used ? `最后使用 ${row.last_used}` : "",
+      row.compatible === false ? (row.compatibility_reasons || []).join("；") : ""];
+  q(".model-meta").textContent = facts.filter(Boolean).join(" ｜ ");
+  q(".state").className = "badge state " + (MODEL_BADGE_CLASS[row.status] || "");
+  q(".state").textContent = (row.default ? "默认 · " : "") + catalogStateText(row, isVlm);
+  // 备注只存得进登记表认识的模型（pose / vlm / custom_task），其余直接不显示这行
+  if (row.known) bindModelNote(row, q(".note"), q(".note-save"), q(".forget"));
+  else q(".model-note-row").classList.add("hidden");
+  const download = modelState.downloads[row.filename] || null;
+  const running = Boolean(download && download.stage === "running");
+  if (running && download.total) {
+    q(".model-progress").classList.remove("hidden");
+    const pct = Math.round((download.done || 0) * 100 / download.total);
+    q(".model-progress .bar").style.width = `${clamp(pct, 0, 100)}%`;
+  }
+  const dl = q(".dl");
+  if (isVlm || !row.downloadable) dl.classList.add("hidden");
+  else {
+    dl.textContent = running ? "下载中…" : (row.installed ? "重新下载" : "下载");
+    dl.disabled = running;
+    dl.onclick = (e) => { e.preventDefault(); downloadWeight(row.filename, Boolean(row.installed)); };
+  }
+  const def = q(".def");
+  const detectTask = ["detect", "segment", "obb", "classify"].includes(task);
+  if (detectTask) {
+    // 检测库的默认权重存在数据集里，和这台机器的姿态默认不是同一个概念，文案分开写
+    const active = detectDefault === String(row.filename || "").toLowerCase();
+    if (active) q(".detect-flag").classList.remove("hidden");
+    if (!row.installed) def.classList.add("hidden");   // 没下进本机之前只能先点「下载」
+    else {
+      def.textContent = active ? "当前检测默认" : "设为检测默认";
+      def.disabled = active;
+      def.title = "目标检测页下次打开就选它；不选也用它跑批量标注";
+      def.onclick = (e) => { e.preventDefault(); setDetectDefault(row.filename); };
+    }
+  } else {
+    const canDefault = row.known && Boolean(row.registry_capability);
+    def.textContent = row.default ? "默认中" : "设为默认";
+    def.disabled = !canDefault || Boolean(row.default);
+    def.title = canDefault
+      ? `设为这台机器${TASK_LABEL[task] || "该任务"}的默认权重（存 configs/models.json）`
+      : "这个权重不在登记表里，暂时设不了默认";
+    def.onclick = (e) => { e.preventDefault(); setModelDefault(row.id, row.registry_capability || ""); };
+  }
+  return el;
+}
+
+/** 「模型目录」区块主体：先渲染本地结果，再叠 GitHub 结果与搜索状态提示。 */
 function renderCatalog() {
   const box = $("model-catalog");
   if (!box) return;
-  const rows = registryRows().filter((row) => !modelState.filter
-    || (row.capability || "pose") === modelState.filter);
+  const rows = catalogRows();
+  const covered = new Set(rows.map((row) => String(row.id || "").toLowerCase()));
+  const all = rows.concat(extraCatalogRows(covered));
   box.innerHTML = "";
-  if (!rows.length) {
-    box.innerHTML = '<div class="batch-empty muted small">没有符合条件的模型。</div>';
-  }
-  const tally = {};
+  for (const row of all) box.appendChild(catalogCard(row));
+  if (!all.length) box.innerHTML = `<div class="batch-empty muted small">${MODEL_EMPTY_HINT}</div>`;
+  renderCatalogNote(all);
+  renderGitHub();
+  renderSearchNote();
+}
+
+/** 计数按任务分开报：把「分割 0/5」和「姿态 3/13」揉成一个数会让人以为权重下好了。 */
+function renderCatalogNote(rows) {
+  const note = $("model-catalog-note");
+  if (!note) return;
+  const tally = new Map();
   for (const row of rows) {
-    const capability = row.capability || "pose";
-    const bucket = tally[capability] || (tally[capability] = { total: 0, ready: 0 });
+    const task = row.task || row.capability || "pose";
+    const bucket = tally.get(task) || { total: 0, ready: 0 };
     bucket.total += 1;
-    if (row.ready) bucket.ready += 1;
-    const el = document.createElement("div");
-    el.className = "model-row model-catalog-row" + (row.default ? " selected" : "");
-    el.innerHTML = `
-      <div class="model-main">
-        <div class="model-name"></div>
-        <div class="model-desc muted small"></div>
-        <div class="muted small model-meta"></div>
-        <div class="model-note-row">
-          <input type="text" class="note" spellcheck="false"
-            placeholder="备注说明：例如「只在内网机器下」「显存吃紧别用」">
-          <button class="note-save" disabled>保存备注</button>
-          <button class="forget danger hidden">取消登记</button>
-        </div>
-      </div>
-      <span class="badge ${MODEL_BADGE_CLASS[row.status] || ""}"></span>
-      <button class="dl"></button>
-      <button class="def"></button>`;
-    el.querySelector(".model-name").textContent = row.display_name || row.id;
-    el.querySelector(".model-desc").textContent = row.description || "（目录里没写说明）";
-    const facts = capability === "vlm"
-      ? [`${VLM_KIND_LABEL[row.kind] || row.kind} · ${row.base_url || "未填地址"} · ${row.model || "未填模型名"}`,
-        `Key ${row.api_key_masked || "未设置"}`,
-        row.last_used ? `最后使用 ${row.last_used}` : "还没用过"]
-      : [row.params_m ? `参数约 ${row.params_m}M` : "参数官方未列明",
-        row.map_pose ? `mAP50-95 约 ${row.map_pose}` : "精度官方未列明",
-        row.ready ? `本地 ${mb(row.size_mb || 0)} MB` : `预计 ${mb(row.expected_mb || 0)} MB`,
-        `${row.num_keypoints || 17} 关键点（${row.keypoint_set || "未标注"}）`,
-        row.speed ? `速度 ${row.speed}` : "",
-        row.last_used ? `最后使用 ${row.last_used}` : "还没用过"];
-    if (row.recommended_for) facts.push(`适合 ${row.recommended_for}`);
-    if (!row.compatible) facts.push((row.compatibility_reasons || []).join("；"));
-    el.querySelector(".model-meta").textContent = facts.filter(Boolean).join(" ｜ ");
-    el.querySelector(".badge").textContent = (row.default ? "默认 · " : "")
-      + (row.status_label || row.status || "");
-    const noteInput = el.querySelector(".note");
-    noteInput.value = row.note || "";
-    const noteSave = el.querySelector(".note-save");
-    // 启用条件只能绑在输入框上：绑在按钮自身的 change 永远不触发，备注会一直存不了
-    const syncNoteState = () => {
-      noteSave.disabled = noteInput.value.trim() === String(row.note || "").trim();
-    };
-    noteInput.oninput = syncNoteState;
-    noteInput.onchange = syncNoteState;
-    noteInput.onkeydown = (e) => {
-      if (e.key !== "Enter") return;
-      e.preventDefault();
-      if (!noteSave.disabled) saveModelNote(row.id, noteInput.value.trim());
-    };
-    noteSave.disabled = true;
-    noteSave.onclick = (e) => { e.preventDefault(); saveModelNote(row.id, noteInput.value.trim()); };
-    const dl = el.querySelector(".dl");
-    if (capability === "vlm" || !row.downloadable) dl.classList.add("hidden");
-    else {
-      const task = modelState.downloads[row.filename];
-      const running = Boolean(task && task.stage === "running");
-      dl.textContent = running ? "下载中…" : (row.ready ? "重新下载" : "下载");
-      dl.disabled = running;
-      dl.onclick = (e) => { e.preventDefault(); downloadWeight(row.filename, Boolean(row.ready)); };
-    }
-    const def = el.querySelector(".def");
-    def.textContent = row.default ? "默认中" : "设为默认";
-    def.disabled = Boolean(row.default);
-    def.onclick = (e) => { e.preventDefault(); setModelDefault(row.id, capability); };
-    const forget = el.querySelector(".forget");
-    if (row.registered) {
-      forget.classList.remove("hidden");
-      forget.onclick = (e) => { e.preventDefault(); forgetLocalModel(row.id); };
-    }
-    box.appendChild(el);
+    if (row.ready || row.installed) bucket.ready += 1;
+    tally.set(task, bucket);
   }
-  // 姿态权重和多模态配置的「可用」不是一回事，混在一起数会让人以为权重下好了
-  const CAP_LABEL = { pose: "姿态权重", detect: "检测权重", segment: "分割权重",
-                      obb: "旋转框权重", vlm: "多模态配置" };
-  const parts = Object.keys(tally).map((cap) => {
-    const word = cap === "vlm" ? "可用" : "就绪";
-    return `${CAP_LABEL[cap] || cap}${word} ${tally[cap].ready}/${tally[cap].total}`;
-  });
-  $("model-catalog-note").textContent = `共 ${rows.length} 个` + (parts.length ? " · " : "") + parts.join(" · ");
+  const parts = [];
+  for (const [task, bucket] of tally) {
+    parts.push(`${TASK_LABEL[task] || task} ${bucket.ready}/${bucket.total}`);
+  }
+  const head = String(modelState.query || "").trim() ? `匹配 ${rows.length} 个` : `共 ${rows.length} 个`;
+  const detectDefault = String(modelState.detectPrefs.model || "");
+  const tail = detectDefault ? ` · 检测默认 ${detectDefault}` : "";
+  note.textContent = head + (parts.length ? " · " + parts.join(" · ") : "") + tail;
+}
+
+/** GitHub 栏：社区仓库级结果没有可下载地址，所以只给「打开 GitHub」和「复制仓库名」。 */
+function renderGitHub() {
+  const box = $("model-github");
+  const note = $("model-github-note");
+  if (!box || !note) return;
+  if (!modelState.remote) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    note.textContent = "";
+    return;
+  }
+  const items = modelState.hub.results || [];
+  if (!items.length) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    note.textContent = modelState.searching
+      ? "联网检索中（可能要几秒）…"
+      : "GitHub 上没有更多匹配，上面的本地结果已经够用了。";
+    return;
+  }
+  note.textContent = `GitHub 检索到 ${items.length} 个社区仓库 · `
+    + (modelState.hub.note || "社区权重未经校验，下载前建议核对文件大小");
+  box.classList.remove("hidden");
+  box.innerHTML = "";
+  for (const item of items) box.appendChild(githubCard(item));
+}
+
+function githubCard(item) {
+  const el = document.createElement("div");
+  el.className = "model-row";
+  el.innerHTML = `
+    <div class="model-main">
+      <div class="model-title-line">
+        <span class="badge task-badge ${TASK_BADGE_CLASS[item.task] || "module"}"></span>
+        <span class="model-name"></span>
+        <span class="chip ok hidden">已在本机</span>
+      </div>
+      <div class="model-desc muted small"></div>
+    </div>
+    <button class="gh-open">打开 GitHub</button>
+    <button class="gh-copy">复制仓库名</button>`;
+  const q = (sel) => el.querySelector(sel);
+  q(".task-badge").textContent = item.task_label || TASK_LABEL[item.task] || item.origin || "社区";
+  q(".model-name").textContent = item.name || item.html_url || "";
+  if (item.installed) q(".chip").classList.remove("hidden");
+  q(".model-desc").textContent = item.intro || item.description || "（仓库没写说明）";
+  q(".gh-open").onclick = (e) => {
+    e.preventDefault();
+    if (item.html_url) window.open(item.html_url, "_blank", "noopener");
+    else toast("这条结果没带仓库地址", true);
+  };
+  q(".gh-copy").onclick = (e) => { e.preventDefault(); copyText(item.name || ""); };
+  return el;
+}
+
+/** 复制仓库名：浏览器不给 clipboard 权限时退回临时输入框，别让人点了没反应。 */
+function copyText(text) {
+  const fallback = () => {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.opacity = "0";
+    document.body.appendChild(area);
+    area.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (err) { ok = false; }
+    document.body.removeChild(area);
+    toast(ok ? `已复制 ${text}` : "复制失败，请手动选中仓库名", !ok);
+  };
+  if (!text) { toast("这条结果没带仓库名", true); return; }
+  if (!navigator.clipboard || !navigator.clipboard.writeText) { fallback(); return; }
+  navigator.clipboard.writeText(text).then(() => toast(`已复制 ${text}`), fallback);
+}
+
+/** 搜索栏下方的状态提示：搜索中 / 联网不可用的原因 / GitHub 命中条数。 */
+function renderSearchNote() {
+  const clear = $("model-search-clear");
+  if (clear) clear.hidden = !String(modelState.query || "").trim();
+  const toggle = $("model-remote");
+  if (toggle) {
+    toggle.classList.toggle("on", Boolean(modelState.remote));
+    toggle.setAttribute("aria-checked", modelState.remote ? "true" : "false");
+  }
+  const note = $("model-search-note");
+  if (!note) return;
+  note.classList.remove("err");
+  if (modelState.searching) {
+    note.textContent = modelState.remote ? "联网检索中（可能要几秒）…" : "搜索中…";
+    return;
+  }
+  if (!modelState.hub.ok) {
+    note.classList.add("err");
+    note.textContent = "联网检索不可用：" + (modelState.hub.note || modelState.hub.error || "未知原因")
+      + "（下面仍是本地目录结果）";
+    return;
+  }
+  const bits = [];
+  if (modelState.remote) bits.push(`GitHub ${(modelState.hub.results || []).length} 条`);
+  if (String(modelState.query || "").trim()) bits.push(`本地 ${modelState.hub.local.length} 条`);
+  note.textContent = bits.join(" · ");
+}
+
+/** 打一次目录搜索：400ms 内的连续输入并成一次请求，回来的旧结果按序号丢掉。 */
+function hubSearch(options) {
+  const opts = options || {};
+  if (modelState.searchTimer) {
+    clearTimeout(modelState.searchTimer);
+    modelState.searchTimer = null;
+  }
+  const run = async () => {
+    modelState.searchTimer = null;
+    const seq = ++modelState.searchSeq;
+    modelState.searching = true;
+    const params = new URLSearchParams();
+    if (modelState.query.trim()) params.set("q", modelState.query.trim());
+    if (modelState.filter) params.set("task", modelState.filter);
+    if (modelState.remote) params.set("remote", "1");
+    const url = "/api/modelhub/search" + (params.toString() ? "?" + params.toString() : "");
+    let data = null;
+    let failure = "";
+    try {
+      data = await getJson(url);
+    } catch (err) {
+      failure = err.message || String(err);   // 后端挂了也照常显示本地目录，别整块空掉
+    }
+    if (seq !== modelState.searchSeq) return;
+    modelState.searching = false;
+    if (data) {
+      modelState.hub = {
+        ok: Boolean(data.ok), loaded: true, query: data.query || "", task: data.task || "",
+        local: data.local || [], results: data.results || [], note: data.note || "",
+        error: data.error || "",
+      };
+    } else {
+      // 接口挂了不清空列表：沿用上次的目录按新关键词本地粗筛，只把提示换成红色
+      const keep = refilterLocal(modelState.hub.local, modelState.query, modelState.filter);
+      modelState.hub = { ok: false, loaded: modelState.hub.loaded, query: modelState.query,
+        task: modelState.filter, local: keep, results: [], error: failure,
+        note: `模型搜索接口没响应（${failure}）` };
+    }
+    renderCatalog();
+  };
+  if (opts.immediate) { run(); return; }
+  renderSearchNote();
+  modelState.searchTimer = setTimeout(run, 400);
+}
+
+/** 搜索框相关的小动作：聚焦、清空、开关联动，命令面板和快捷键共用。 */
+function focusModelSearch() {
+  const input = $("model-search");
+  if (!input) return;
+  input.focus();
+  input.select();
+}
+
+function clearModelSearch() {
+  modelState.query = "";
+  const input = $("model-search");
+  if (input) input.value = "";
+  hubSearch({ immediate: true });
+  if (input) input.focus();
+}
+
+function toggleModelRemote() {
+  modelState.remote = !modelState.remote;
+  toast(modelState.remote ? "已开启联网搜 GitHub：第一次会慢几秒" : "已关闭联网检索：只搜本地目录");
+  hubSearch({ immediate: true });
+}
+
+function setModelTask(task) {
+  const select = $("model-filter");
+  if (select) select.value = task || "";
+  modelState.filter = select ? select.value : (task || "");
+  hubSearch({ immediate: true });
 }
 
 async function saveModelNote(id, note) {
@@ -348,7 +734,10 @@ async function pollDownloads() {
     }
     if (data.task.message !== before) changed = true;
   }
-  if (changed) renderWeights();
+  if (changed) {
+    renderWeights();
+    renderCatalog();   // 目录卡片里的进度条跟上面这块是同一个 downloads 状态
+  }
 }
 
 async function deleteSelectedWeights() {
@@ -572,6 +961,14 @@ function modelCommands() {
     { label: "去姿态标注", tag: "姿态标注", run: () => { location.href = "/pose"; } },
     { label: "去提示词标注", tag: "提示词标注", run: () => { location.href = "/objects"; } },
     { label: "回工作台总览", tag: "工作台", run: () => { location.href = "/"; } },
+    { label: "在模型目录里搜索", key: "/", tag: "模型目录", run: () => focusModelSearch() },
+    { label: "联网搜 GitHub（开 / 关）", tag: "模型目录", run: () => toggleModelRemote() },
+    { label: "清空模型搜索", tag: "模型目录", run: () => clearModelSearch() },
+    { label: "只看姿态估计权重", tag: "模型目录", run: () => setModelTask("pose") },
+    { label: "只看实例分割权重", tag: "模型目录", run: () => setModelTask("segment") },
+    { label: "只看旋转框权重", tag: "模型目录", run: () => setModelTask("obb") },
+    { label: "只看图像分类权重", tag: "模型目录", run: () => setModelTask("classify") },
+    { label: "看全部任务的权重", tag: "模型目录", run: () => setModelTask("") },
     { label: "重新读取权重目录", key: "R", run: () => refreshModels() },
     { label: "看本页操作说明", key: "?", run: () => openHelp(true) },
   ];
@@ -582,6 +979,7 @@ function onModelKey(e) {
   if (isTyping(e)) { return; }
   switch (String(e.key).toLowerCase()) {
     case "r": e.preventDefault(); refreshModels(); break;
+    case "/": e.preventDefault(); focusModelSearch(); break;
     default:
   }
 }
@@ -594,7 +992,19 @@ async function bootModels() {
   $("rail-help").onclick = () => openHelp(true);
   $("model-refresh").onclick = refreshModels;
   $("model-del-weight").onclick = deleteSelectedWeights;
-  $("model-filter").onchange = (e) => { modelState.filter = e.target.value; renderCatalog(); };
+  // 任务筛选直接走后端匹配：中文任务词（分割 / 旋转框…）也由后端统一判定
+  $("model-filter").onchange = (e) => setModelTask(e.target.value);
+  const search = $("model-search");
+  search.oninput = () => { modelState.query = search.value; hubSearch(); };
+  search.onkeydown = (e) => {
+    if (e.key !== "Escape") return;
+    e.preventDefault();
+    if (search.value) clearModelSearch();   // 有内容先清空，已经空了才交出焦点
+    else search.blur();
+  };
+  $("model-search-clear").onclick = (e) => { e.preventDefault(); clearModelSearch(); };
+  // 联网检索默认关：开着之后每次搜索都要等 GitHub 几秒，本地搜不该被它拖慢
+  $("model-remote").onclick = (e) => { e.preventDefault(); toggleModelRemote(); };
   $("model-register").onclick = registerLocalModel;
   $("model-reg-path").onkeydown = (e) => { if (e.key === "Enter") registerLocalModel(); };
   $("model-download-new").onclick = () => {

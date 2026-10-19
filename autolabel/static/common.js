@@ -1,12 +1,80 @@
 "use strict";
 
-// 四个页面（门户 / 姿态标注 / 提示词标注 / 模型管理）共用的极小工具集。
-// 页面自己的逻辑在 portal.js / app.js / objects.js / models.js 里，各页只加载自己那份。
+// 五个页面（门户 / 姿态标注 / 提示词标注 / 目标检测 / 模型管理）共用的极小工具集。
+// 页面自己的逻辑在 portal.js / app.js / objects.js / models.js 里，各页只加载自己那份；
+// 「目标检测」与「提示词标注」共用同一份 objects.js，靠 <body data-lib> 决定吃哪一库，
+// 绝不再复制一份：同一件事有两个入口，改天就只有一个跟着改。
 
 const $ = (id) => document.getElementById(id);
 const mb = (v) => Number(v || 0).toFixed(1);
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+// 数字输入框：留空才回落默认值。`parseFloat(v) || 默认` 会把用户填的 **0** 当假值吞掉
+// ——最多帧数填 0、置信度填 0 都会悄悄变回默认，与服务端"0 是实义值"的口径相反。
+const readNumber = (id, fallback) => {
+  const node = $(id);
+  const raw = node ? parseFloat(node.value) : NaN;
+  return Number.isFinite(raw) ? raw : fallback;
+};
+
+// 导出训练集时留作验证集的比例。三个导出入口（门户面板 / 姿态页菜单 / 两个库的面板）
+// 共用这一个默认，只有门户面板上有输入框可改；写死三遍迟早有三个数。
+const DEFAULT_VAL_RATIO = 0.2;
+
+// 日志区只留最后这么多行。一次拖两百个文件就是两百行，而
+// ``box.textContent += ...`` 每次都要把整段字符串重造一遍，越滚越慢；
+// 更前面的行本来也滚出可视区了，留着只是让页面越来越卡。
+const LOG_TAIL = 400;
+const logState = new WeakMap();
+
+/** 往某个日志区追加一行（带时间戳），超出上限就折成「更早 N 条」。 */
+function appendLog(id, msg, isErr) {
+  const box = $(id);
+  if (!box) return;
+  let state = logState.get(box);
+  // 有人清空过日志区（「清空」按钮直接写 textContent），行缓存必须跟着归零，
+  // 否则下一次追加会把已经清掉的那批又写回来。
+  if (!state || state.rendered !== box.textContent) state = { lines: [], dropped: 0, rendered: "" };
+  state.lines.push(`[${new Date().toLocaleTimeString("zh-CN")}] ${msg}`);
+  if (state.lines.length > LOG_TAIL) {
+    state.dropped += state.lines.length - LOG_TAIL;
+    state.lines = state.lines.slice(-LOG_TAIL);
+  }
+  state.rendered = (state.dropped ? `（更早 ${state.dropped} 条已折叠）\n` : "")
+    + state.lines.join("\n");
+  logState.set(box, state);
+  box.textContent = state.rendered;
+  box.classList.toggle("err", Boolean(isErr));
+  box.scrollTop = box.scrollHeight;
+}
 const kb = (n) => (n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB");
+
+/** 上传单个文件，带**真实字节进度**（只有 XHR 有 upload.onprogress，fetch 没有）。
+ *
+ * 进度回调收 ``(已传字节, 总字节)``；失败时 reject 的 Error 消息一律中文——
+ * 上传 500 MB 录像时那条进度条就是这页唯一的表现，卡在 0% 和走到 60% 是两种体验。
+ */
+function uploadFile(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/upload?name=" + encodeURIComponent(file.name));
+    if (xhr.upload && onProgress) {
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) onProgress(Math.min(event.loaded, file.size), file.size);
+      };
+    }
+    xhr.onload = () => {
+      let data = {};
+      try { data = JSON.parse(xhr.responseText || "{}"); } catch (err) { data = {}; }
+      if (xhr.status >= 200 && xhr.status < 300) { resolve(data); return; }
+      // 超限 / 类型不支持时服务端回的就是中文 JSON，优先用它，剩下的才按状态码兜底
+      const reason = data.error || (xhr.status === 413 ? "超过单文件大小上限" : `上传失败（HTTP ${xhr.status}）`);
+      reject(new Error(reason));
+    };
+    xhr.onerror = () => reject(new Error("网络中断，这一条没传完"));
+    xhr.ontimeout = () => reject(new Error("上传超时"));
+    xhr.send(file);
+  });
+}
 
 const IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".webp", ".bmp"];
 const VIDEO_EXTS = [".mp4", ".mov", ".m4v", ".mkv", ".webm", ".avi", ".flv", ".wmv",
@@ -21,8 +89,9 @@ const isImage = (f) => IMAGE_EXTS.includes(extOf(f.name)) || /^image\//.test(f.t
 
 const MODULES = [
   { id: "pose", href: "/pose", name: "姿态标注", desc: "人体骨骼关键点复核" },
-  { id: "objects", href: "/objects", name: "提示词标注", desc: "按描述找物品，出检测框" },
-  { id: "models", href: "/models", name: "模型管理", desc: "姿态权重与多模态配置" },
+  { id: "objects", href: "/objects", name: "提示词标注", desc: "大模型按你写的描述找物品" },
+  { id: "detect", href: "/detect", name: "目标检测", desc: "本地 YOLO 权重按自带类别出框" },
+  { id: "models", href: "/models", name: "模型管理", desc: "搜模型、下载权重、多模态配置" },
 ];
 
 // 状态词只在界面层统一，写回后端的仍是 approved / edited 这些原值；两页共用一份，避免各写各的
@@ -485,6 +554,55 @@ function bindModalKeys() {
   }, true);
 }
 
+/** 左侧竖条里补上缺的模块入口。
+ *
+ *  竖条是各页写死的 HTML，加一个二级模块就要改五个文件，漏掉的那页等于没有入口
+ *  （上次加提示词标注时模型管理页就漏了）。这里按 MODULES 兜底补齐：
+ *  页面自己写好了就不动，缺了才插到「提示词标注」后面，位置和各页保持一致。
+ */
+function ensureRailModules() {
+  const rail = $("rail");
+  if (!rail) { return; }
+  for (const item of MODULES) {
+    if (rail.querySelector('a[href="' + item.href + '"]')) { continue; }
+    const link = document.createElement("a");
+    link.className = "iconbtn";
+    link.href = item.href;
+    link.title = item.name + " · " + item.desc;
+    link.innerHTML = '<svg class="ic"><use href="#ic-boxes"/></svg>';
+    const anchor = rail.querySelector('a[href="/objects"]') || rail.querySelector("a[href]");
+    if (anchor) { anchor.after(link); } else { rail.prepend(link); }
+  }
+}
+
+/** 「⋯」菜单里的模块跳转写死在各页 HTML 里，新增加一个库时在这里补齐：
+ *
+ *  否则哪页的 HTML 还没来得及改，用户从那页就跳不去新模块。已有同 href 的不重复加。
+ */
+function ensureMenuModules() {
+  const menu = $("more-menu");
+  if (!menu) { return; }
+  const page = document.body.dataset.page || "";
+  const missing = MODULES.filter((item) => item.id !== page
+    && !menu.querySelector('a[href="' + item.href + '"]'));
+  if (!missing.length) { return; }
+  const anchor = $("btn-settings") || menu.lastElementChild;
+  if (!anchor) { return; }
+  const label = document.createElement("div");
+  label.className = "menu-label";
+  label.textContent = "其他模块";
+  anchor.before(label);
+  for (const item of missing) {
+    const link = document.createElement("a");
+    link.className = "menu-item";
+    link.href = item.href;
+    link.title = item.desc;
+    link.innerHTML = '<svg class="ic"><use href="#ic-boxes"/></svg>';
+    link.append(document.createTextNode(item.name));
+    anchor.before(link);
+  }
+}
+
 /** 顶栏模块导航：高亮当前页，并在按 M/B/O 时跳到对应模块。 */
 function initNav() {
   const page = document.body.dataset.page || "";
@@ -502,6 +620,8 @@ function initNav() {
   }
   const brand = $("nav-portal");
   if (brand) brand.href = "/";
+  ensureRailModules();
+  ensureMenuModules();
   bindConfirmBox();
   bindModalKeys();
   initVersionWidget();
@@ -613,6 +733,8 @@ function initVersionWidget() {
 const EXPORT_COMMANDS = {
   pose: { verb: "pose", model: "yolo11s-pose.pt" },
   detect: { verb: "detect", model: "yolo11s.pt" },
+  // 目标检测库导出的 kind 与提示词库不同名，少了这行训练命令会错拿 pose 的那条
+  yolo_detect: { verb: "detect", model: "yolo11n.pt" },
 };
 
 /** 复制了目录还得手敲训练命令，这里直接给整条。 */
@@ -729,10 +851,19 @@ function renderExportNote(containerId, ds, kind) {
 const dash = (v) => (v === null || v === undefined || v === "" ? "—" : v);
 
 // --------------------------------------------------------------------------- //
-// 素材池：两个库共用 images/ 下的素材，这里提供"把池里已有的图添加进本库"的选择器
+// 素材池：三个库共用 images/ 下的素材，这里提供"把池里已有的图添加进本库"的选择器
 // --------------------------------------------------------------------------- //
-const LIB_LABELS = { pose: "姿态标注", objects: "提示词标注" };
+const LIB_LABELS = { pose: "姿态标注", objects: "提示词标注", detect: "目标检测" };
 const libLabel = (lib) => LIB_LABELS[lib] || String(lib || "本库");
+
+// 素材池里每张图被哪些库引用：后端按下发 in_<lib>，界面按这张表念名字。
+// 写成一等数据而不是三处 if，是为了以后加库只改这张表——上一版加检测库时，
+// "已在姿态库 / 已在提示词库" 那句就漏了新库，新库的图看起来像"哪都没去"。
+const POOL_LIBS = [
+  { lib: "pose", name: "姿态库" },
+  { lib: "objects", name: "提示词库" },
+  { lib: "detect", name: "检测库" },
+];
 
 const poolState = { lib: "pose", files: [], sel: new Set(), loading: false, busy: false, onDone: null };
 
@@ -785,9 +916,11 @@ async function loadPool() {
     poolState.files = data.files || [];
     poolState.sel = new Set();
     poolState.stats = data.stats || {};
+    const owned = (data.libs || POOL_LIBS)
+      .map((row) => `${row.name} ${poolState.stats[row.lib] || 0}`).join(" · ");
     $("pool-note").textContent = `素材池共 ${poolState.stats.files || 0} 个文件（`
-      + `姿态库 ${poolState.stats.pose || 0} · 提示词库 ${poolState.stats.objects || 0} · `
-      + `两库共用 ${poolState.stats.shared || 0}）· ${kb(poolState.stats.bytes || 0)}；`
+      + owned + (owned ? " · " : "") + `几个库共用 ${poolState.stats.shared || 0}）`
+      + `· ${kb(poolState.stats.bytes || 0)}；`
       + `其中可添加到「${libLabel(poolState.lib)}」的 ${poolState.files.length} 张。`;
   } catch (err) {
     box.textContent = "素材池读取失败：" + err.message;
@@ -823,8 +956,8 @@ function renderPool() {
       + ` · ${file.width || "?"}×${file.height || "?"} · ${kb(file.bytes || 0)}`;
     const chips = document.createElement("span");
     chips.className = "chip";
-    chips.textContent = (file.in_pose ? "已在姿态库 " : "") + (file.in_objects ? "已在提示词库" : "")
-      || "两库都没有";
+    const owned = POOL_LIBS.filter((row) => file["in_" + row.lib]).map((row) => "已在" + row.name);
+    chips.textContent = owned.join(" · ") || "各库都没有";
     line.append(check, name, meta, chips);
     box.append(line);
   }
@@ -879,8 +1012,20 @@ async function poolAdopt() {
 const shell = { commands: [], rows: [], sel: 0, matchFrames: null, hideUndo: null, cd: null };
 
 function registerShellCommands(commands, matchFrames) {
-  shell.commands = (commands || []).concat(appearanceCommands());
+  const own = commands || [];
+  shell.commands = own.concat(moduleNavCommands(own), appearanceCommands());
   if (typeof matchFrames === "function") { shell.matchFrames = matchFrames; }
+}
+
+/** 每个模块都必须能在 ⌘K 里搜到：页面自己登记过的跳转（文案里带模块名）不重复补。 */
+function moduleNavCommands(own) {
+  const labels = (own || []).map((row) => String(row.label || ""));
+  return MODULES
+    .filter((item) => !labels.some((label) => label.includes(item.name)))
+    .map((item) => ({
+      label: "去" + item.name, tag: "页面",
+      run: () => { location.href = item.href; },
+    }));
 }
 
 function isTyping(e) {

@@ -5,15 +5,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 import shutil
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .dataset import label_path_for, load_index, now_str
+from .dataset import label_path_for, load_index, now_str, source_missing
 from .yolo_pose import COCO17_KEYPOINTS, COCO17_FLIP_IDX, COCO17_SKELETON, parse_label_file
 
 DEFAULT_EXCLUDE_STATUS = {"rejected"}
 MISSING_LABEL_REASON = "缺少标签"
+MISSING_SOURCE_REASON = "源文件缺失（images/ 里的文件不在了）"
 EMPTY_CAP_REASON = "背景图超出比例上限"
 
 
@@ -29,7 +31,29 @@ def skipped_summary(skipped: Sequence[Tuple[str, str]]) -> str:
     return "（" + " · ".join(parts) + "）"
 
 
-def no_sample_hint(skipped: Sequence[Tuple[str, str]]) -> str:
+def other_library_hint(root: str, flag: str = "export") -> str:
+    """姿态库空着、另两个库却有货时指个路。
+
+    ``export`` / ``coords`` 只管姿态标注库，提示词库和检测库的导出各在
+    ``prompt --export`` / ``detect --export`` 里。只在检测库干过活的人跑来敲
+    ``export``，看到的是"库里一张图都还没有"，只会以为标注丢了。
+    """
+    from .dataset import load_index_or_none
+    from .library import LIB_DETECT, LIB_OBJECTS, field_key, lib_name
+
+    hits = []
+    for lib, command in ((LIB_OBJECTS, "prompt"), (LIB_DETECT, "detect")):
+        index = load_index_or_none(root, lib)
+        if index is None:
+            continue
+        labeled = sum(1 for item in index.items.values() if item.get(field_key(lib, "objects")))
+        if labeled:
+            hits.append(f"{lib_name(lib)}里还有 {labeled} 张，"
+                        f"那部分用 autolabel {command} <数据集> --{flag}")
+    return ("；" + "；".join(hits)) if hits else ""
+
+
+def no_sample_hint(skipped: Sequence[Tuple[str, str]], root: str = "") -> str:
     """没有帧可导出时，只指真正能改的那个开关。
 
     以前不分原因都提示「加 --include-all / 界面范围改成全部」，实测三行里只有一行
@@ -42,12 +66,15 @@ def no_sample_hint(skipped: Sequence[Tuple[str, str]]) -> str:
     if any(reason.startswith("status=") for reason in reasons):
         advice.append("想连被驳回的帧一起要，命令行加 --include-all，界面里把导出范围改成「全部帧」")
     if MISSING_LABEL_REASON in reasons:
-        advice.append("没标注的帧进不了训练集，先跑一次自动标注（命令行 autolabel auto / annotate）")
+        advice.append("没标注的帧进不了训练集，先跑一次自动标注（命令行 autolabel auto 或 label）")
     if any(reason.startswith(EMPTY_CAP_REASON) for reason in reasons):
         advice.append("背景图是被占比上限压掉的，命令行加 --max-empty-ratio 1 就全要")
+    if MISSING_SOURCE_REASON in reasons:
+        advice.append("有几张图索引里记着、images/ 里却没有了，把图片放回去或在库里删掉这些帧")
     if not advice:
-        return "：库里一张图都还没有，先导入图片或抽帧（命令行 autolabel import / auto）"
-    return "：" + "；".join(advice)
+        return ("：姿态标注库里一张图都还没有，先导入图片或抽帧（命令行 autolabel import / auto）"
+                + (other_library_hint(root) if root else ""))
+    return "：" + "；".join(advice) + (other_library_hint(root) if root else "")
 
 
 def export_dataset(
@@ -74,11 +101,19 @@ def export_dataset(
     populated: List[Tuple[str, dict]] = []
     empty: List[Tuple[str, dict]] = []
     skipped: List[Tuple[str, str]] = []
+    missing_source: List[str] = []
     for rel, item in idx.ordered_items():
         status = item.get("status", "unreviewed")
         label = label_path_for(root, rel)
         if status in exclude:
             skipped.append((rel, f"status={status}"))
+            continue
+        if source_missing(root, rel):
+            # 磁盘上没这张图：不管是导出还是训练，后面每一步都会踩空。以前它
+            # 一路混进 selected，copy 模式抛 FileNotFoundError 整批失败、
+            # symlink 模式留一根悬空软链还照计数——先在这里拦下，三种模式同行为。
+            skipped.append((rel, MISSING_SOURCE_REASON))
+            missing_source.append(rel)
             continue
         if require_label and not os.path.exists(label):
             skipped.append((rel, MISSING_LABEL_REASON))
@@ -104,7 +139,7 @@ def export_dataset(
     selected = populated + empty
     if not selected:
         raise ValueError("没有符合条件的样本可导出" + skipped_summary(skipped)
-                         + no_sample_hint(skipped))
+                         + no_sample_hint(skipped, root))
     val_set = split_val_set([rel for rel, _item in selected], val_ratio, seed)
     fingerprint = content_fingerprint(
         [(rel, _read_label(root, rel)) for rel, _item in selected],
@@ -127,8 +162,11 @@ def export_dataset(
         os.makedirs(os.path.join(out_root, "labels", split), exist_ok=True)
 
     counts = {"train": 0, "val": 0, "people": {"train": 0, "val": 0}, "empty": len(empty),
-              "empty_dropped": len(dropped_empty)}
+              "empty_dropped": len(dropped_empty), "missing_source": len(missing_source)}
     coco_records: List[Tuple[str, dict, str, List]] = []
+    written: Dict[str, set] = {"train": set(), "val": set()}
+    split_by_rel: Dict[str, str] = {}
+    taken: Dict[str, str] = {}
     for rel, item in selected:
         src_img = os.path.join(os.path.abspath(root), "images", rel)
         src_lbl = label_path_for(root, rel)
@@ -140,7 +178,7 @@ def export_dataset(
             skipped.append((rel, f"标签解析失败：{exc}"))
             continue
         split = "val" if rel in val_set else "train"
-        split_unique = export_stem(rel)
+        split_unique = unique_stem(taken, export_stem(rel), rel)
         dst_img = os.path.join(out_root, "images", split, split_unique + ".jpg")
         dst_lbl = os.path.join(out_root, "labels", split, split_unique + ".txt")
         _place(src_img, dst_img, mode)
@@ -148,7 +186,12 @@ def export_dataset(
             _place(src_lbl, dst_lbl, mode)
         counts[split] += 1
         counts["people"][split] += len(persons)
+        written[split].add(split_unique)
+        split_by_rel[rel] = split
         coco_records.append((split_unique, item, split, persons))
+    # 上一版留下、这一版不再要的帧必须删掉，否则"驳回 30 张重导"之后
+    # 训练集里还是那 30 张，用户根本看不出来
+    counts["pruned"] = prune_stale(out_root, written)
 
     if counts["train"] + counts["val"] == 0:
         # 坏标签改成只跳单帧之后，"每一帧都读不通"会导出了一个 0 张的训练集还报成功。
@@ -169,7 +212,7 @@ def export_dataset(
              f"flip_idx: {flip_idx_for(num_kpt)}"]
     lines.append("names:")
     for cid in sorted(names):
-        lines.append(f"  {cid}: {names[cid]}")
+        lines.append(f"  {cid}: {yaml_scalar(names[cid])}")
     with open(os.path.join(out_root, "data.yaml"), "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
 
@@ -194,7 +237,7 @@ def export_dataset(
     if coords:
         from .coords import write_coordinate_files
 
-        splits = {stem: split for stem, _item, split, _persons in coco_records}
+        splits = split_by_rel
         coord_result = write_coordinate_files(
             root, out=os.path.join(out_root, "coords"), tag="coords",
             exclude_status=tuple(exclude), splits=splits,
@@ -223,6 +266,81 @@ def export_stem(rel: str) -> str:
     """
     stem = os.path.splitext(str(rel).replace(os.sep, "/"))[0].replace("/", "__").strip("_")
     return stem or "image"
+
+
+def unique_stem(taken: Dict[str, str], stem: str, rel: str) -> str:
+    """导出目录里真正落地的文件名，剩下那种撞车兜底加 ``-2``、``-3``。
+
+    :func:`export_stem` 把子目录压进名字，于是 ``a/f.jpg`` 和 ``a__f.jpg`` 会算出
+    同一个 ``a__f``：谁后写谁把前面的连图片带标签一起盖掉，清单和 COCO 里却还按
+    两张计数（实测 3 张图导完磁盘只剩 2 个文件）。宁可多个后缀，也不能悄悄少帧。
+    """
+    if taken.setdefault(stem, rel) == rel:
+        return stem
+    for index in range(2, 1000):
+        candidate = f"{stem}-{index}"
+        if taken.setdefault(candidate, rel) == rel:
+            return candidate
+    forced = f"{stem}-{len(taken)}"
+    taken[forced] = rel
+    return forced
+
+
+def prune_stale(out_root: str, keep: Dict[str, set]) -> int:
+    """删掉导出目录里"这次没产出"的旧文件，返回删掉的数量。
+
+    重复往同一个 ``--out`` 导出时最容易踩：上一版 200 张、这一版驳回了 30 张只剩
+    170 张，旧写法只覆盖同名文件，被驳回那 30 张的图片和标签还留在 ``images/train``
+    里，训练集悄悄带着用户已经判定不要的帧。划分变了（train 挪到 val）同理。
+    """
+    gone = 0
+    for split, stems in keep.items():
+        for kind in ("images", "labels"):
+            folder = os.path.join(out_root, kind, split)
+            if not os.path.isdir(folder):
+                continue
+            try:
+                entries = list(os.scandir(folder))
+            except OSError:
+                continue
+            for entry in entries:
+                try:
+                    if entry.is_dir() and not entry.is_symlink():
+                        continue
+                except OSError:
+                    continue
+                if os.path.splitext(entry.name)[0] in stems:
+                    continue
+                try:
+                    os.remove(entry.path)
+                    gone += 1
+                except OSError:
+                    pass
+    return gone
+
+
+_YAML_PLAIN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.\-]*$")
+_YAML_RESERVED = frozenset({"true", "false", "null", "none", "yes", "no", "on", "off",
+                            "nan", "inf", "~"})
+
+
+def yaml_scalar(value: object) -> str:
+    """把类别名写成 ``data.yaml`` 里的一个标量：不能原样落的就加引号。
+
+    姿态库以前直接写 ``1: 安全帽: 大``，Ultralytics 一 ``yaml.safe_load`` 就报
+    "mapping values are not allowed here"，训练集看着导好了却一帧都跑不起来。
+    纯标识符仍然写成明文，只有会被 YAML 改含义的才加引号。
+    """
+    text = str(value)
+    if _YAML_PLAIN.match(text) and text.lower() not in _YAML_RESERVED:
+        return text
+    return json.dumps(text, ensure_ascii=False)
+
+
+def yaml_comment(value: object) -> str:
+    """注释行里的可变内容：换行会把注释后面的半截变成正经的 YAML 行。"""
+    return " ".join(str(value).split())
+
 
 
 def flip_idx_for(num_kpt: int) -> List[int]:
@@ -312,6 +430,11 @@ def content_fingerprint(pairs: Sequence[Tuple[str, bytes]], params: str = "") ->
     return digest.hexdigest()
 
 
+#: 每种导出各自的元数据文件名：界面靠它认出这份导出属于哪个库、能不能直接复用
+EXPORT_META_NAMES = {"detect": "prompt_meta.json", "yolo_detect": "yolo_meta.json",
+                     "pose": "manifest.json"}
+
+
 def find_reusable_export(root: str, fingerprint: str, kind: str = "pose") -> Optional[dict]:
     """`exports/` 里最近一份指纹完全相同的导出目录，命中就直接复用，字段与真实导出保持一致。"""
     if not fingerprint:
@@ -319,7 +442,7 @@ def find_reusable_export(root: str, fingerprint: str, kind: str = "pose") -> Opt
     for row in list_exports(root, limit=8):
         if row.get("kind") != kind:
             continue
-        meta_name = "prompt_meta.json" if kind == "detect" else "manifest.json"
+        meta_name = EXPORT_META_NAMES.get(kind, "manifest.json")
         try:
             with open(os.path.join(row["path"], meta_name), encoding="utf-8") as fh:
                 meta = json.load(fh)
@@ -330,7 +453,7 @@ def find_reusable_export(root: str, fingerprint: str, kind: str = "pose") -> Opt
         counts = meta.get("counts") or {}
         if not counts:
             continue
-        if kind == "detect":
+        if kind in ("detect", "yolo_detect"):
             fields = {int(row["class_id"]): row for row in meta.get("fields") or []
                       if str(row.get("class_id", "")).lstrip("-").isdigit()}
             remap = meta.get("class_remap") or {}
@@ -446,6 +569,8 @@ def list_exports(root: str, limit: int = 8) -> List[dict]:
             continue
         if os.path.exists(os.path.join(path, "prompt_meta.json")):
             kind = "detect"
+        elif os.path.exists(os.path.join(path, "yolo_meta.json")):
+            kind = "yolo_detect"
         elif os.path.exists(os.path.join(path, "manifest.json")):
             kind = "pose"
         else:

@@ -6,7 +6,7 @@
       images/                 # 共享素材池：统一规范化后的图片（RGB、EXIF 已展开）
       labels/                 # 姿态库标签，与图片同名（YOLO pose 格式）
       prompt_labels/          # 提示词库标签（YOLO detection 格式）
-      qc/  exports/  coords/  # 两个库的产出各写各的文件名
+      qc/  exports/  coords/  # 三个库的产出各写各的文件名
       .autolabel/
         index.json            # 姿态库索引：图片元信息 + 骨骼复核状态 + 标注参数
         batches.json          # 姿态库批次登记表
@@ -14,10 +14,10 @@
         fields.json           # 提示词库的字段登记表
         objects/              # 提示词库：独立索引 + 独立批次 + 独立备份
           index.json batches.json originals/ history/
-        deleted/              # 两库共用的删除快照（快照里记 lib）
+        deleted/              # 各库共用的删除快照（快照里记 lib）
 
-同一个池里的图片可以同时被两个库引用，删除时只摘本库引用；界面上区分
-「从本库移除」和「删素材」，只有两个库都不再引用的图片才会真正落盘删除。
+同一个池里的图片可以同时被三个库引用，删除时只摘本库引用；界面上区分
+「从本库移除」和「删素材」，只有所有库都不再引用的图片才会真正落盘删除。
 """
 
 from __future__ import annotations
@@ -29,9 +29,13 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .library import (LIB_NAMES, LIB_OBJECTS, LIB_POSE, LIBRARIES, backups_dir,
+from .library import (LIB_DETECT, LIB_NAMES, LIB_OBJECTS, LIB_POSE, LIBRARIES, backups_dir,
                       deleted_dir, ensure_lib, exports_dir, history_root, images_dir,
-                      index_path, labels_dir, meta_dir, normalize, pool_files, qc_dir)
+                      index_path, labels_dir, meta_dir, normalize,
+                      pool_files, qc_dir)
+from .atomic import atomic_write_json
+from .library import field_key
+from .library import status_key as library_status_key
 from .yolo_pose import COCO17_FLIP_IDX, COCO17_KEYPOINTS
 
 INDEX_VERSION = 1
@@ -45,9 +49,18 @@ STATUS_EDITED = "edited"
 # 人工已经定论的两个状态：接受 = 确认要进训练集，驳回 = 明确不要。
 # 「等你复核」「优先队列」「导出默认范围」全以这条线为界——界面前后、命令行与
 # 网页必须是同一个口径，否则同一个词在三处给出三个数，用户不知道该信哪个。
-# 注意与 pipeline.HUMAN_STATUSES（approved+edited，"人工碰过就别覆盖"）区分：
+# 注意与下面的 HUMAN_STATUSES（approved+edited，"人工碰过就别覆盖"）区分：
 # 那条线保护成果，这条线判断还需不需要人再看一眼，用途不同不能混用。
+#: 复核状态的全集：命令行参数、界面请求、索引落盘三处同一个口径，别各写一份
+ALL_STATUSES = (STATUS_UNREVIEWED, STATUS_EDITED, STATUS_APPROVED, STATUS_REJECTED)
+
 DEFINITIVE_STATUSES = (STATUS_APPROVED, STATUS_REJECTED)
+
+#: 人工在复核界面碰过的两个状态：接受过的、手工改过的。批量重标默认绕开它们。
+#: 这条线以前只有姿态流水线认（定义在 pipeline 里），检测与提示词两处各自抄了一遍
+#: 且都漏了 edited——"改过但还没点接受"的框会被下一次批量标注悄悄抹掉。
+#: 现在三处共用这一个定义，别再出现第三种说法。
+HUMAN_STATUSES = (STATUS_APPROVED, STATUS_EDITED)
 
 
 # --------------------------------------------------------------------------- #
@@ -83,6 +96,26 @@ def resolve_image(root: str, image_rel: str) -> str:
     if os.path.commonpath([base, path]) != base:
         raise ValueError(f"图片路径越界: {image_rel!r}")
     return path
+
+
+def source_missing(root: str, image_rel: str) -> bool:
+    """索引里有记录、磁盘上却没有这张图（手工删了 / 外接盘没接上）。
+
+    以前导出端对这种情况要么整批崩（copy/hardlink 抛 FileNotFoundError，
+    报的还是一句裸的 ``[Errno 2]``），要么悄悄产出一根指向空气的软链
+    （symlink：manifest 照报"train 4 张"，要到训练读图时才炸）。三处口径必须
+    先有一个共同的判定，才谈得上统一行为。
+    """
+    try:
+        path = resolve_image(root, image_rel)
+    except ValueError:
+        return True
+    return not os.path.isfile(path)
+
+
+def missing_sources(root: str, rels: Iterable[str]) -> List[str]:
+    """挑出索引里指向丢失文件的相对路径，保持传入顺序。"""
+    return [rel for rel in rels if source_missing(root, rel)]
 
 
 # --------------------------------------------------------------------------- #
@@ -139,18 +172,13 @@ class DatasetIndex:
     def save(self) -> None:
         self.data["updated_at"] = now_str()
         self.data["lib"] = self.lib
-        path = index_path(self.root, self.lib)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(self.data, fh, ensure_ascii=False, indent=2, sort_keys=True)
-        os.replace(tmp, path)
+        atomic_write_json(index_path(self.root, self.lib), self.data, sort_keys=True)
 
 
 def status_of(item: Optional[dict], lib: str = LIB_POSE) -> str:
-    """取一张图的复核状态：提示词库写在 ``prompt_status``，姿态库写在 ``status``。"""
-    key = "prompt_status" if normalize(lib) == LIB_OBJECTS else "status"
-    return str((item or {}).get(key) or STATUS_UNREVIEWED)
+    """取一张图的复核状态。每库用自己的键（``status`` / ``prompt_status`` /
+    ``detect_status``），所以删库、重建索引不会把别的库的状态串过来。"""
+    return str((item or {}).get(library_status_key(lib)) or STATUS_UNREVIEWED)
 
 
 def is_definitive(item: Optional[dict], lib: str = LIB_POSE) -> bool:
@@ -172,7 +200,9 @@ def init_dataset(root: str, name: Optional[str] = None,
     for lib in LIBRARIES:
         ensure_lib(root, lib)
     idx = _init_pose_index(root, name, class_names, num_keypoints)
-    _init_objects_index(root, name)
+    for lib in LIBRARIES:
+        if lib != LIB_POSE:
+            _init_box_index(root, lib, name)
     return idx
 
 
@@ -203,14 +233,15 @@ def _init_pose_index(root: str, name: Optional[str] = None,
     return idx
 
 
-def _init_objects_index(root: str, name: Optional[str] = None) -> DatasetIndex:
-    """建/读提示词库索引（不含关键点相关字段，那些是姿态库的事）。"""
-    path = index_path(root, LIB_OBJECTS)
-    if os.path.exists(path):
-        return load_index(root, LIB_OBJECTS)
+def _init_box_index(root: str, lib: str = LIB_OBJECTS,
+                    name: Optional[str] = None) -> DatasetIndex:
+    """建/读一个「框」类库的索引（提示词库与目标检测库结构一样，只差库名）。"""
+    lib = normalize(lib)
+    if os.path.exists(index_path(root, lib)):
+        return load_index(root, lib)
     data = {
         "version": INDEX_VERSION,
-        "lib": LIB_OBJECTS,
+        "lib": lib,
         "name": name or os.path.basename(root),
         "created_at": now_str(),
         "updated_at": now_str(),
@@ -218,9 +249,14 @@ def _init_objects_index(root: str, name: Optional[str] = None) -> DatasetIndex:
         "settings": {},
         "items": {},
     }
-    idx = DatasetIndex(root=root, data=data, lib=LIB_OBJECTS)
+    idx = DatasetIndex(root=root, data=data, lib=lib)
     idx.save()
     return idx
+
+
+def _init_objects_index(root: str, name: Optional[str] = None) -> DatasetIndex:
+    """建/读提示词库索引（旧调用名保留）。"""
+    return _init_box_index(root, LIB_OBJECTS, name)
 
 
 def load_index(root: str, lib: str = LIB_POSE) -> DatasetIndex:
@@ -277,14 +313,18 @@ POOL_KEYS = ("width", "height", "sha256", "bytes", "dhash", "imported_at", "sour
 
 
 def _entry_defaults(lib: str) -> dict:
-    """新库条目的初始状态字段：两个库各自记自己的复核状态，互不掺水。"""
-    if normalize(lib) == LIB_OBJECTS:
-        return {"prompt_status": STATUS_UNREVIEWED, "prompt_objects": None, "prompt_flags": []}
-    return {"status": STATUS_UNREVIEWED, "objects": None, "flags": []}
+    """新库条目的初始状态字段：每个库只记自己的状态与计数，互不掺水。
+
+    姿态库用不带前缀的 ``status`` / ``objects`` / ``flags``（沿用老数据集的键名），
+    提示词库与目标检测库各自带前缀，这样跨库复制元信息时不会把状态串味。
+    """
+    name = normalize(lib)
+    return {field_key(name, "status"): STATUS_UNREVIEWED,
+            field_key(name, "objects"): None, field_key(name, "flags"): []}
 
 
 def pool_entries(root: str, lib: str = LIB_POSE) -> Dict[str, dict]:
-    """两库索引合并出的「素材池视角」：``相对路径 -> 条目``，用于跨库去重与复用。"""
+    """三个库索引合并出的「素材池视角」：``相对路径 -> 条目``，用于跨库去重与复用。"""
     merged: Dict[str, dict] = {}
     for other in LIBRARIES:
         other_idx = load_index_or_none(root, other)
@@ -294,6 +334,17 @@ def pool_entries(root: str, lib: str = LIB_POSE) -> Dict[str, dict]:
             merged.setdefault(rel, item)
     merged.pop("__missing__", None)
     return merged
+
+
+def libs_holding_image(root: str, image_rel: str) -> List[str]:
+    """这张素材现在被哪些库引用（删文件前先问这个）。"""
+    rel = str(image_rel).replace("\\", "/")
+    holders = []
+    for lib in LIBRARIES:
+        other = load_index_or_none(root, lib)
+        if other is not None and rel in other.items:
+            holders.append(lib)
+    return holders
 
 
 def adopt_pool_entry(target: DatasetIndex, source_item: Optional[dict], rel: str) -> bool:
@@ -313,23 +364,29 @@ def adopt_pool_entry(target: DatasetIndex, source_item: Optional[dict], rel: str
 
 
 def pool_items(root: str) -> List[dict]:
-    """素材池清单：每个文件在哪些库里被引用了，供「从素材池添加」与删除确认用。"""
-    pose = load_index_or_none(root, LIB_POSE)
-    objects = load_index_or_none(root, LIB_OBJECTS)
+    """素材池清单：每个文件在哪些库里被引用了，供「从素材池添加」与删除确认用。
+
+    ``in_<库名>`` 是各库的单独开关（门户按它决定"这张要不要出现在本库"），
+    ``libs`` 是引用它的库名列表——判断"删文件会不会影响别的库"只看这一个，
+    两个库的时代可以瞎写 ``in_pose and in_objects``，三个库就不够用了。
+    """
+    indexes = {lib: load_index_or_none(root, lib) for lib in LIBRARIES}
     rows: List[dict] = []
     for rel in pool_files(root):
-        p_item = pose.get(rel) if pose else None
-        o_item = objects.get(rel) if objects else None
-        base = p_item or o_item or {}
+        found = {lib: (idx.get(rel) if idx is not None else None) for lib, idx in indexes.items()}
+        base = next((item for item in found.values() if item), {})
+        holders = [lib for lib, item in found.items() if item is not None]
         rows.append({
             "image": rel, "name": os.path.basename(rel),
             "bytes": int(base.get("bytes") or 0),
             "width": base.get("width"), "height": base.get("height"),
             "imported_at": base.get("imported_at"),
             "video": os.path.basename(str(base["video"])) if base.get("video") else "",
-            "in_pose": p_item is not None, "in_objects": o_item is not None,
-            "status": (p_item or {}).get("status") or "",
-            "prompt_status": (o_item or {}).get("prompt_status") or "",
+            "in_pose": found[LIB_POSE] is not None, "in_objects": found[LIB_OBJECTS] is not None,
+            "in_detect": found[LIB_DETECT] is not None, "libs": holders,
+            "status": (found[LIB_POSE] or {}).get("status") or "",
+            "prompt_status": (found[LIB_OBJECTS] or {}).get("prompt_status") or "",
+            "detect_status": (found[LIB_DETECT] or {}).get("detect_status") or "",
         })
     rows.sort(key=lambda row: str(row.get("imported_at") or ""), reverse=True)
     return rows
@@ -388,7 +445,7 @@ def import_images(
     :param dedupe: ``none`` | ``exact``（内容哈希）| ``perceptual``（dHash 近似重复）
     :param lib: 目标标注库，``pose`` 或 ``objects``
 
-    去重看的是**素材池**（两个库的并集）：另一个库已经存过同一帧时不再复制文件，
+    去重看的是**素材池**（三个库的并集）：另一个库已经存过同一帧时不再复制文件，
     只把已有文件登记进本库，计入 ``reused``。本库已有才算 ``skipped_*``。
     """
     from .image_utils import dhash64, hamming
@@ -606,11 +663,13 @@ def import_prepared(
 # 与测试里的 ``ds.index_path(...)`` 都还能用；新增代码请直接从 :mod:`autolabel.library` 取。
 __all__ = [
     "COCO17_KEYPOINTS", "IMAGE_EXTS", "INDEX_VERSION", "LIB_OBJECTS", "LIB_POSE", "LIBRARIES",
-    "STATUS_APPROVED", "STATUS_EDITED", "STATUS_REJECTED", "STATUS_UNREVIEWED", "DatasetIndex",
+    "ALL_STATUSES", "STATUS_APPROVED", "STATUS_EDITED", "STATUS_REJECTED",
+    "STATUS_UNREVIEWED", "DatasetIndex",
+    "DEFINITIVE_STATUSES", "HUMAN_STATUSES",
     "adopt_from_pool", "backups_dir", "collect_image_files", "deleted_dir", "ensure_lib",
     "exports_dir", "file_sha256", "history_root", "images_dir", "import_images",
     "import_prepared", "index_path", "init_dataset", "label_path_for", "labels_dir",
-    "load_index", "load_index_or_none", "meta_dir", "now_str", "pool_items",
+    "load_index", "load_index_or_none", "meta_dir", "missing_sources", "now_str", "pool_items",
     "prompt_label_path_for", "prompt_labels_dir", "qc_dir", "resolve_image",
-    "sync_missing_labels",
+    "source_missing", "sync_missing_labels",
 ]

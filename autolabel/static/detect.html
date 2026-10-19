@@ -1,0 +1,435 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>目标检测</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23141a22'/%3E%3Cg fill='none' stroke='%2343b581' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M16 12v8M16 14l-5 3M16 14l5 3M16 20l-4 6M16 20l4 6'/%3E%3C/g%3E%3Ccircle cx='16' cy='8' r='3.2' fill='%2343b581'/%3E%3C/svg%3E">
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='2.2' y='3.4' width='11.6' height='9.2' rx='1.6' fill='none' stroke='%234ade80' stroke-width='1.3'/%3E%3Ccircle cx='11.4' cy='5.9' r='1.3' fill='%234ade80'/%3E%3Cpath d='M4.4 10.6 L6.6 7.6 L8.4 9.8 L10.2 7.2 L11.8 10.6' stroke='%234ade80' stroke-width='1.2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+<script>
+/* 首屏先把主题与字号定好，免得先黑后白闪一下；选择存在这台浏览器，五个页面共用 */
+(function () {
+  try {
+    var a = JSON.parse(localStorage.getItem("autolabel.appearance") || "{}") || {};
+    var pref = ["light", "dark"].indexOf(a.theme) >= 0 ? a.theme : "auto";
+    var light = pref === "light" ||
+      (pref === "auto" && window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
+    var r = document.documentElement;
+    r.dataset.theme = light ? "light" : "dark";
+    r.dataset.themePref = pref;
+    r.dataset.fs = ["0", "2", "3"].indexOf(String(a.fs)) >= 0 ? String(a.fs) : "1";
+  } catch (e) { /* 读不到就用默认：跟随系统 + 标准字号 */ }
+})();
+</script>
+</head>
+<body data-page="detect" data-lib="detect">
+
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+  <symbol id="ic-mark" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 9v7M12 11l-4.2 2.6M12 11l4.2 2.6M12 16l-3.4 5M12 16l3.4 5"/></g><circle cx="12" cy="6" r="2.6" fill="currentColor"/></symbol>
+  <symbol id="ic-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></symbol>
+  <symbol id="ic-dots" viewBox="0 0 16 16"><circle cx="3.4" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="8" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="12.6" cy="8" r=".9" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="ic-upload" viewBox="0 0 16 16"><path d="M8 11V2.6M8 2.6 4.8 5.8M8 2.6l3.2 3.2M2.6 10v2.4a1 1 0 0 0 1 1h8.8a1 1 0 0 0 1-1V10"/></symbol>
+  <symbol id="ic-layers" viewBox="0 0 16 16"><path d="M8 1.8 1.6 5 8 8.2 14.4 5 8 1.8ZM1.6 8.4 8 11.6l6.4-3.2M1.6 11.4 8 14.6l6.4-3.2"/></symbol>
+  <symbol id="ic-boxes" viewBox="0 0 16 16"><rect x="2" y="3.2" width="12" height="9.6" rx="1.4"/><path d="M5.6 10.4 7.4 7.6l1.8 2.2 1.4-2 1.4 2.6"/></symbol>
+  <symbol id="ic-cube" viewBox="0 0 16 16"><path d="M8 1.8 14 5v6l-6 3.2L2 11V5l6-3.2ZM2 5l6 3.2L14 5M8 8.2v6"/></symbol>
+  <symbol id="ic-key" viewBox="0 0 16 16"><rect x="1.6" y="4" width="12.8" height="8" rx="1.4"/><path d="M4.2 6.6h.01M6.6 6.6h.01M9 6.6h.01M11.4 6.6h.01M4.2 9.4h7.6"/></symbol>
+  <symbol id="ic-target" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2.4M8 12.8v2.4M.8 8h2.4M12.8 8h2.4"/></symbol>
+  <symbol id="ic-run" viewBox="0 0 16 16"><path d="M5 3.2 12.6 8 5 12.8V3.2Z"/></symbol>  <symbol id="ic-refresh" viewBox="0 0 16 16"><path d="M13.4 8a5.4 5.4 0 1 1-1.6-3.8"/><path d="M12.2 1.4v2.9H9.3"/></symbol>  <symbol id="ic-gear" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.3"/><path d="M8 1.3v2.1M8 12.6v2.1M1.3 8h2.1M12.6 8h2.1M3.3 3.3l1.5 1.5M11.2 11.2l1.5 1.5M12.7 3.3l-1.5 1.5M4.8 11.2l-1.5 1.5"/></symbol>
+</svg>
+
+<header>
+  <a class="brand" id="nav-portal" href="/"><svg class="mark"><use href="#ic-mark"/></svg>自动标注<span id="ds-name" class="muted"></span></a>
+  <nav id="nav-modules"></nav>
+  <span class="capsule" id="queue-capsule" title="焦点队列：带标记或还没标过检测框的帧">
+    <svg class="ic" style="width:13px;height:13px"><use href="#ic-target"/></svg>
+    <span class="name" id="capsule-set">载入中…</span>
+    <span class="num" id="capsule-count"></span>
+    <button id="btn-flagged" title="跳到下一张待复核（F）">跳转</button>
+  </span>
+  <div class="controls">
+    <a class="vchip" id="version-chip" href="https://github.com/windinchen/autolabel"
+       target="_blank" rel="noopener noreferrer" title="当前版本 · 点开看 GitHub 仓库">v—</a>
+    <div class="wrap-rel">
+      <button class="searchbtn" id="btn-palette" title="命令面板">
+        <svg class="ic" style="width:13px;height:13px"><use href="#ic-search"/></svg>
+        搜帧或命令<span class="kbd">⌘K</span>
+      </button>
+    </div>
+    <button class="btn primary" id="btn-run" title="用本机 YOLO 权重按本库类别出框，不联网、单张几十毫秒（G）">
+      <svg class="ic"><use href="#ic-run"/></svg>批量目标检测
+    </button>
+    <button class="btn" id="btn-upload" title="导入图片 / 目录 / 视频（W）">
+      <svg class="ic"><use href="#ic-upload"/></svg>导入素材
+    </button>
+    <div class="wrap-rel">
+      <button class="iconbtn" id="btn-more" title="筛选、显示与导出" aria-haspopup="true" aria-expanded="false">
+        <svg class="ic"><use href="#ic-dots"/></svg>
+      </button>
+      <div class="menu" id="more-menu" hidden>
+        <div class="menu-label">队列</div>
+        <label class="menu-field">筛选
+          <select id="filter">
+            <option value="pending" selected>待复核</option>
+            <option value="flagged">仅带标记</option>
+            <option value="edited">已修改</option>
+            <option value="approved">已接受</option>
+            <option value="rejected">已驳回</option>
+            <option value="unlabeled">未标注</option>
+            <option value="all">全部</option>
+          </select>
+        </label>
+        <label class="menu-field">排序
+          <select id="sort">
+            <option value="priority">按优先级</option>
+            <option value="name">按文件名</option>
+          </select>
+        </label>
+        <label class="menu-field"><span>显示标签</span><input type="checkbox" id="show-labels" checked></label>
+        <button class="menu-item" id="btn-fields"><svg class="ic"><use href="#ic-layers"/></svg>类别管理<span class="kbd k">1</span></button>
+        <div class="menu-sep"></div>
+        <div class="menu-label">导出</div>
+        <a class="menu-item" href="/api/prompt/coords?format=csv&lib=detect" download
+           title="导出一行一个框的 CSV（本库 detect_labels/）">坐标 CSV</a>
+        <a class="menu-item" href="/api/prompt/coords?format=jsonl&lib=detect" download
+           title="导出一行一张图的 JSONL（本库 detect_labels/）">坐标 JSONL</a>
+        <button class="menu-item" id="btn-export-yolo"
+          title="导出 YOLO 标准训练集：images/{train,val} + labels/{train,val} + data.yaml（类别名取本库类别表）">
+          YOLO 训练集</button>
+        <div class="menu-label">关于</div>
+        <div class="menu-field muted small"><span>版本</span><span class="mono" id="about-version">—</span></div>
+        <div class="menu-field muted small"><span>开发者</span><a id="about-dev"
+          href="https://github.com/windinchen" target="_blank" rel="noopener noreferrer">windinchen</a></div>
+        <a class="menu-item" id="about-home" href="https://github.com/windinchen/autolabel"
+           target="_blank" rel="noopener noreferrer"><svg class="ic"><use href="#ic-cube"/></svg>GitHub 仓库</a>
+        <button class="menu-item" id="about-check"><svg class="ic"><use href="#ic-refresh"/></svg>检查更新</button>
+        <div class="menu-field muted small" id="about-note"></div>
+        <div class="menu-sep"></div>
+        <button class="menu-item" id="btn-settings"><svg class="ic"><use href="#ic-gear"/></svg>系统设置<span class="kbd k">⌥S</span></button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="update-bar" id="update-bar" hidden>
+  <svg class="ic"><use href="#ic-refresh"/></svg>
+  <span id="update-text"></span>
+  <a id="update-open" href="https://github.com/windinchen/autolabel/releases"
+     target="_blank" rel="noopener noreferrer">查看更新</a>
+  <button id="update-later">知道了</button>
+</div>
+<div class="progress" id="progress-track"><div id="progress-bar" class="bar"></div></div>
+
+<div id="export-note" class="export-note bar muted small hidden"></div>
+
+<div id="job-strip" class="hidden">
+  <span id="job-strip-text"></span>
+  <button id="strip-clear-jobs" class="danger">清除任务</button>
+</div>
+
+<main>
+  <div id="rail">
+    <button class="iconbtn on" id="rail-queue" title="焦点队列"><svg class="ic"><use href="#ic-target"/></svg></button>
+    <button class="iconbtn" id="rail-upload" title="导入素材（W）"><svg class="ic"><use href="#ic-upload"/></svg></button>
+    <button class="iconbtn" id="rail-fields" title="类别管理（1）"><svg class="ic"><use href="#ic-layers"/></svg></button>
+    <button class="iconbtn" id="rail-run" title="批量目标检测（G）"><svg class="ic"><use href="#ic-run"/></svg></button>
+    <span class="sep"></span>
+    <a class="iconbtn on" href="/detect" title="目标检测（本页）"><svg class="ic"><use href="#ic-boxes"/></svg></a>
+    <a class="iconbtn" href="/objects" title="提示词标注（O）"><svg class="ic"><use href="#ic-layers"/></svg></a>
+    <a class="iconbtn" href="/pose" title="回姿态标注（P）"><svg class="ic"><use href="#ic-target"/></svg></a>
+    <a class="iconbtn" href="/models" title="模型管理（M）"><svg class="ic"><use href="#ic-cube"/></svg></a>
+    <span class="sep"></span>
+    <button class="iconbtn" id="btn-help" title="快捷键速查（?）"><svg class="ic"><use href="#ic-key"/></svg></button>
+  </div>
+
+  <div id="queue-col">
+    <div class="queue-head">焦点队列<span class="n" id="queue-count"></span></div>
+    <div id="filmstrip"></div>
+  </div>
+
+  <section id="stage">
+    <canvas id="canvas"></canvas>
+    <div id="empty-state" class="hidden">当前筛选下没有图片：点右上角「导入素材」上传图片和视频，或切右上角筛选。</div>
+    <div id="loading" class="hidden">加载中…</div>
+    <div id="toast" class="hidden"></div>
+    <div id="draw-hint" class="muted small">空白处拖动画框补漏标 · 点框选中后可改类别/删除 · 空格拖动平移、滚轮缩放</div>
+    <div id="hud">
+      <span class="chip bad" id="hud-flag">0 处待确认</span>
+      <span class="pos" id="hud-pos">第 <b>0</b> / 0</span>
+    </div>
+    <div id="undo-bar">
+      <span class="dot"></span><span id="undo-label">已接受</span>
+      <button id="btn-undo-bar">撤销 U</button><span class="cd" id="undo-cd">5s</span>
+    </div>
+  </section>
+  <aside id="panel">
+    <div id="panel-scroll">
+      <div class="panel-block">
+        <div class="panel-title">当前图片</div>
+        <div id="meta" class="mono small"></div>
+        <div id="flags"></div>
+      </div>
+      <div class="panel-block">
+        <div class="panel-title">绘制类别<span class="muted small"> · 新框算哪一类</span></div>
+        <select id="draw-field" class="wide"></select>
+        <div class="panel-title" style="margin-top:8px">检测框列表<span id="box-count" class="muted"></span></div>
+        <div id="boxes"></div>
+      </div>
+    </div>
+    <div class="panel-block actions">
+      <div class="panel-title">动作</div>
+      <div class="btn-row">
+        <button id="btn-approve" class="primary">接受 Q</button>
+        <button id="btn-reject" class="danger">驳回 E</button>
+      </div>
+      <div class="btn-row">
+        <button id="btn-delete">删除选中框 X</button>
+        <button id="btn-undo">撤销本轮 U</button>
+      </div>
+      <div class="btn-row">
+        <button id="btn-prev">← 上一张</button>
+        <button id="btn-next">下一张 →</button>
+      </div>
+      <div class="kbd-help">
+        <div><span>0 / 1</span><span>删框 / 打开类别管理</span></div>
+        <div><span>[ / ]</span><span>切换选中框</span></div>
+        <div><span>Z</span><span>适应窗口</span></div>
+        <div><span>⌘K / ?</span><span>命令面板 / 全部快捷键</span></div>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<footer>
+  <div id="save-state" class="muted">就绪</div>
+  <div id="progress-text" class="muted small"></div>
+  <div id="hint" class="muted small"></div>
+</footer>
+
+<div id="palette-modal" class="modal hidden">
+  <div class="modal-card">
+    <input type="text" id="palette-input" placeholder="输入动作、文件名或筛选条件…" spellcheck="false" autocomplete="off">
+    <div id="palette-list"></div>
+    <div class="palette-hint"><span>↑↓ 选择</span><span>Enter 执行</span><span>Esc 关闭</span></div>
+  </div>
+</div>
+
+<div id="help-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title">快捷键<span class="muted small"> · 数字键在本页是「删框 / 类别管理」，与姿态页不同，两侧说明各按各的</span></div>
+    <div class="help-grid">
+      <div class="panel-title">复核</div>
+      <div><span>Q</span><span>接受当前图</span></div>
+      <div><span>E</span><span>驳回当前图</span></div>
+      <div><span>U</span><span>撤销这张图的上一次保存（⌘Z 同）；撤销条开着时先退回刚才那次接受 / 驳回</span></div>
+      <div><span>F</span><span>跳到下一张待复核</span></div>
+      <div><span>A / D</span><span>上一张 / 下一张</span></div>
+      <div><span>↑ / ↓</span><span>队列内上下移动</span></div>
+      <div class="panel-title">检测框</div>
+      <div><span>空白处拖</span><span>补画漏掉的目标</span></div>
+      <div><span>角点拖</span><span>改框大小</span></div>
+      <div><span>X</span><span>删除选中框</span></div>
+      <div><span>[ / ]</span><span>切换选中框</span></div>
+      <div><span>Z</span><span>适应窗口</span></div>
+      <div><span>0 / 1</span><span>删框 / 打开类别管理</span></div>
+      <div class="panel-title">界面</div>
+      <div><span>⌘K</span><span>命令面板</span></div>
+      <div><span>?</span><span>本速查表</span></div>
+        <div><span>⌥T</span><span>白天 / 夜晚</span></div>
+        <div><span>⌥= / ⌥-</span><span>字号放大 / 缩小</span></div>
+        <div><span>⌥S</span><span>系统设置（外观 + 推理算力）</span></div>
+      <div><span>G</span><span>批量目标检测</span></div>
+      <div><span>W</span><span>导入素材</span></div>
+      <div><span>O</span><span>去提示词标注（大模型按描述找物品）</span></div>
+      <div><span>P</span><span>回姿态标注页</span></div>
+      <div><span>M</span><span>模型管理页</span></div>
+    </div>
+    <div class="btn-row"><button id="help-close">关闭</button></div>
+  </div>
+</div>
+
+<div id="confirm-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title" id="confirm-title">确认操作</div>
+    <div id="confirm-body" class="muted"></div>
+    <div class="btn-row">
+      <button id="confirm-ok" class="danger">确定</button>
+      <button id="confirm-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="field-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title">类别管理<span class="muted small"> · 先把权重自带的类别导进来，「批量目标检测」只吃本库这张类别表</span></div>
+    <div class="model-section">
+      <div class="model-section-head">
+        <span class="panel-title">从权重导入类别</span>
+        <label class="muted small">本机权重 <select id="cls-model"></select></label>
+        <button class="btn" id="cls-reload" title="重新列一遍本机权重与它自带的类别">重新载入</button>
+        <span class="spacer"></span>
+        <span class="muted small" id="cls-count"></span>
+      </div>
+      <div class="muted small" id="cls-note">选一个本机权重，下面会列出它自带的类别（不联网，就地读权重）。</div>
+      <div class="param-row">
+        <label class="muted small grow">搜类别（中文名 / 英文类名 / class_id）
+          <input type="search" id="cls-search" placeholder="比如 bus、公交车、5" spellcheck="false">
+        </label>
+        <button class="btn" id="cls-all">全选</button>
+        <button class="btn" id="cls-clear">清空</button>
+        <button class="btn" id="cls-invert">反选</button>
+      </div>
+      <div id="cls-list" class="check-list muted small">加载中…</div>
+      <div class="btn-row">
+        <button id="cls-import" class="primary" disabled>导入所选</button>
+      </div>
+      <div class="muted small" id="cls-result"></div>
+      <div class="muted small" id="cls-model-note"></div>
+      <div class="muted small">导入只往本库类别表里加行：<b>同名类别永不换号</b>，换一副权重也不会让先前标好的框指到别的东西上；
+        没勾的类别权重照样认得，只是这张表里不要它。</div>
+    </div>
+    <div class="panel-title">本库类别表<span class="muted small"> · 类名写进 data.yaml，运行与导出都按这张表</span></div>
+    <div id="field-list"></div>
+    <div id="field-form">
+      <div class="vlm-row">
+        <label class="muted small grow">字段名（英文）
+          <input type="text" id="field-name" placeholder="bottle" spellcheck="false"
+                 title="只能字母开头，接字母数字下划线短横线，最长 32 字符；这是写进标签和 data.yaml 的类名">
+        </label>
+        <label class="muted small grow">中文显示名
+          <input type="text" id="field-label" placeholder="瓶子" spellcheck="false">
+        </label>
+        <input type="hidden" id="field-id">
+      </div>
+      <div class="vlm-row">
+        <label class="muted small grow">备注（选填）
+          <textarea id="field-hint" rows="2" spellcheck="false"
+            placeholder="给这一类补一句人话说明，只有你自己看；出框靠的是权重自带的类别"></textarea>
+        </label>
+      </div>
+      <div class="btn-row">
+        <button id="field-save" class="primary">保存类别</button>
+        <button id="field-reset">新建 / 清空</button>
+        <button id="field-close">关闭</button>
+      </div>
+      <div id="field-log" class="mono"></div>
+    </div>
+    <div class="muted small">权重自带的类别直接导进来最省事；确实缺一个也可以手填（英文类名写进标签与
+      <span class="mono">data.yaml</span>，但换权重后它认不出来就标不到框）。
+      类别号 <span class="mono">class_id</span> 创建后固定、删了不复用，避免历史标签串类。
+      本库类别表在 <span class="mono">.autolabel/detect/classes.json</span>。</div>
+  </div>
+</div>
+
+<div id="run-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title">批量目标检测<span class="muted small"> · 本机 YOLO 权重按本库类别表出框，不联网</span></div>
+    <div class="model-section">
+      <div class="model-section-head">
+        <span class="panel-title">要标的类别</span>
+        <span class="spacer"></span>
+        <label class="muted small"><input type="checkbox" id="run-all-fields" checked> 全选</label>
+      </div>
+      <div id="run-fields"></div>
+    </div>
+    <div class="param-row">
+      <label class="muted small">本机权重
+        <select id="run-model"></select>
+      </label>
+      <label class="muted small" title="低于这个置信度的框直接丢掉">置信度阈值
+        <input type="number" id="run-conf" value="0.25" min="0.01" max="0.95" step="0.05">
+      </label>
+      <label class="muted small">标注范围
+        <select id="run-scope">
+          <option value="unlabeled" selected>只标还没标过的</option>
+          <option value="current">当前筛选结果</option>
+          <option value="all">全部图片</option>
+        </select>
+      </label>
+      <label class="muted small">最多张数 <input type="number" id="run-limit" value="0" min="0" max="5000"
+        title="0 表示不限；本机权重单张几十毫秒，整库跑一轮也就一两分钟"></label>
+      <label class="muted small" title="勾上会覆盖已有的检测框（含人工改过的），慎勾">
+        <input type="checkbox" id="run-overwrite"> 覆盖已有框
+      </label>
+    </div>
+    <div class="muted small" id="run-model-note"></div>
+    <div class="btn-row">
+      <button id="run-start" class="primary">开始出框</button>
+      <button id="run-clear-jobs" class="danger" disabled>清除任务</button>
+      <button id="run-export" title="标完后导出 YOLO detection 数据集">导出数据集</button>
+      <button id="run-close">关闭</button>
+    </div>
+    <div class="progress"><div id="run-bar" class="bar"></div></div>
+    <div id="run-log" class="mono"></div>
+    <div class="muted small">本地推理不联网：单张通常几十毫秒，几百张也就一两分钟，比问多模态大模型快得多。
+      换权重或改了类别表之后，先前标过的图会打 <span class="mono">model_stale</span> 标记，提示重标。</div>
+  </div>
+</div>
+
+<div id="up-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title">导入素材<span class="muted small"> · 目标检测模块独立上传，入库后本机权重直接出框</span></div>
+    <div id="up-drop">把文件拖到这里，或用下面的按钮选择<br>
+      <span class="muted small">视频先抽帧再逐帧跑本机权重；图片和目录直接入库。这条链路不联网、不跑 YOLO-pose，
+        产出写 <span class="mono">detect_labels/</span>，与提示词库的 <span class="mono">prompt_labels/</span> 互不影响</span>
+    </div>
+    <div class="pick-row">
+      <label class="btn"><input type="file" id="up-file-images" multiple accept="image/*" hidden> 选择图片</label>
+      <label class="btn"><input type="file" id="up-file-dir" webkitdirectory multiple hidden> 选择图片目录</label>
+      <label class="btn"><input type="file" id="up-file-video" accept="video/*" hidden> 选择视频</label>
+      <button class="btn" id="up-pool" title="素材池里已有的图直接加进目标检测库，不重新上传、不复制文件">从素材池添加</button>
+    </div>
+    <div class="muted small">素材池是几个库共用的 <span class="mono">images/</span>：别的库传过的图，这里可以直接引用同一份文件再出一次框，不占双份。</div>
+    <div class="model-section">
+      <div class="model-section-head">
+        <span class="panel-title">要标的类别</span>
+        <span class="spacer"></span>
+        <label class="muted small"><input type="checkbox" id="up-all-fields" checked> 全选</label>
+      </div>
+      <div id="up-fields"></div>
+    </div>
+    <div class="param-row">
+      <label class="muted small">本机权重 <select id="up-model"></select></label>
+      <label class="muted small" title="低于这个置信度的框直接丢掉">置信度阈值
+        <input type="number" id="up-conf" value="0.25" min="0.01" max="0.95" step="0.05">
+      </label>
+      <label class="muted small">视频抽帧
+        <select id="up-fps">
+          <option value="0.5" selected>每 2 秒 1 帧</option>
+          <option value="1">每秒 1 帧</option>
+          <option value="2">每秒 2 帧</option>
+        </select>
+      </label>
+      <label class="muted small">最多帧数 <input type="number" id="up-max-frames" value="600" min="1" max="5000"></label>
+      <label class="muted small" title="不勾就只入库，之后再到「批量目标检测」里跑">
+        <input type="checkbox" id="up-label" checked> 入库后自动标注
+      </label>
+      <label class="muted small" title="默认按画面相似度丢弃近重复帧">
+        <input type="checkbox" id="up-keep-similar"> 保留近重复帧
+      </label>
+    </div>
+    <div class="vlm-row">
+      <label class="muted small grow">批次名（选填）
+        <input type="text" id="up-batch-name" placeholder="例如：10 月厨房采集" spellcheck="false">
+      </label>
+    </div>
+    <div class="muted small" id="up-note">权重在 <span class="mono">models/</span> 里，管理去「模型管理」（按
+      <span class="mono">M</span>）；本机推理不联网，几百帧也就一两分钟，整批传完直接出框。</div>
+    <div class="muted small" id="up-model-note"></div>
+    <div id="up-files" class="muted small">尚未选择文件</div>
+    <div class="btn-row">
+      <button id="up-start" class="primary" disabled>开始上传并标注</button>
+      <button id="up-clear-jobs" class="danger" disabled title="取消排队中和正在标注的任务">清除任务</button>
+      <button id="up-clear">清空</button>
+      <button id="up-close">关闭</button>
+    </div>
+    <div class="progress"><div id="up-bar" class="bar"></div></div>
+    <div id="up-log" class="mono"></div>
+  </div>
+</div>
+
+<script src="/common.js"></script>
+<script src="/objects.js"></script>
+</body>
+</html>

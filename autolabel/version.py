@@ -21,7 +21,7 @@ from typing import Callable, Optional, Tuple
 
 DEVELOPER = "windinchen"
 REPO = "windinchen/autolabel"
-VERSION = "1.2.3"
+VERSION = "1.2.4"
 
 OWNER = REPO.split("/", 1)[0]
 HOME_PAGE_URL = f"https://github.com/{OWNER}"
@@ -34,6 +34,9 @@ DEFAULT_CACHE = os.path.join("~", ".autolabel", "update.json")
 CACHE_TTL = 12 * 3600          # 半天查一次：界面上每次开页只读缓存，不该为版本号去等网络
 TIMEOUT = 2.5                  # 网络再慢也不值得让用户多等这么久
 _VERSION_PATTERN = re.compile(r'^VERSION\s*=\s*["\']([\w.\-]+)["\']', re.M)
+#: 写回文件的版本号必须是三段数字：``1.2`` 在比较时等于 ``1.2.0``，
+#: 界面上写着"当前版本 v1.2"、更新提示却按 1.2.0 算，看着就像版本号没生效
+_STRICT_VERSION = re.compile(r"^\d+\.\d+\.\d+$")
 _TAG_PATTERN = re.compile(r"^v?(\d+(?:\.\d+){0,2}(?:[-.\w]+)?)$", re.I)
 
 
@@ -98,18 +101,19 @@ def version_file(path: Optional[str] = None) -> str:
 def rewrite(new_version: str, path: Optional[str] = None) -> Tuple[str, str]:
     """把新版本号写回本文件，返回 ``(旧版本, 新版本)``。只动 ``VERSION`` 这一行。"""
     target = version_file(path)
-    if not parse_version(new_version) or parse_version(new_version) == (0,):
-        raise ValueError(f"版本号格式不对：{new_version}（要写成 1.2.3 这样）")
+    cleaned = str(new_version or "").strip().lstrip("vV")
+    if not _STRICT_VERSION.match(cleaned):
+        raise ValueError(f"版本号要写成三段数字（例如 1.2.3），现在是「{new_version}」")
     with open(target, "r", encoding="utf-8") as fh:
         source = fh.read()
     match = _VERSION_PATTERN.search(source)
     if not match:
         raise ValueError(f"没在 {target} 里找到 VERSION 定义，版本管理脚本可能被改坏了")
     old = match.group(1)
-    updated = source[:match.start(1)] + new_version + source[match.end(1):]
+    updated = source[:match.start(1)] + cleaned + source[match.end(1):]
     with open(target, "w", encoding="utf-8") as fh:
         fh.write(updated)
-    return old, new_version
+    return old, cleaned
 
 
 def _http_get(url: str) -> str:
@@ -147,14 +151,46 @@ def fetch_latest(fetcher: Optional[Callable[[str], str]] = None) -> Tuple[str, s
     return "", " · ".join(problems) or "没取到版本"
 
 
+def _as_float(value: object) -> float:
+    """缓存里的时间戳认不出来就当"从没查过"（0），别让一个坏字段拖垮接口。"""
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_text(value: object) -> str:
+    """只收字符串和数字：缓存被手改成 ``{"latest": ["1.9.0"]}`` 时，
+    ``str(...)`` 会给出 ``"['1.9.0']"``，界面照着渲染就是一串 Python 字面量。"""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
+    return ""
+
+
 def _read_cache() -> dict:
+    """读更新检查缓存。这是用户机器上一个会被手改、被半截写入污染的普通文件：
+    ``checked_at`` 是字符串时 ``float()`` 当场 ValueError，``/api/version`` 整个 500，
+    顶栏版本徽标和启动时的后台检查一起没。所有字段在这里一次性收敛成安全类型。
+    """
     path = cache_path()
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, json.JSONDecodeError):
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        "latest": _as_text(data.get("latest")),
+        "source": _as_text(data.get("source")),
+        "note": _as_text(data.get("note")),
+        "checked_text": _as_text(data.get("checked_text")),
+        "checked_at": _as_float(data.get("checked_at")),
+    }
 
 
 def _write_cache(latest: str, source: str, note: str) -> dict:
@@ -178,7 +214,7 @@ def status(fetcher: Optional[Callable[[str], str]] = None, force: bool = False) 
     开发中的检出比发布版新，弹"有更新"反而骗人。
     """
     cache = _read_cache()
-    fresh = bool(cache.get("checked_at")) and time.time() - float(cache["checked_at"]) < CACHE_TTL
+    fresh = bool(cache.get("checked_at")) and time.time() - _as_float(cache.get("checked_at")) < CACHE_TTL
     if force or not fresh:
         if not network_enabled():
             record = _write_cache(str(cache.get("latest") or ""), "offline",

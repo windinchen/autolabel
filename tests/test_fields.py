@@ -124,3 +124,56 @@ def test_prompt_labels_dir_is_separate_from_pose_labels(dataset):
     assert open(pose, encoding="utf-8").read().strip().split() == [
         "0", "0.5", "0.5", "0.2", "0.3", "0.1", "0.1", "2"]
     assert fd.read_label_rows(prompt) == [(0, 0.5, 0.5, 0.2, 0.3)]
+
+
+# --- 第 27 轮体检：删类别之后索引里那笔框数账 ---------------------------- #
+
+def test_dropping_boxes_also_fixes_the_index_box_count(dataset):
+    """删类别只重写标签文件是不够的，索引里的框数得跟着落。
+
+    以前删完之后磁盘上剩 1 个框、索引还记着 3 个：列表页写着 3、点开编辑器只剩 1，
+    ``status`` 的合计也跟着虚高。同一个界面上出现两个数，用户只会觉得软件在瞎说。
+    """
+    from autolabel.dataset import load_index
+
+    saved = fd.upsert_field(dataset, name="bottle")
+    other = fd.upsert_field(dataset, name="backpack")
+    class_id, keep = int(saved["class_id"]), int(other["class_id"])
+    index = load_index(dataset, "objects")
+    plan = {"img0.jpg": [class_id, class_id, keep], "img1.jpg": [keep]}
+    for rel, classes in plan.items():
+        fd.write_label_rows(label(dataset, rel), [[c, 0.5, 0.5, 0.2, 0.3] for c in classes])
+        index.upsert(rel, prompt_objects=len(classes), prompt_status="approved")
+    index.save()
+
+    result = fd.delete_field(dataset, "bottle", drop_boxes=True)
+
+    assert result["boxes_removed"] == 2 and result["labels_touched"] == 1
+    index = load_index(dataset, "objects")
+    assert index.items["img0.jpg"]["prompt_objects"] == 1
+    assert index.items["img1.jpg"]["prompt_objects"] == 1
+    assert fd.box_counts_by_image(dataset, "objects") == {"img0": 1, "img1": 1}
+
+
+def test_dropping_boxes_does_not_invent_index_rows(dataset):
+    """孤儿标签文件（索引里根本没这张图）不该因为删类别被凭空登记进索引。"""
+    from autolabel.dataset import load_index
+
+    saved = fd.upsert_field(dataset, name="bottle")
+    fd.write_label_rows(label(dataset, "ghost.jpg"),
+                        [[int(saved["class_id"]), 0.5, 0.5, 0.2, 0.3]])
+    before = set(load_index(dataset, "objects").items)
+
+    fd.delete_field(dataset, "bottle", drop_boxes=True)
+
+    assert set(load_index(dataset, "objects").items) == before
+
+
+def test_box_counts_by_image_reports_the_disk_truth(dataset):
+    saved = fd.upsert_field(dataset, name="bottle")
+    class_id = int(saved["class_id"])
+    fd.write_label_rows(label(dataset, "img0.jpg"),
+                        [[class_id, 0.5, 0.5, 0.2, 0.3], [class_id, 0.4, 0.4, 0.1, 0.1]])
+    fd.write_label_rows(label(dataset, "img1.jpg"), [])
+
+    assert fd.box_counts_by_image(dataset) == {"img0": 2, "img1": 0}

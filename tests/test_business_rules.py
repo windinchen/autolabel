@@ -84,7 +84,7 @@ def test_positive_flag_is_not_an_issue(dataset):
 
 
 def test_review_counts_match_the_page_queues(server):
-    """门户「等你复核」= 两个库「没定论」之和，与两页默认筛选（pending）同口径。"""
+    """门户「等你复核」= 三个库「没定论」之和，与各页默认筛选（pending）同口径。"""
     base, store = server
     payload = get(base, "/api/dataset")
     review = payload["review"]
@@ -347,7 +347,7 @@ def test_undo_bar_targets_the_frame_that_just_changed():
 
 
 def test_portal_uses_backend_review_numbers():
-    """门户不再自己数一遍两个库（以前一个数全部、一个数带标记，拼出来的数没人信）。"""
+    """门户不再自己数一遍各库（以前一个数全部、一个数带标记，拼出来的数没人信）。"""
     source = static_source("portal.js")
     assert "ds.review" in source or "review[key]" in source
     body = source.split("function buildStats(ds) {", 1)[1].split("\n}", 1)[0]
@@ -370,3 +370,64 @@ def test_export_scope_options_match_the_backend(server):
         assert status == 200, (scope, body)
     status, body = post(base, "/api/export", {"scope": "wrong"})
     assert status == 400 and "未知的导出范围" in body["error"]
+
+
+# --------------------------------------------------------------------------- #
+# 五、三个库的「带标记」各读各的字段
+# --------------------------------------------------------------------------- #
+
+def test_detect_review_counts_read_detect_fields(dataset):
+    """qc 以前只认姿态与提示词：``needs_review(item, "detect")`` 读的是姿态库的
+    ``flags``/``score``，于是门户概览写「带标记 0」、同一页批次表写「带标记 1」。"""
+    from autolabel.dataset import adopt_from_pool
+    from autolabel.library import LIB_DETECT, LIB_OBJECTS
+
+    rels = sorted(idx_names(dataset))
+    adopt_from_pool(dataset, rels, lib=LIB_DETECT)
+    index = load_index(dataset, LIB_DETECT)
+    stale, settled = rels[0], rels[1]
+    index.upsert(stale, detect_objects=2, detect_status="unreviewed",
+                 detect_flags=["model_stale"], detect_score=0.9)
+    index.upsert(settled, detect_objects=1, detect_status="approved",
+                 detect_flags=["model_failed"], detect_score=0.95)
+    index.save()
+
+    rows = load_index(dataset, LIB_DETECT)
+    assert qc.issue_flags(rows.get(stale), LIB_DETECT) == ["model_stale"]
+    assert qc.needs_review(rows.get(stale), LIB_DETECT) is True
+    assert qc.needs_review(rows.get(settled), LIB_DETECT) is False, "已接受 = 不用再复核"
+
+    counts = qc.review_counts([], [], [rows.get(stale), rows.get(settled)])
+    assert counts["detect_flagged"] == 1, "带标记的帧必须被数进来"
+    assert counts["flagged"] == counts["detect_flagged"]
+
+    # 同一行里两个框类库的标记互不串味
+    both = dict(rows.get(stale), prompt_flags=["vlm_failed"], prompt_objects=1,
+                prompt_status="unreviewed")
+    assert qc.issue_flags(both, LIB_DETECT) == ["model_stale"]
+    assert qc.issue_flags(both, LIB_OBJECTS) == ["vlm_failed"]
+    # 认不出的库名（all / 空）退回姿态口径，别抛异常
+    assert qc.issue_flags({"flags": ["tiny_box"]}, "all") == ["tiny_box"]
+
+
+def test_status_and_pool_count_the_third_library(dataset, capsys):
+    """``status`` / ``pool`` 的素材池统计以前只看两个库：只在检测库里的素材会被
+    报成「无人引用」，让人去重新认领明明在用的文件；检测库标了几张也压根不报。"""
+    from autolabel.dataset import adopt_from_pool
+    from autolabel.library import LIB_DETECT
+
+    rels = sorted(idx_names(dataset))
+    adopt_from_pool(dataset, rels[:1], lib=LIB_DETECT)
+    index = load_index(dataset, LIB_DETECT)
+    index.upsert(rels[0], detect_objects=3, detect_status="unreviewed", detect_score=0.9)
+    index.save()
+
+    assert main(["status", dataset]) == 0
+    out = capsys.readouterr().out
+    assert "目标检测 已标 1/1 张" in out, out
+    assert "无人引用 0" in out, out
+
+    assert main(["pool", dataset]) == 0
+    out = capsys.readouterr().out
+    assert "检测库 1" in out and "无人引用 0" in out, out
+    assert "检测" in out.splitlines()[2] or "检测" in out, out

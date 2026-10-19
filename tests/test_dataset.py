@@ -119,4 +119,5 @@ def test_index_roundtrip_is_atomic(dataset):
     idx.save()
     reloaded = ds.load_index(dataset)
     assert reloaded.get("x.jpg")["status"] == ds.STATUS_APPROVED
-    assert not os.path.exists(ds.index_path(dataset) + ".tmp")
+    leftovers = [n for n in os.listdir(os.path.dirname(ds.index_path(dataset))) if ".tmp" in n]
+    assert leftovers == [], f"临时文件没清干净：{leftovers}"

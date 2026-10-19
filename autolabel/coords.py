@@ -19,8 +19,8 @@ import shutil
 import tempfile
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .dataset import label_path_for, load_index, now_str
-from .export import export_stem
+from .dataset import label_path_for, load_index, now_str, source_missing
+from .export import MISSING_SOURCE_REASON, export_stem
 from .yolo_pose import COCO17_KEYPOINTS, COCO17_SKELETON, parse_label_file, person_sanity_flags
 
 WIDE_FILE = "coords.csv"
@@ -88,6 +88,8 @@ def collect_records(
 ) -> Tuple[List[dict], dict]:
     """把标签解析成带像素坐标的记录。
 
+    :param splits: 导出时算好的 train/val，按索引里的相对路径给（``{"a/f.jpg": "val"}``）；
+                   认相对路径而不是认导出文件名，导出端加后缀改名也不会对不上
     :return: (逐图记录, 数据集元信息)
     """
     idx = load_index(root)
@@ -103,6 +105,11 @@ def collect_records(
         status = item.get("status", "unreviewed")
         if status in skip:
             skipped.append({"image": rel, "reason": f"status={status}"})
+            continue
+        if source_missing(root, rel):
+            # 与 export 同一口径：图都不在了，坐标再准也是对空气标注。
+            # 以前 export --coords 会给出"这一帧没导出、但 CSV 里有一行"的对不上账。
+            skipped.append({"image": rel, "reason": MISSING_SOURCE_REASON})
             continue
         label = label_path_for(root, rel)
         if not os.path.exists(label):
@@ -136,7 +143,7 @@ def collect_records(
         records.append({
             "image": rel,
             "stem": stem,
-            "split": (splits or {}).get(stem, ""),
+            "split": (splits or {}).get(rel, ""),
             "status": status,
             "width": width,
             "height": height,

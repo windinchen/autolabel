@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .dataset import (LIB_OBJECTS, LIB_POSE, is_definitive, label_path_for, load_index, now_str,
-                      resolve_image)
+from .dataset import (LIB_DETECT, LIB_OBJECTS, LIB_POSE, is_definitive, label_path_for,
+                      load_index, now_str, resolve_image, source_missing)
+from .library import field_key, normalize
 from .yolo_pose import COCO17_KEYPOINTS, COCO17_SKELETON, parse_label_file
 
 # 复核优先级权重：越大越该先看
@@ -57,46 +58,66 @@ LOW_SCORE = 0.4
 
 
 def _lib_key(lib: str) -> str:
-    """状态字段归属：``objects`` / ``prompt`` 都算提示词库，其余按姿态库。"""
-    return LIB_OBJECTS if str(lib or "") in (LIB_OBJECTS, "prompt") else LIB_POSE
+    """状态字段归属：认得出的库一律按本库算。
+
+    以前只认 ``objects``/``prompt``，剩下的全落姿态库——于是 ``needs_review(item,
+    "detect")`` 读的是姿态库的 ``flags``/``score``，目标检测库的「带标记」永远是 0，
+    和同一页批次表里的「带标记 3」自相矛盾。认不出的写法（``all``、空串）才退回姿态库。
+    """
+    try:
+        return normalize(lib)
+    except ValueError:
+        return LIB_POSE
 
 
 def issue_flags(item: dict, lib: str = LIB_POSE) -> List[str]:
     """这张图上的"真问题"：去掉「多模型结论一致」这类正向标记。"""
-    if _lib_key(lib) == LIB_OBJECTS:
-        return [f for f in (item.get("prompt_flags") or []) if f not in POSITIVE_FLAGS]
-    flags = list(item.get("flags", [])) + list(item.get("object_flags", []))
+    name = _lib_key(lib)
+    if name != LIB_POSE:
+        # 两个框类库各有各的标记前缀，只看本库那份，别让隔壁库的标记串味
+        flags = list(item.get(field_key(name, "flags")) or [])
+    else:
+        flags = list(item.get("flags", [])) + list(item.get("object_flags", []))
     return [f for f in flags if f not in POSITIVE_FLAGS]
 
 
 def needs_review(item: dict, lib: str = LIB_POSE) -> bool:
     """这一帧还需不需要人看一眼：没定论，且机器自己报了问题。
 
-    姿态库的问题是 QC 标记或平均置信度偏低；提示词库是标记或压根还没标过框。
+    姿态库的问题是 QC 标记或平均置信度偏低；两个框类库（提示词 / 目标检测）
+    是标记或压根还没标过框。
     界面右下角的「待确认 N 处」、红点、``F`` 键跳转、门户的「带标记」全部走这里。
     """
-    lib = _lib_key(lib)
-    if is_definitive(item, lib):
+    name = _lib_key(lib)
+    if is_definitive(item, name):
         return False
-    if issue_flags(item, lib):
+    if issue_flags(item, name):
         return True
-    if lib == LIB_OBJECTS:
-        return item.get("prompt_objects") is None
+    if name != LIB_POSE:
+        return item.get(field_key(name, "objects")) is None
     score = item.get("score")
     return score is not None and float(score) < LOW_SCORE
 
 
-def review_counts(pose_rows: List[dict], prompt_rows: List[dict]) -> dict:
-    """两个库的「等你复核」计数：pending = 还没定论的帧，与两页默认筛选同口径。"""
+def review_counts(pose_rows: List[dict], prompt_rows: List[dict],
+                  detect_rows: Optional[List[dict]] = None) -> dict:
+    """各库的「等你复核」计数：pending = 还没定论的帧，与各页默认筛选同口径。
+
+    门户那一格、启动日志、各复核页都读这一份，别各自加一遍——以前门户 JS
+    自己数，姿态库数"所有没定论的"、提示词库数"带标记的"，同一个数字两套算法。
+    """
     counts = {
         "pose_pending": sum(1 for it in pose_rows if not is_definitive(it, LIB_POSE)),
         "pose_flagged": sum(1 for it in pose_rows if needs_review(it, LIB_POSE)),
         "prompt_pending": sum(1 for it in prompt_rows if not is_definitive(it, LIB_OBJECTS)),
         "prompt_flagged": sum(1 for it in prompt_rows if needs_review(it, LIB_OBJECTS)),
     }
-    # 合计也在这算：门户那一格、启动日志、以后加的报表都读同一个键，别各自加一遍
-    counts["pending"] = counts["pose_pending"] + counts["prompt_pending"]
-    counts["flagged"] = counts["pose_flagged"] + counts["prompt_flagged"]
+    rows = list(detect_rows or [])
+    counts["detect_pending"] = sum(1 for it in rows if not is_definitive(it, LIB_DETECT))
+    counts["detect_flagged"] = sum(1 for it in rows if needs_review(it, LIB_DETECT))
+    # 合计把所有 *_pending / *_flagged 一起加：以后再加库不会漏进合计
+    counts["pending"] = sum(value for key, value in counts.items() if key.endswith("_pending"))
+    counts["flagged"] = sum(value for key, value in counts.items() if key.endswith("_flagged"))
     return counts
 
 
@@ -141,9 +162,14 @@ def dataset_stats(root: str) -> dict:
     box_scores: List[float] = []
     missing_labels = 0
     bad_labels = 0
+    missing_files: List[str] = []
     for rel, item in idx.ordered_items():
         status = item.get("status", "unreviewed")
         status_counts[status] = status_counts.get(status, 0) + 1
+        if source_missing(root, rel):
+            # 图被手工删了：标签可能还在，所以"缺标签 0"完全不提这件事，
+            # 而导出偏偏会在这一帧上崩或留下读不出来的图。必须单开一个格子。
+            missing_files.append(rel)
         for flag in list(item.get("flags", [])) + list(item.get("object_flags", [])):
             flag_counts[flag] = flag_counts.get(flag, 0) + 1
         lp = label_path_for(root, rel)
@@ -174,6 +200,8 @@ def dataset_stats(root: str) -> dict:
         "dataset": idx.name,
         "images": len(idx.items),
         "missing_labels": missing_labels,
+        "missing_files": len(missing_files),
+        "missing_images": missing_files[:50],
         "bad_labels": bad_labels,
         "status_counts": status_counts,
         "flag_counts": dict(sorted(flag_counts.items(), key=lambda kv: -kv[1])),

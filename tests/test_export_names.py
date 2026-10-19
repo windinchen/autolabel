@@ -188,3 +188,127 @@ def test_detection_export_also_avoids_name_collisions(tmp_path):
     images = sorted(set(_listing(out, "train")) | set(_listing(out, "val")))
     assert images == ["a__frame_0001.jpg", "b__frame_0001.jpg"]
     assert result["counts"]["train"] + result["counts"]["val"] == 2
+
+
+# --- 第 7 轮体检（导出与训练可用性）实测到的三件事 ---
+
+@pytest.mark.parametrize("name", ["安全帽: 大", "背带裤", "true", "no", "3d", "a#b", "", "null"])
+def test_pose_data_yaml_survives_awkward_class_names(dataset, tmp_path, name):
+    """类名里带 `:` 会让整份 data.yaml 解析失败，训练一帧都跑不起来。
+
+    姿态库以前把类名原样拼进 YAML（``1: 安全帽: 大``），``yaml.safe_load`` 直接
+    报 "mapping values are not allowed here"；``true``/``no`` 这类还会被 YAML
+    悄悄变成布尔值，训练时的类别名就成了 True。
+    """
+    for rel in sorted(idx_names(dataset)):
+        write_label(dataset, rel, [SAMPLE17])
+    idx = load_index(dataset)
+    idx.data["class_names"] = {"0": name}
+    idx.save()
+    out = os.path.join(str(tmp_path), "exp-odd-name")
+    ex.export_dataset(dataset, out=out, val_ratio=0.0, mode="copy")
+    with open(os.path.join(out, "data.yaml"), encoding="utf-8") as fh:
+        meta = yaml.safe_load(fh)          # 解析不了在这里就炸
+    assert meta["names"] == {0: name}
+
+
+def test_yaml_scalar_only_quotes_what_yaml_would_misread():
+    """纯标识符保持明文（人和 diff 都好读），会被改含义的才加引号。"""
+    assert ex.yaml_scalar("person") == "person"
+    assert ex.yaml_scalar("potted plant") == '"potted plant"'
+    assert ex.yaml_scalar("helmet-color") == "helmet-color"
+    for risky in ("安全帽: 大", "true", "No", "null", "3d", "", "a#b"):
+        assert yaml.safe_load("k: " + ex.yaml_scalar(risky))["k"] == risky
+
+
+def test_nested_and_flat_names_do_not_eat_each_other(tmp_path):
+    """``a/f.jpg`` 压平后是 ``a__f``，正好和真实存在的 ``a__f.jpg`` 撞名。
+
+    旧写法后写的把先写的连图带标签一起盖掉：3 张图导出后磁盘只剩 2 个文件，
+    清单和返回值却都按 3 张计，训练时没人看得出来少了帧。
+    """
+    root = str(tmp_path / "clash")
+    init_dataset(root, name="clash")
+    nested = tmp_path / "src_nested"
+    nested.mkdir()
+    _jpeg(nested / "f.jpg", (10, 200, 30))
+    flat = tmp_path / "src_flat"
+    flat.mkdir()
+    _jpeg(flat / "a__f.jpg", (200, 20, 90))
+    import_images(root, [str(nested)], subdir="a", dedupe="none")
+    import_images(root, [str(flat)], dedupe="none")
+    rels = sorted(idx_names(root))
+    assert rels == ["a/f.jpg", "a__f.jpg"]
+    for rel in rels:
+        write_label(root, rel, [SAMPLE17])
+
+    out = os.path.join(str(tmp_path), "exp-clash")
+    result = ex.export_dataset(root, out=out, val_ratio=0.0, mode="copy")
+    images = _listing(out, "train")
+    assert len(images) == 2, f"两张图导出后磁盘只剩 {images}"
+    assert len(set(images)) == 2
+    assert result["train"] == 2
+    labels = _listing(out, "train", kind="labels")
+    assert [os.path.splitext(n)[0] for n in labels] == [os.path.splitext(n)[0] for n in images]
+    # 盖掉的帧在 COCO 里也会一起消失，顺手一起验
+    coco_out = os.path.join(str(tmp_path), "exp-clash-coco")
+    ex.export_dataset(root, out=coco_out, val_ratio=0.0, coco=True, mode="copy")
+    assert len(_load(os.path.join(coco_out, "coco_keypoints.json"))["images"]) == 2
+
+
+def test_reexport_into_the_same_out_prunes_rejected_frames(dataset, tmp_path):
+    """同一个 `--out` 反复导出时，这一版不要的帧必须从磁盘上清掉。
+
+    只覆盖同名文件的旧写法，会把上一版留下、这一版已被驳回的帧留在 ``images/train``
+    里：训练集悄悄带着用户判定不要的帧，界面却只报剩下的张数。
+    """
+    for rel in sorted(idx_names(dataset)):
+        write_label(dataset, rel, [SAMPLE17])
+    out = os.path.join(str(tmp_path), "exp-stale")
+    first = ex.export_dataset(dataset, out=out, val_ratio=0.0, mode="copy")
+    assert first["train"] == 2 and _listing(out, "train") == ["img0.jpg", "img1.jpg"]
+
+    idx = load_index(dataset)
+    idx.items["img1.jpg"]["status"] = "rejected"
+    idx.save()
+    second = ex.export_dataset(dataset, out=out, val_ratio=0.0, mode="copy")
+    assert second["train"] == 1
+    assert _listing(out, "train") == ["img0.jpg"], "被驳回的帧还留在导出目录里"
+    assert _listing(out, "train", kind="labels") == ["img0.txt"]
+    assert second["pruned"] == 2                       # 图片 + 标签
+    manifest = _load(os.path.join(out, "manifest.json"))
+    assert manifest["counts"]["pruned"] == 2
+
+
+def test_detection_export_prunes_and_quotes(tmp_path):
+    """检测库导出走同一套清理与转义，别只修姿态那一半。"""
+    root = str(tmp_path / "det")
+    init_dataset(root, name="det")
+    source = tmp_path / "det_src"
+    source.mkdir()
+    for index, color in enumerate([(200, 40, 40), (40, 40, 200)]):
+        _jpeg(source / f"d{index}.jpg", color)
+    import_images(root, [str(source)], lib=ds.LIB_DETECT)
+    registered = field_store.upsert_field(root, name="potted plant", label="盆栽", lib=ds.LIB_DETECT)
+    class_id = int(registered["class_id"])
+    index = load_index(root, ds.LIB_DETECT)
+    for rel in ("d0.jpg", "d1.jpg"):
+        pr.write_detections(root, rel,
+                            [pr.Detection(cls=class_id, cx=0.5, cy=0.5, w=0.2, h=0.3)],
+                            lib=ds.LIB_DETECT)
+        index.upsert(rel, detect_objects=1, detect_status=ds.STATUS_UNREVIEWED)
+    index.save()
+
+    out = os.path.join(str(tmp_path), "exp-det")
+    pr.export_detection_dataset(root, out=out, val_ratio=0.0, lib=ds.LIB_DETECT)
+    with open(os.path.join(out, "data.yaml"), encoding="utf-8") as fh:
+        meta = yaml.safe_load(fh)
+    assert meta["names"] == {0: "potted plant"}
+
+    index = load_index(root, ds.LIB_DETECT)
+    index.items["d1.jpg"]["detect_status"] = "rejected"
+    index.save()
+    second = pr.export_detection_dataset(root, out=out, val_ratio=0.0, lib=ds.LIB_DETECT)
+    assert second["train"] == 1
+    assert _listing(out, "train") == ["d0.jpg"], "被驳回的图还留在导出目录里"
+    assert second["counts"]["pruned"] == 2

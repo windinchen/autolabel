@@ -9,6 +9,7 @@ from PIL import Image
 from autolabel.cli import main
 
 from _helpers import idx_names, write_label
+from autolabel.dataset import load_index
 
 SAMPLE17 = "0 0.500000 0.500000 0.400000 0.600000 " + " ".join(["0.500000 0.500000 2"] * 17)
 
@@ -118,3 +119,65 @@ def test_auto_without_anything_importable_stops_early(dataset, source_dir, capsy
     assert "没有可导入的图片" in (captured.out + captured.err)
     last = batches_of(dataset)[-1]
     assert last["status"] == "failed"
+
+
+@pytest.mark.parametrize("command", ["export", "coords", "auto"])
+def test_keep_status_accepts_comma_and_rejects_typos(dataset, source_dir, capsys, command):
+    """``--keep-status`` 与兄弟参数一样认逗号，拼错的状态当场拦。
+
+    以前写错一个字母不会报错，只会当成"没写"——用户以为多留了一批样本，
+    其实导出范围一个字没变。
+    """
+    from autolabel.cli import _exclude_from_args, build_parser
+
+    parser = build_parser()
+    # auto 的图片来源是必填位置参数，先补一个占位
+    head = [command, dataset] + ([source_dir] if command == "auto" else []) + ["--only-approved"]
+    args = parser.parse_args([*head, "--keep-status", "rejected,edited"])
+    assert _exclude_from_args(args) == ["unreviewed"]
+    spaced = parser.parse_args([*head, "--keep-status", "rejected", "edited"])
+    assert _exclude_from_args(spaced) == _exclude_from_args(args)
+
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as caught:
+        parser.parse_args([*head, "--keep-status", "aprovied"])
+    assert caught.value.code == 2
+    err = capsys.readouterr().err
+    assert "不认识的状态" in err and "rejected" in err and "Traceback" not in err
+
+
+def test_delete_images_accepts_comma_separated_list(dataset, capsys):
+    names = sorted(idx_names(dataset))
+    for name in names:
+        write_label(dataset, name, [SAMPLE17])
+
+    assert main(["batches", dataset, "--delete-images", ",".join(names), "--lib", "pose"]) == 0
+    out = capsys.readouterr().out
+
+    assert "移除图片 2 张" in out
+    assert idx_names(dataset) == set()
+    # 只摘了姿态引用，提示词库与素材文件都该还在
+    assert len(load_index(dataset, "objects").items) == 2
+    assert os.path.exists(os.path.join(dataset, "images", names[0]))
+
+
+def test_pool_add_accepts_comma_separated_list(dataset, capsys):
+    names = sorted(idx_names(dataset))
+
+    assert main(["pool", dataset, "--add", ",".join(names), "--lib", "detect"]) == 0
+    out = capsys.readouterr().out
+
+    assert "新增 2 张" in out and "池里查无 0 张" in out
+    assert set(load_index(dataset, "detect").items) == set(names)
+
+
+def test_batch_delete_accepts_comma_separated_ids(dataset, capsys):
+    from autolabel.batches import create_batch
+
+    ids = [create_batch(dataset, name=f"批次{i}", kind="image")["id"] for i in (1, 2)]
+
+    assert main(["batches", dataset, "--delete", ",".join(ids), "--force"]) == 0
+    out = capsys.readouterr().out
+
+    assert "删除批次 2 个" in out
+    assert ids[0] not in {row["id"] for row in batches_of(dataset)}

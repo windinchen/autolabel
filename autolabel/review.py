@@ -6,19 +6,21 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import threading
 import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import TYPE_CHECKING, List, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 from urllib.parse import parse_qs, unquote, urlparse
 
 if TYPE_CHECKING:  # 仅类型标注使用，避免导入期拉起推理依赖
     from .upload import JobStore
 
 from .dataset import (
+    ALL_STATUSES,
     STATUS_APPROVED,
     STATUS_EDITED,
     STATUS_REJECTED,
@@ -32,11 +34,13 @@ from .dataset import (
     resolve_image,
 )
 from .library import (
+    LIB_DETECT,
     LIBRARIES,
     LIB_NAMES,
     LIB_OBJECTS,
     LIB_POSE,
     backups_dir,
+    field_key,
     history_root,
     lib_name,
     migrate,
@@ -65,13 +69,15 @@ from .qc import COCO17_SKELETON, FLAG_HINTS, LOW_SCORE, POSITIVE_FLAGS, dataset_
     review_priority
 from .batches import (
     MODULE_NAMES,
+    MODULE_ROW_KEYS,
+    MODULE_UNKNOWN,
     batch_file_rows,
     delete_images,
     list_batches,
     reconcile_with_disk,
 )
 from .yolo_pose import COCO17_KEYPOINTS, Keypoint, Person, parse_label_file, write_label_file
-from .dataset import index_path, prompt_label_path_for
+from .dataset import index_path
 from .fields import (
     delete_field,
     fields_payload as fields_payload_for,
@@ -92,21 +98,44 @@ from .prompt import (
     write_detections,
 )
 
-VALID_STATUS = {STATUS_UNREVIEWED, STATUS_APPROVED, STATUS_EDITED, STATUS_REJECTED}
+VALID_STATUS = set(ALL_STATUSES)
+
+
+def status_argument(value: object) -> str:
+    """接口请求里的复核状态字段：没给就说「没有指定」，别把 Python 的 ``None``
+    当成一个状态回给用户（``复核状态只能是 …，现在是「None」`` 属于 second-order
+    报错——真正的问题是那个字段压根没传）。
+    """
+    text = "" if value is None else str(value).strip()
+    if not text:
+        raise ValueError(f"没有指定复核状态（可选 {' / '.join(sorted(VALID_STATUS))}）")
+    return text
 
 
 def module_summary(rows: List[dict]) -> dict:
     """按二级模块（= 标注库）汇总批次规模：门户工作台与 ``/api/batches`` 同一套口径。"""
-    out: dict = {}
+    out: Dict[str, dict] = {}
     for name, label in MODULE_NAMES.items():
+        if name == MODULE_UNKNOWN:
+            continue
         group = [row for row in rows if row.get("module") == name]
+        mine = [row.get(MODULE_ROW_KEYS.get(name, name)) or {} for row in group]
+        unit = "people" if name == LIB_POSE else "boxes"
         out[name] = {
             "label": label, "batches": len(group),
             "items": sum(int(row.get("items") or 0) for row in group),
-            "labeled": sum(int(row.get("labeled") or 0) for row in group),
-            "prompt_labeled": sum(int(row.get("prompt_labeled") or 0) for row in group),
-            "prompt_boxes": sum(int(row.get("prompt_boxes") or 0) for row in group),
+            # labeled 取本模块自己的小计：顶层那个 labeled 是姿态库的无前缀键，
+            # 照抄会让目标检测页显示"标注 0 张 · 5 个框"（实测门户就这样）
+            "labeled": sum(int(row.get("labeled") or 0) for row in mine),
+            unit: sum(int(row.get(unit) or 0) for row in mine),
+            "reviewed": sum(int(row.get("reviewed") or 0) for row in mine),
+            "unreviewed": sum(int(row.get("unreviewed") or 0) for row in mine),
+            "flagged": sum(int(row.get("flagged") or 0) for row in mine),
         }
+        if name == LIB_OBJECTS:
+            # 老键名留着：门户和命令行还在读 prompt_labeled / prompt_boxes
+            out[name]["prompt_labeled"] = out[name]["labeled"]
+            out[name]["prompt_boxes"] = out[name]["boxes"]
     return out
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -125,9 +154,9 @@ class ReviewStore:
         self.migration = migrate(self.root)
         # 先按磁盘对账，再读索引：上次跑到一半被打断的导入不能悄悄丢掉素材
         self.recovery = reconcile_with_disk(self.root)
-        # 姿态库与提示词库各自一份索引：删图只摘本库引用，统计也不再互相掺水
-        self.index: DatasetIndex = load_index(self.root, LIB_POSE)
-        self.objects_index: DatasetIndex = load_index(self.root, LIB_OBJECTS)
+        # 每个库一份索引：删图只摘本库引用，统计也不再互相掺水
+        self.indexes: Dict[str, DatasetIndex] = {lib: load_index(self.root, lib)
+                                                 for lib in LIBRARIES}
         self._index_stamp = self._disk_stamp()
         if jobs is None:
             from .upload import JobStore as _JobStore
@@ -135,8 +164,27 @@ class ReviewStore:
             jobs = _JobStore(self.root, on_finish=self.reload)
         self.jobs = jobs
 
+    @property
+    def index(self) -> DatasetIndex:
+        """姿态库索引（旧调用名保留，读起来比 indexes["pose"] 顺）。"""
+        return self.indexes[LIB_POSE]
+
+    @property
+    def objects_index(self) -> DatasetIndex:
+        """提示词库索引（旧调用名保留）。"""
+        return self.indexes[LIB_OBJECTS]
+
+    @property
+    def detect_index(self) -> DatasetIndex:
+        """目标检测库索引（YOLO 权重出的检测框）。"""
+        return self.indexes[LIB_DETECT]
+
+    def index_for(self, lib: Optional[str] = LIB_POSE) -> DatasetIndex:
+        """按库名取索引；库名写法乱七八糟也接得住。"""
+        return self.indexes[normalize(lib)]
+
     def _disk_stamp(self):
-        """两个库索引文件的（修改时间, 大小）快照，用来判断磁盘是不是被别人动过。"""
+        """各库索引文件的（修改时间, 大小）快照，用来判断磁盘是不是被别人动过。"""
         stamps = []
         for lib in LIBRARIES:
             try:
@@ -158,21 +206,19 @@ class ReviewStore:
             self._index_stamp = stamp
 
     def reload(self) -> dict:
-        """重新读取两个库的磁盘索引：上传/后台标注写入的新图要能立刻出现在界面里。"""
+        """重新读取三个库的磁盘索引：上传/后台标注写入的新图要能立刻出现在界面里。"""
         with self.lock:
             self._reload_locked()
             self._index_stamp = self._disk_stamp()
-        return {"ok": True, "images": len(self.index.items),
-                "object_images": len(self.objects_index.items)}
+        out = {"ok": True, "images": len(self.index.items),
+               "object_images": len(self.objects_index.items)}
+        out["detect_images"] = len(self.indexes[LIB_DETECT].items)
+        return out
 
     def _reload_locked(self) -> None:
         """调用方必须已经握着 ``self.lock``。"""
         for lib in LIBRARIES:
-            idx = load_index(self.root, lib)
-            if lib == LIB_POSE:
-                self.index = idx
-            else:
-                self.objects_index = idx
+            self.indexes[lib] = load_index(self.root, lib)
 
     def _sync_locked(self) -> None:
         """按磁盘重建内存索引并记下时间戳；调用方必须已经握着 ``self.lock``。"""
@@ -243,19 +289,33 @@ class ReviewStore:
                 "prompt_score": item.get("prompt_score"),
                 "prompt_priority": prompt_priority(item),
             })
-        # 「等你复核」由后端一次算清：门户 / 命令行 / 两个复核页共用同一个口径。
+        detect_items = []
+        for rel, item in self.detect_index.ordered_items():
+            detect_items.append({
+                "image": rel,
+                "width": item.get("width"),
+                "height": item.get("height"),
+                "time_sec": item.get("time_sec"),
+                "video": os.path.basename(item["video"]) if item.get("video") else None,
+                "batch_id": item.get("batch_id"),
+                "detect_objects": item.get("detect_objects"),
+                "detect_status": item.get("detect_status", STATUS_UNREVIEWED),
+                "detect_flags": sorted(set(item.get("detect_flags") or [])),
+                "detect_score": item.get("detect_score"),
+                "detect_priority": prompt_priority(item, LIB_DETECT),
+            })
+        # 「等你复核」由后端一次算清：门户 / 命令行 / 各复核页共用同一个口径。
         # 以前门户 JS 自己数一遍，姿态库数"所有没定论的"、提示词库数"带标记的"，
         # 同一个数字两套算法；正向标记（多模型结论一致）还被前端当成待确认。
-        review = review_counts(items, object_items)
+        review = review_counts(items, object_items, detect_items)
         # 门户要一眼看清"池里有多少素材、每个库各引用了多少"
         pool_rows = pool_items(self.root)
         pool_stats = {
             "files": len(pool_rows),
             "bytes": sum(int(row.get("bytes") or 0) for row in pool_rows),
-            "pose": sum(1 for row in pool_rows if row["in_pose"]),
-            "objects": sum(1 for row in pool_rows if row["in_objects"]),
-            "shared": sum(1 for row in pool_rows if row["in_pose"] and row["in_objects"]),
-            "orphan": sum(1 for row in pool_rows if not row["in_pose"] and not row["in_objects"]),
+            **{lib: sum(1 for row in pool_rows if row["in_" + lib]) for lib in LIBRARIES},
+            "shared": sum(1 for row in pool_rows if len(row["libs"]) > 1),
+            "orphan": sum(1 for row in pool_rows if not row["libs"]),
         }
         num_kpt = int(self.index.data.get("kpt_shape", [len(COCO17_KEYPOINTS), 3])[0])
         return {
@@ -271,7 +331,8 @@ class ReviewStore:
             "skeleton": [[a, b] for a, b in COCO17_SKELETON if max(a, b) < num_kpt],
             "num_keypoints": num_kpt,
             "stats": {k: stats[k] for k in ("images", "persons_total", "status_counts", "flag_counts",
-                                            "box_height_px", "persons_per_image")},
+                                            "box_height_px", "persons_per_image",
+                                            "missing_files", "missing_images")},
             "flag_hints": FLAG_HINTS,
             "review": review,
             # 前端判断"这帧要不要人看"要用同一条线：正向标记清单 + 置信度阈值
@@ -284,13 +345,15 @@ class ReviewStore:
             "batches": batch_rows,
             "by_module": module_summary(batch_rows),
             "libs": [{"lib": lib, "name": LIB_NAMES[lib],
-                      "items": len(self.index.items if lib == LIB_POSE
-                                   else self.objects_index.items)} for lib in LIBRARIES],
+                      "items": len(self.index_for(lib).items)} for lib in LIBRARIES],
             "pool": pool_stats,
             "pool_files": pool_rows[:400],
             "exports_recent": self.exports_recent(),
             "fields": fields_payload_for(self.root),
+            "detect_items": detect_items,
+            "detect_classes": fields_payload_for(self.root, LIB_DETECT),
             "prompt": prompt_summary(self.root),
+            "detect": prompt_summary(self.root, LIB_DETECT),
             "recovery": self.recovery,
         }
 
@@ -353,10 +416,23 @@ class ReviewStore:
         return {"ok": True, "image": image_rel, **fields,
                 "objects": [self._person_payload(p) for p in persons]}
 
+    @staticmethod
+    def _require_item(index: DatasetIndex, image_rel: str, lib: str) -> None:
+        """图已经不在本库时报错，别用 upsert 造出一行没有文件的记录。
+
+        多开一个标签页最容易撞上：这边刚把图删掉，那边还停在旧列表上点
+        「接受」或「撤销」，upsert 会把行凭空建回来——于是库里多出一张
+        永远打不开的图，张数、未标注数、缩略图列表全都对不上（实测 1 张变 2 张）。
+        """
+        if index.get(image_rel) is None:
+            raise ValueError(f"这张图已不在{LIB_NAMES[lib]}里（可能刚被另一个页面删除），"
+                             f"刷新页面就好：{image_rel}")
+
     def set_status(self, image_rel: str, status: str) -> dict:
         if status not in VALID_STATUS:
-            raise ValueError(f"非法状态: {status}")
+            raise ValueError(f"复核状态只能是 {' / '.join(sorted(VALID_STATUS))}，现在是「{status}」")
         with self._mutate():
+            self._require_item(self.index, image_rel, LIB_POSE)
             self.index.upsert(image_rel, status=status, reviewed_at=now_str())
             self.index.save()
         return {"ok": True, "image": image_rel, "status": status}
@@ -371,9 +447,8 @@ class ReviewStore:
             "files": [row for row in rows
                       if not wanted or not row.get(f"in_{wanted}")],
             "stats": {"files": len(rows),
-                      "pose": sum(1 for row in rows if row["in_pose"]),
-                      "objects": sum(1 for row in rows if row["in_objects"]),
-                      "shared": sum(1 for row in rows if row["in_pose"] and row["in_objects"]),
+                      **{lib: sum(1 for row in rows if row.get("in_" + lib)) for lib in LIBRARIES},
+                      "shared": sum(1 for row in rows if len(row.get("libs") or []) > 1),
                       "bytes": sum(int(row.get("bytes") or 0) for row in rows)},
             "libs": [{"lib": lib_key, "name": LIB_NAMES[lib_key]} for lib_key in LIBRARIES],
         }
@@ -417,8 +492,8 @@ class ReviewStore:
                       lib: str = LIB_POSE, mode: str = "lib") -> dict:
         """按张删除图片与标注，正在标注的批次拒绝。
 
-        :param lib: 从哪个库删（``pose`` / ``objects``）
-        :param mode: ``lib`` 只摘本库引用（素材留在池里）；``purge`` 两库都摘并删素材文件
+        :param lib: 从哪个库删（``pose`` / ``objects`` / ``detect``）
+        :param mode: ``lib`` 只摘本库引用（素材留在池里）；``purge`` 其余库一起摘并删素材文件
         """
         live = {str(job.get("batch_id")) for job in self.jobs.snapshot()
                 if not job.get("finished") and job.get("batch_id")}
@@ -446,9 +521,9 @@ class ReviewStore:
             "prompt_fields": [field.get("name") for field in fields],
             "prompt_extra": str(payload.get("prompt_extra") or ""),
             "label": bool(payload.get("label", True)),
-            "fps": float(payload.get("fps") or 0.5),
-            "max_frames": int(payload.get("max_frames") or 300),
-            "max_side": int(payload.get("max_side") or 1600),
+            "fps": self._positive(payload, "fps", 0.5, "视频抽帧频率"),
+            "max_frames": int(self._positive(payload, "max_frames", 600, "视频最多抽帧数", integer=True)),
+            "max_side": int(self._positive(payload, "max_side", 1600, "图片最长边像素", integer=True)),
             "dedupe": str(payload.get("dedupe") or "exact"),
             "video_dedupe": str(payload.get("video_dedupe") or "perceptual"),
             "batch_name": str(payload.get("batch_name") or "")[:80],
@@ -470,70 +545,90 @@ class ReviewStore:
         return result
 
     # --- 提示词标注：字段表 + 检测框读写 ---
-    def fields_payload(self) -> dict:
-        """字段登记表 + 每个字段的已标框数。"""
-        return fields_payload_for(self.root)
+    def fields_payload(self, lib: str = LIB_OBJECTS) -> dict:
+        """类别登记表 + 每个类别的已标框数（两个检测框库共用这一套）。"""
+        return fields_payload_for(self.root, lib)
 
-    def save_field(self, payload: dict) -> dict:
+    def save_field(self, payload: dict, lib: str = LIB_OBJECTS) -> dict:
         """新建/更新一个字段（英文类名 + 中文显示名 + 描述提示词）。"""
         payload = payload or {}
         return upsert_field(self.root, name=str(payload.get("name") or ""),
                             label=str(payload.get("label") or ""),
                             prompt_hint=str(payload.get("prompt_hint") or ""),
                             field_id=str(payload.get("id") or ""),
-                            color=str(payload.get("color") or ""))
+                            color=str(payload.get("color") or ""), lib=lib)
 
-    def remove_field(self, wanted: str, drop_boxes: bool = False) -> dict:
-        # drop_boxes 会把该字段的框从所有图里抹掉并重写提示词索引，同样要进锁
+    def remove_field(self, wanted: str, drop_boxes: bool = False,
+                     lib: str = LIB_OBJECTS) -> dict:
+        # drop_boxes 会把该类别的框从所有图里抹掉并重写本库索引，同样要进锁
         with self._mutate(resync=True):
-            return delete_field(self.root, wanted, drop_boxes=drop_boxes)
+            return delete_field(self.root, wanted, drop_boxes=drop_boxes, lib=lib)
 
-    def prompt_summary_payload(self) -> dict:
-        summary = prompt_summary(self.root)
-        return {"prompt": summary, "fields": fields_payload_for(self.root),
-                "flag_hints": PROMPT_FLAG_HINTS}
+    def prompt_summary_payload(self, lib: str = LIB_OBJECTS) -> dict:
+        summary = prompt_summary(self.root, lib)
+        return {("detect" if normalize(lib) == LIB_DETECT else "prompt"): summary,
+                "fields": fields_payload_for(self.root, lib),
+                "flag_hints": summary.get("flag_hints") or PROMPT_FLAG_HINTS}
 
-    def read_prompt_item(self, image_rel: str) -> dict:
-        """读一张图的检测框，附带像素坐标与逐框质量标记。"""
-        item = self.objects_index.get(image_rel)
+    def read_prompt_item(self, image_rel: str, lib: str = LIB_OBJECTS) -> dict:
+        """读一张图的检测框，附带像素坐标与逐框质量标记（两个框库共用）。
+
+        返回里的键名跟着库走：提示词库给 ``prompt_status``/``prompt_objects``，
+        目标检测库给 ``detect_status``/``detect_objects``，前端一个页面服务两个库，
+        靠的就是这里的键名和 ``library.field_key`` 完全一致。
+        """
+        lib = normalize(lib)
+        index = self.index_for(lib)
+        item = index.get(image_rel)
         if item is None:
             raise KeyError(image_rel)
+        key = lambda name: field_key(lib, name)          # noqa: E731 只在这个小函数里用
+        stale_flag = "model_stale" if lib == LIB_DETECT else "prompt_stale"
         width = int(item.get("width") or 0)
         height = int(item.get("height") or 0)
-        detections = apply_manual_marks(read_detections(self.root, image_rel),
-                                       item.get("prompt_manual_boxes") or [])
-        known = [int(field.get("class_id", -1)) for field in list_fields(self.root)]
+        detections = apply_manual_marks(read_detections(self.root, image_rel, lib),
+                                       item.get(key("manual_boxes")) or [])
+        known = [int(field.get("class_id", -1)) for field in list_fields(self.root, lib)]
         per_box = box_flags(detections, width, height, known)
         return {
-            "image": image_rel, "width": width, "height": height,
-            "status": item.get("prompt_status", STATUS_UNREVIEWED),
-            "flags": sorted(set(item.get("prompt_flags") or [])),
-            "score": item.get("prompt_score"), "time_sec": item.get("time_sec"),
+            "image": image_rel, "width": width, "height": height, "lib": lib,
+            "status": item.get(key("status"), STATUS_UNREVIEWED),
+            "flags": sorted(set(item.get(key("flags")) or [])),
+            "score": item.get(key("score")), "time_sec": item.get("time_sec"),
             "video": item.get("video"), "batch_id": item.get("batch_id"),
-            "signature": item.get("prompt_signature") or "",
-            "stale": bool("prompt_stale" in (item.get("prompt_flags") or [])),
-            "error": item.get("prompt_error") or "",
+            "signature": item.get(key("signature")) or "",
+            "stale": bool(stale_flag in (item.get(key("flags")) or [])),
+            "error": item.get(key("error")) or "",
+            "model": item.get(key("model")) or item.get("prompt_profile") or "",
             "objects": [dict(detection.payload(width, height), flags=per_box[index])
                         for index, detection in enumerate(detections)],
-            "has_backup": self.undoable(image_rel, "prompt"),
+            "has_backup": self.undoable(image_rel, lib),
         }
 
     def write_prompt_item(self, image_rel: str, objects: List[dict],
-                          status: Optional[str] = None) -> dict:
-        """把前端画好的框写回 ``prompt_labels/``（YOLO detection 5 列）。"""
+                          status: Optional[str] = None, lib: str = LIB_OBJECTS) -> dict:
+        """把前端画好的框写回本库标签目录（YOLO detection 5 列）。"""
+        lib = normalize(lib)
+        key = lambda name: field_key(lib, name)          # noqa: E731 只在这个方法里用
+        stale_flag = "model_stale" if lib == LIB_DETECT else "prompt_stale"
         with self._mutate():
-            item = self.objects_index.get(image_rel)
+            # 索引必须在锁里取：_mutate 进门先按磁盘对齐一次，会把 indexes 换成
+            # 新对象，锁外拿到的那份写回去会盖掉刚同步进来的状态（实测：写完框
+            # 接口返回 1 个框，/api/dataset 里却又是未标注）。
+            index = self.index_for(lib)
+            item = index.get(image_rel)
             if item is None:
                 raise KeyError(image_rel)
             width = int(item.get("width") or 0)
             height = int(item.get("height") or 0)
-            registry = {int(field.get("class_id", -1)): field for field in list_fields(self.root)}
+            registry = {int(field.get("class_id", -1)): field
+                        for field in list_fields(self.root, lib)}
             detections: List[Detection] = []
             for raw in objects or []:
                 cls = int(raw.get("cls", -1))
                 if cls not in registry:
-                    names = "、".join(field.get("name", "") for field in registry.values()) or "（还没有字段）"
-                    raise ValueError(f"类别号 {cls} 不在字段表里；当前可用类别：{names}")
+                    names = "、".join(field.get("name", "") for field in registry.values()) or "（还没有类别）"
+                    raise ValueError(f"类别号 {cls} 不在{LIB_NAMES[lib]}的类别表里；当前可用类别：{names}")
                 detection = Detection(cls=cls, cx=_clamp01(float(raw.get("cx", 0.5))),
                                       cy=_clamp01(float(raw.get("cy", 0.5))),
                                       w=max(0.0, min(1.0, float(raw.get("w", 0.0)))),
@@ -547,36 +642,41 @@ class ReviewStore:
             manual_indices = [index for index, raw in enumerate(objects or [])
                               if "manual" in (raw.get("flags") or [])]
             scores = [detection.score for detection in detections]
-            self._backup(image_rel, prompt_label_path_for(self.root, image_rel),
-                         backup_path=self._prompt_backup_path(image_rel),
-                         history_dir=self._prompt_history_dir(image_rel))
-            write_detections(self.root, image_rel, detections)
-            flags = image_flags(detections, per_box)
-            if "prompt_stale" in (item.get("prompt_flags") or []):
-                flags = sorted(set(flags) | {"prompt_stale"})
+            self._backup(image_rel, label_path_for(self.root, image_rel, lib),
+                         backup_path=self._box_backup_path(image_rel, lib),
+                         history_dir=self._box_history_dir(image_rel, lib))
+            write_detections(self.root, image_rel, detections, lib)
+            flags = image_flags(detections, per_box,
+                                stale_flag=stale_flag,
+                                failed_flag="model_failed" if lib == LIB_DETECT else "vlm_failed")
+            if stale_flag in (item.get(key("flags")) or []):
+                flags = sorted(set(flags) | {stale_flag})
+            current = item.get(key("status"))
             new_status = status if status in VALID_STATUS else (
-                item.get("prompt_status") if item.get("prompt_status") in (STATUS_APPROVED, STATUS_REJECTED)
-                else STATUS_EDITED)
-            fields_written = dict(prompt_objects=len(detections), prompt_status=new_status,
-                                  prompt_flags=flags, prompt_manual=len(manual_indices),
-                                  prompt_manual_boxes=manual_indices, prompt_error="",
-                                  prompt_score=round(sum(scores) / len(scores), 4) if scores else 0.0,
-                                  prompt_classes=sorted({detection.cls for detection in detections}),
-                                  prompt_reviewed_at=now_str())
-            self.objects_index.upsert(image_rel, **fields_written)
-            self.objects_index.save()
+                current if current in (STATUS_APPROVED, STATUS_REJECTED) else STATUS_EDITED)
+            fields_written = {key("objects"): len(detections), key("status"): new_status,
+                              key("flags"): flags, key("manual"): len(manual_indices),
+                              key("manual_boxes"): manual_indices, key("error"): "",
+                              key("score"): round(sum(scores) / len(scores), 4) if scores else 0.0,
+                              key("classes"): sorted({detection.cls for detection in detections}),
+                              key("reviewed_at"): now_str()}
+            index.upsert(image_rel, **fields_written)
+            index.save()
         return {"ok": True, "image": image_rel, **fields_written,
                 "objects": [dict(detection.payload(width, height), flags=per_box[index])
                             for index, detection in enumerate(detections)]}
 
-    def set_prompt_status(self, image_rel: str, status: str) -> dict:
+    def set_prompt_status(self, image_rel: str, status: str, lib: str = LIB_OBJECTS) -> dict:
         if status not in VALID_STATUS:
-            raise ValueError(f"非法状态: {status}")
+            raise ValueError(f"复核状态只能是 {' / '.join(sorted(VALID_STATUS))}，现在是「{status}」")
+        lib = normalize(lib)
+        key_name = field_key(lib, "status")
         with self._mutate():
-            self.objects_index.upsert(image_rel, prompt_status=status,
-                                      prompt_reviewed_at=now_str())
-            self.objects_index.save()
-        return {"ok": True, "image": image_rel, "prompt_status": status}
+            self._require_item(self.index_for(lib), image_rel, lib)
+            self.index_for(lib).upsert(image_rel, **{key_name: status,
+                                                      field_key(lib, "reviewed_at"): now_str()})
+            self.index_for(lib).save()
+        return {"ok": True, "image": image_rel, "lib": lib, key_name: status}
 
     def run_prompt_job(self, payload: dict) -> dict:
         """提交一次批量提示词标注任务（走任务队列，可在界面上「清除任务」）。"""
@@ -585,10 +685,11 @@ class ReviewStore:
         if isinstance(wanted, str):
             wanted = [item.strip() for item in wanted.split(",") if item.strip()]
         fields = resolve_prompt_fields(self.root, wanted)
+        self._refresh_if_changed()      # 同 run_detect_job：别拿旧内存索引判定"库里没图"
         images = [str(rel) for rel in (payload.get("images") or []) if str(rel).strip()]
         if not images:
             images = [rel for rel, _ in self.objects_index.ordered_items()]
-        limit = int(payload.get("limit") or 0)
+        limit = int(self._number(payload, "limit", 0, 0, None, "标注张数上限", integer=True))
         if limit > 0:
             images = images[:limit]
         if not images:
@@ -599,6 +700,120 @@ class ReviewStore:
         if payload.get("vlm_profile"):
             params["vlm_profile"] = str(payload.get("vlm_profile"))
         job = self.jobs.submit("prompt", images, params)
+        return job.payload()
+
+    # --- 目标检测：本机权重清单 + 模型自带类别 + 批量标注 ---
+    def detect_models_payload(self) -> dict:
+        """目标检测页的模型下拉框：本机能用的检测类权重，以及上次选的那一个。
+
+        用不了的权重（姿态 / 分类）也一并回，附一句为什么不能用——用户在同一个
+        ``models/`` 目录里塞了 ``yolo11n-pose.pt``，界面只给他一个空下拉框最容易被当成 bug。
+        """
+        from . import detect
+
+        rows = detect.local_models()
+        return {"models": [row for row in rows if row["usable"]],
+                "unusable": [row for row in rows if not row["usable"]],
+                "prefs": detect.load_prefs(self.root),
+                "device": str((self.index.data.get("settings") or {}).get("device") or "auto")}
+
+    def detect_model_classes(self, model: str, device: str = "") -> dict:
+        """这个权重自带哪些类别（含中文名）——界面上「它能标什么」就看这里。"""
+        from . import detect
+
+        return detect.model_profile(model, device)
+
+    def save_detect_prefs(self, payload: dict) -> dict:
+        """把某个权重设成目标检测库的默认：页面下次打开选它，批量标注不选也用它。
+
+        只认可用在检测的权重——把 ``yolo11n-pose.pt`` 设成检测默认，
+        等跑起来才报"这是姿态模型"最坑人，所以在这里就挡住并说明原因。
+        """
+        from . import detect
+
+        payload = payload or {}
+        model = os.path.basename(str(payload.get("model") or "").strip())
+        if not model:
+            raise ValueError("没有指定要设为默认的权重")
+        rows = {row["name"]: row for row in detect.local_models()}
+        row = rows.get(model)
+        if row is None:
+            raise ValueError(f"本机没有 {model}：先在「模型管理」页搜到它并下载")
+        if not row["usable"]:
+            raise ValueError(row["note"] or f"{model} 不适合目标检测库")
+        detect.save_prefs(self.root, model=model)
+        return {"ok": True, "model": model, "prefs": detect.load_prefs(self.root)}
+
+    def add_detect_classes(self, payload: dict) -> dict:
+        """把权重自带的类别导进目标检测库的类别表；同名类别永不换号。"""
+        from . import detect
+
+        payload = payload or {}
+        names = payload.get("names") or payload.get("classes") or []
+        if isinstance(names, str):
+            names = [item.strip() for item in names.split(",") if item.strip()]
+        return detect.add_model_classes(self.root, str(payload.get("model") or ""),
+                                        list(names) or None, str(payload.get("device") or ""))
+
+    def run_detect_job(self, payload: dict) -> dict:
+        """提交一次批量目标检测：本库已有的图 → 本地权重 → ``detect_labels/``。"""
+        payload = payload or {}
+        # 索引必须先看盘再取：命令行刚 import 完就点"开始标注"时，内存里
+        # 还是旧的那份，会冒出一句"目标检测库里还没有图片"（实测踩过）
+        self._refresh_if_changed()
+        classes = payload.get("classes") or payload.get("fields") or []
+        if isinstance(classes, str):
+            classes = [item.strip() for item in classes.split(",") if item.strip()]
+        images = [str(rel) for rel in (payload.get("images") or []) if str(rel).strip()]
+        if not images:
+            images = [rel for rel, _ in self.detect_index.ordered_items()]
+        # 参数先校验再查库存：填错阈值时报"置信度阈值不能大于 1"才有用，
+        # 报"库里还没有图片"会把真正写错的那个框盖掉（与 export_pose_dataset 同口径）。
+        limit = int(self._number(payload, "limit", 0, 0, None, "标注张数上限", integer=True))
+        conf = None
+        if payload.get("conf") not in (None, ""):
+            conf = self._number(payload, "conf", 0.25, 0.0, 1.0, "置信度阈值")
+        if limit > 0:
+            images = images[:limit]
+        if not images:
+            raise ValueError("目标检测库里还没有图片，先在「目标检测」页上传或从素材池添加")
+        params = {"detect_classes": list(classes), "overwrite": bool(payload.get("overwrite")),
+                  "model": str(payload.get("model") or ""),
+                  "batch_name": str(payload.get("batch_name") or "")[:80]}
+        if conf is not None:
+            params["conf"] = conf
+        if payload.get("device"):
+            params["device"] = str(payload.get("device"))
+        job = self.jobs.submit("detect", images, params)
+        return job.payload()
+
+    def run_detect_upload_job(self, payload: dict) -> dict:
+        """目标检测模块自己上传素材：入库后直接跑 YOLO 检测，登记成目标检测模块的批次。"""
+        payload = payload or {}
+        files = [str(name) for name in (payload.get("files") or []) if str(name).strip()]
+        if not files:
+            raise ValueError("没有收到文件，先选择图片或视频")
+        classes = payload.get("classes") or payload.get("fields") or []
+        if isinstance(classes, str):
+            classes = [item.strip() for item in classes.split(",") if item.strip()]
+        # 只入库不标注时不必校验权重与类别，免得类别表还没建就不能传素材
+        params = {
+            "detect_classes": list(classes),
+            "model": str(payload.get("model") or ""),
+            "label": bool(payload.get("label", True)),
+            "overwrite": bool(payload.get("overwrite")),
+            "fps": self._positive(payload, "fps", 0.5, "视频抽帧频率"),
+            "max_frames": int(self._positive(payload, "max_frames", 600, "视频最多抽帧数", integer=True)),
+            "max_side": int(self._positive(payload, "max_side", 1600, "图片最长边像素", integer=True)),
+            "dedupe": str(payload.get("dedupe") or "exact"),
+            "video_dedupe": str(payload.get("video_dedupe") or "perceptual"),
+            "batch_name": str(payload.get("batch_name") or "")[:80],
+        }
+        if payload.get("conf") not in (None, ""):
+            params["conf"] = self._number(payload, "conf", 0.25, 0.0, 1.0, "置信度阈值")
+        if payload.get("device"):
+            params["device"] = str(payload.get("device"))
+        job = self.jobs.submit("detect_upload", files, params)
         return job.payload()
 
     def exports_recent(self, limit: int = 8) -> List[dict]:
@@ -678,7 +893,7 @@ class ReviewStore:
         if not labelled:
             if not load_index(self.root).items:
                 return "姿态库还没有图片：先导入图片或抽帧（命令行 autolabel import / auto）"
-            return ("姿态库还没有任何骨骼标签：先跑一次自动标注（命令行 autolabel auto / annotate，"
+            return ("姿态库还没有任何骨骼标签：先跑一次自动标注（命令行 autolabel auto 或 label，"
                     "或在复核界面手动画一副骨骼再保存）")
         return (f"这个导出范围里没有带骨骼标签的帧（库里共 {labelled} 张带标签）："
                 "换个导出范围，或先把带标签的帧点成「接受」")
@@ -708,10 +923,13 @@ class ReviewStore:
         if raw is None or raw == "":
             raw = default
         try:
-            value = int(raw) if integer else float(raw)
+            number = float(raw)
         except (TypeError, ValueError):
             raise ValueError(f"{name}要填数字，现在是「{raw}」")
-        if integer and float(raw) != value:
+        if not math.isfinite(number):
+            raise ValueError(f"{name}要填数字，现在是「{raw}」")
+        value = int(number) if integer else number
+        if integer and number != value:
             raise ValueError(f"{name}要填整数，现在是「{raw}」")
         if low is not None and value < low:
             raise ValueError(f"{name}不能小于 {low}，现在是 {value}")
@@ -719,11 +937,24 @@ class ReviewStore:
             raise ValueError(f"{name}不能大于 {high}，现在是 {value}")
         return float(value)
 
-    def export_detection(self, payload: dict) -> dict:
-        """导出 YOLO detection 数据集（train/val + data.yaml）。"""
+    def _positive(self, payload: dict, key: str, default: float, name: str,
+                  integer: bool = False) -> float:
+        """抽帧频率、最长边这类必须大于 0 的数字。
+
+        填 0 或负数以前会一路穿到 PIL / cv2 里炸出英文栈（``fps=0`` 除零、
+        ``max_side=0`` 缩放报错），界面上只剩一行看不懂的 traceback。
+        """
+        value = self._number(payload, key, default, None, None, name, integer=integer)
+        if value <= 0:
+            raise ValueError(f"{name}要大于 0，现在是 {value}")
+        return value
+
+    def export_detection(self, payload: dict, lib: str = LIB_OBJECTS) -> dict:
+        """导出 YOLO detection 数据集（train/val + data.yaml），两个框库共用。"""
         from .prompt import export_detection_dataset
 
         payload = payload or {}
+        lib = normalize(payload.get("lib") or lib)
         scope = str(payload.get("scope") or "reviewed")
         table = {"reviewed": ("rejected",), "approved": ("rejected", "unreviewed"), "all": ()}
         if scope not in table:
@@ -736,8 +967,9 @@ class ReviewStore:
             val_ratio=val_ratio, seed=seed, exclude_status=table[scope],
             max_empty_ratio=max_empty_ratio,
             tag=str(payload.get("tag") or "") or None,
-            mode=str(payload.get("mode") or "symlink"))
+            mode=str(payload.get("mode") or "symlink"), lib=lib)
         result["scope"] = scope
+        result["lib"] = normalize(lib)
         return result
 
     def reveal_export(self, payload: dict) -> dict:
@@ -836,6 +1068,7 @@ class ReviewStore:
             return self.undo_prompt(image_rel)
         history = self._history_dir(image_rel)
         with self._mutate():
+            self._require_item(self.index, image_rel, LIB_POSE)
             snaps = sorted(os.listdir(history)) if os.path.isdir(history) else []
             if not snaps:
                 backup = self._backup_path(image_rel)
@@ -854,26 +1087,30 @@ class ReviewStore:
                 "objects": [self._person_payload(p) for p in persons],
                 "status": STATUS_UNREVIEWED}
 
-    def undo_prompt(self, image_rel: str) -> dict:
+    def undo_prompt(self, image_rel: str, lib: str = LIB_OBJECTS) -> dict:
         """把检测框回滚到上一次快照：删错的框删多了也能救回来。"""
-        history = self._prompt_history_dir(image_rel)
+        lib = normalize(lib)
+        key = lambda name: field_key(lib, name)          # noqa: E731 只在这个方法里用
+        history = self._box_history_dir(image_rel, lib)
         with self._mutate():
-            label = prompt_label_path_for(self.root, image_rel)
+            self._require_item(self.index_for(lib), image_rel, lib)
+            label = label_path_for(self.root, image_rel, lib)
             snaps = sorted(os.listdir(history)) if os.path.isdir(history) else []
             if snaps:
                 shutil.copy2(os.path.join(history, snaps[-1]), label)
                 os.remove(os.path.join(history, snaps[-1]))
             else:
-                backup = self._prompt_backup_path(image_rel)
+                backup = self._box_backup_path(image_rel, lib)
                 if not os.path.exists(backup):
                     raise ValueError("这张图还没有可撤销的修改：它没有被保存过")
                 shutil.copy2(backup, label)
-            count = len(read_detections(self.root, image_rel))
-            self.objects_index.upsert(image_rel, prompt_status=STATUS_UNREVIEWED,
-                                      prompt_objects=count, prompt_reviewed_at=now_str())
-            self.objects_index.save()
-        return {"ok": True, "image": image_rel, "prompt_objects": count,
-                "prompt_status": STATUS_UNREVIEWED}
+            count = len(read_detections(self.root, image_rel, lib))
+            index = self.index_for(lib)
+            index.upsert(image_rel, **{key("status"): STATUS_UNREVIEWED, key("objects"): count,
+                                       key("reviewed_at"): now_str()})
+            index.save()
+        return {"ok": True, "image": image_rel, "lib": lib,
+                key("objects"): count, key("status"): STATUS_UNREVIEWED}
 
     def _backup(self, image_rel: str, label: str, *, backup_path: str = "",
                 history_dir: str = "") -> None:
@@ -908,21 +1145,34 @@ class ReviewStore:
         return os.path.splitext(str(image_rel).replace("/", "__"))[0]
 
     def undoable(self, image_rel: str, kind: str = "pose") -> bool:
-        """界面用来判断「撤销」是否可用：有原始备份或有历史快照都算。"""
-        if kind == "prompt":
-            backup, history = (self._prompt_backup_path(image_rel),
-                               self._prompt_history_dir(image_rel))
-        else:
+        """界面用来判断「撤销」是否可用：有原始备份或有历史快照都算。
+
+        ``kind`` 直接收库名（``pose``/``objects``/``detect``），也认提示词页传过来的
+        老写法 ``prompt``，省得前端为了一个按钮再维护一张映射表。
+        """
+        wanted = str(kind or "pose").strip().lower()
+        if wanted in ("prompt", "obj", "object", "objects"):
+            wanted = LIB_OBJECTS
+        if wanted == LIB_POSE:
             backup, history = self._backup_path(image_rel), self._history_dir(image_rel)
+        else:
+            backup = self._box_backup_path(image_rel, wanted)
+            history = self._box_history_dir(image_rel, wanted)
         if os.path.exists(backup):
             return True
         return os.path.isdir(history) and bool(os.listdir(history))
 
+    def _box_backup_path(self, image_rel: str, lib: str = LIB_OBJECTS) -> str:
+        return os.path.join(backups_dir(self.root, lib), self._stem(image_rel) + ".txt")
+
+    def _box_history_dir(self, image_rel: str, lib: str = LIB_OBJECTS) -> str:
+        return os.path.join(history_root(self.root, lib), self._stem(image_rel))
+
     def _prompt_backup_path(self, image_rel: str) -> str:
-        return os.path.join(backups_dir(self.root, LIB_OBJECTS), self._stem(image_rel) + ".txt")
+        return self._box_backup_path(image_rel, LIB_OBJECTS)
 
     def _prompt_history_dir(self, image_rel: str) -> str:
-        return os.path.join(history_root(self.root, LIB_OBJECTS), self._stem(image_rel))
+        return self._box_history_dir(image_rel, LIB_OBJECTS)
 
 
 def persons_from_payload(objects: List[dict], img_w: int, img_h: int) -> List[Person]:
@@ -971,6 +1221,17 @@ def _clamp01(value: float) -> float:
 # HTTP
 # --------------------------------------------------------------------------- #
 
+class UnknownEndpoint(ValueError):
+    """界面打了一个服务端没有的接口。
+
+    单独一个异常类是为了把话说清楚：以前回的是英文 ``not found``，
+    界面上只剩「失败：not found」，谁也不知道是没这个接口还是别的问题。
+    """
+
+    def __init__(self, path: str):
+        super().__init__(f"没有这个接口：{path}")
+
+
 class ReviewHandler(BaseHTTPRequestHandler):
     store: ReviewStore  # 由 server 注入
     protocol_version = "HTTP/1.1"
@@ -985,6 +1246,40 @@ class ReviewHandler(BaseHTTPRequestHandler):
         super().log_message(fmt, *args)
 
     # --- 路由 ---
+    @staticmethod
+    def _lib_of(parsed, default: str = LIB_OBJECTS) -> str:
+        """从查询串取 ``?lib=``：检测框那几个接口两个框库共用，靠这个参数分流。
+
+        空值必须走默认库而不是 :func:`library.normalize`——它把空串当姿态库，
+        于是 ``?lib=`` 会把提示词页的请求送到姿态库去。
+        """
+        raw = str(parse_qs(parsed.query).get("lib", [""])[0] or "").strip()
+        return normalize(raw) if raw else normalize(default)
+
+    def _modelhub_search(self, parsed) -> dict:
+        """模型管理页的搜索：本机模型目录 + （可选）官网/GitHub 检索。
+
+        网络不通是常态，不是错误：远端失败只回 ``ok=false`` 加一句原因，
+        本机目录照旧列出，界面才能一直有东西可看。
+        """
+        from . import models as model_manager
+
+        query = parse_qs(parsed.query)
+        text = unquote(query.get("q", [""])[0])
+        task = query.get("task", [""])[0]
+        remote = query.get("remote", ["0"])[0] in ("1", "true", "yes")
+        try:
+            from . import modelhub
+        except ImportError:
+            modelhub = None
+        if modelhub is not None and hasattr(modelhub, "search_payload"):
+            return modelhub.search_payload(text, task=task, remote=remote,
+                                           dataset_root=self.store.root)
+        rows = [row for row in model_manager.list_models(dataset_root=self.store.root)
+                if not text or text.lower() in json.dumps(row, ensure_ascii=False).lower()]
+        return {"ok": True, "query": text, "task": task, "local": rows, "results": [],
+                "remote": remote, "note": "" if not remote else "本机模型目录检索（未启用在线源）"}
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
@@ -996,6 +1291,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self._send_page("review.html")
             elif path in ("/objects", "/objects/"):
                 self._send_page("objects.html")
+            elif path in ("/detect", "/detect/"):
+                # 目标检测页与提示词页共用同一套检测框编辑器，差别只在吃哪一库
+                self._send_page("detect.html")
             elif path in ("/models", "/models/"):
                 self._send_page("models.html")
             elif path in ("/app.js", "/common.js", "/portal.js", "/objects.js", "/models.js"):
@@ -1012,12 +1310,25 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 image = parse_qs(parsed.query).get("image", [""])[0]
                 self._send_json(self.store.read_item(unquote(image)))
             elif path == "/api/fields":
-                self._send_json(self.store.fields_payload())
+                # ?lib= 决定看哪个库的类别表：提示词库与目标检测库各有各的一份
+                self._send_json(self.store.fields_payload(self._lib_of(parsed)))
+            elif path == "/api/detect/models":
+                self._send_json(self.store.detect_models_payload())
+            elif path == "/api/detect/model/classes":
+                query = parse_qs(parsed.query)
+                self._send_json(self.store.detect_model_classes(
+                    unquote(query.get("model", [""])[0]), query.get("device", [""])[0]))
+            elif path == "/api/detect/summary":
+                from .detect import detect_summary
+
+                self._send_json({"detect": detect_summary(self.store.root)})
+            elif path == "/api/modelhub/search":
+                self._send_json(self._modelhub_search(parsed))
             elif path == "/api/prompt/item":
                 image = parse_qs(parsed.query).get("image", [""])[0]
-                self._send_json(self.store.read_prompt_item(unquote(image)))
+                self._send_json(self.store.read_prompt_item(unquote(image), self._lib_of(parsed)))
             elif path == "/api/prompt/summary":
-                self._send_json(self.store.prompt_summary_payload())
+                self._send_json(self.store.prompt_summary_payload(self._lib_of(parsed)))
             elif path == "/api/jobs":
                 self._send_json({"jobs": self.store.jobs.snapshot()})
             elif path == "/api/batches":
@@ -1050,8 +1361,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
             elif path == "/api/prompt/coords":
                 from .prompt import render_object_coords
 
-                fmt = parse_qs(parsed.query).get("format", ["csv"])[0]
-                name, body = render_object_coords(self.store.root, fmt)
+                query = parse_qs(parsed.query)
+                fmt = query.get("format", ["csv"])[0]
+                name, body = render_object_coords(self.store.root, fmt,
+                                                  lib=self._lib_of(parsed))
                 ctype = "application/json; charset=utf-8" if fmt == "jsonl" else "text/csv; charset=utf-8"
                 self._send_download(name, body, ctype)
             elif path.startswith("/image/"):
@@ -1060,7 +1373,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 # 队列缩略图走小图 + 长缓存，主图仍旧用 /image/ 看全分辨率
                 self._send_image(unquote(path[len("/thumb/"):]), thumb=True)
             else:
-                self._send_json({"error": "not found"}, status=404)
+                raise UnknownEndpoint(path)
+        except UnknownEndpoint as exc:
+            self._send_json({"error": str(exc)}, status=404)
         except FileNotFoundError as exc:
             self._send_json({"error": f"文件不存在: {exc}"}, status=404)
         except KeyError as exc:
@@ -1068,18 +1383,59 @@ class ReviewHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
         except Exception as exc:  # noqa: BLE001
-            self._send_json({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            # 异常类型名留着：用户截图反馈时那一串英文就是最有用的线索，
+            # 但整句得先是中文，否则界面弹出来只剩一串没人看得懂的东西。
+            self._send_json({"error": f"服务内部出错（{type(exc).__name__}）：{exc}"}, status=500)
+
+    #: JSON 顶层类型 → 中文说法。请求体写成数组 / 字符串时得能说清"是个什么"，
+    #: 只回一句"解析失败"用户根本不知道错在哪（这三种都是合法 JSON，只是不是对象）
+    JSON_KIND = {"list": "数组", "str": "字符串", "int": "数字", "float": "数字",
+                 "bool": "true/false", "NoneType": "null"}
+
+    def _content_length(self) -> int:
+        """请求体长度。``Content-Length`` 写坏（``abc`` / 负数）以前会在
+        ``int()`` 上抛异常，而那一行在所有 try 之外——连接被直接掐断，
+        客户端看到的是断链而不是中文提示。按 0 处理，让后面报「没收到内容」。
+        """
+        raw = str(self.headers.get("Content-Length") or "").strip()
+        try:
+            length = int(raw)
+        except ValueError:
+            return 0
+        return length if length > 0 else 0
+
+    def _read_payload(self) -> dict:
+        """读 JSON 请求体，保证返回的是 dict。
+
+        ``json.loads`` 认 ``[1,2]`` / ``"hi"`` / ``null`` 都是合法 JSON，可下面清一色
+        ``payload.get(...)``，而且取 ``image`` 那一行在 try 之外：抛出来的
+        ``AttributeError`` 一路冲到 ``BaseHTTPRequestHandler``，连接被关掉、一个字节
+        响应都没写，界面上只剩「Failed to fetch」——看着像服务挂了。
+        """
+        length = self._content_length()
+        raw = self.rfile.read(length) if length else b""
+        if not raw.strip():
+            return {}
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"JSON 解析失败：{exc.msg}（第 {exc.lineno} 行第 {exc.colno} 列）") from None
+        if not isinstance(payload, dict):
+            kind = self.JSON_KIND.get(type(payload).__name__, type(payload).__name__)
+            raise ValueError(f"请求体得是 JSON 对象，现在收到的是 {kind}")
+        return payload
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        length = int(self.headers.get("Content-Length") or 0)
+        length = self._content_length()
         if parsed.path == "/api/upload":
             self._handle_upload(parsed, length)
             return
         try:
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
-            self._send_json({"error": "JSON 解析失败"}, status=400)
+            payload = self._read_payload()
+        except Exception as exc:  # noqa: BLE001 读请求体失败统一按 400 回
+            self._send_json({"error": str(exc) or f"读请求体失败（{type(exc).__name__}）"},
+                            status=400)
             return
         image = unquote(str(payload.get("image", "")))
         try:
@@ -1087,29 +1443,52 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 self._send_json(self.store.write_item(image, payload.get("objects", []),
                                                       payload.get("status")))
             elif parsed.path == "/api/status":
-                self._send_json(self.store.set_status(image, str(payload.get("status"))))
+                self._send_json(self.store.set_status(image, status_argument(payload.get("status"))))
             elif parsed.path == "/api/undo":
                 self._send_json(self.store.undo(image, str(payload.get("kind") or "pose")))
             elif parsed.path == "/api/fields/save":
-                saved = self.store.save_field(payload.get("field") or payload)
-                self._send_json({"ok": True, "field": saved, **self.store.fields_payload()})
+                lib = normalize(payload.get("lib") or LIB_OBJECTS)
+                saved = self.store.save_field(payload.get("field") or payload, lib)
+                self._send_json({"ok": True, "field": saved, **self.store.fields_payload(lib)})
             elif parsed.path == "/api/fields/delete":
-                wanted = str(payload.get("id") or payload.get("name") or "").strip()
+                # 显式判 None 而不是 or：类别号 0 是合法值，别被当假值丢掉
+                wanted = ""
+                for key in ("id", "name"):
+                    if payload.get(key) not in (None, ""):
+                        wanted = str(payload[key]).strip()
+                        break
                 if not wanted:
                     raise ValueError("没有指定要删除的字段")
                 self._send_json({"ok": True, **self.store.remove_field(
-                    wanted, drop_boxes=bool(payload.get("drop_boxes")))})
+                    wanted, drop_boxes=bool(payload.get("drop_boxes")),
+                    lib=normalize(payload.get("lib") or LIB_OBJECTS))})
+            elif parsed.path == "/api/detect/classes/add":
+                self._send_json({"ok": True, **self.store.add_detect_classes(payload)})
+            elif parsed.path == "/api/detect/prefs":
+                self._send_json(self.store.save_detect_prefs(payload))
             elif parsed.path == "/api/prompt/item":
-                self._send_json(self.store.write_prompt_item(image, payload.get("objects", []),
-                                                             payload.get("status")))
+                self._send_json(self.store.write_prompt_item(
+                    image, payload.get("objects", []), payload.get("status"),
+                    normalize(payload.get("lib") or LIB_OBJECTS)))
             elif parsed.path == "/api/prompt/status":
-                self._send_json(self.store.set_prompt_status(image, str(payload.get("status"))))
+                self._send_json(self.store.set_prompt_status(
+                    image, status_argument(payload.get("status")),
+                    normalize(payload.get("lib") or LIB_OBJECTS)))
             elif parsed.path == "/api/prompt/undo":
-                self._send_json(self.store.undo_prompt(image))
+                self._send_json(self.store.undo_prompt(
+                    image, normalize(payload.get("lib") or LIB_OBJECTS)))
+            elif parsed.path == "/api/detect/run":
+                self._send_json(self.store.run_detect_job(payload), status=202)
+            elif parsed.path == "/api/detect/upload":
+                self._send_json(self.store.run_detect_upload_job(payload), status=202)
             elif parsed.path == "/api/prompt/run":
                 self._send_json(self.store.run_prompt_job(payload), status=202)
             elif parsed.path == "/api/prompt/export":
-                self._send_json({"ok": True, "export": self.store.export_detection(payload)})
+                export = self.store.export_detection(payload)
+                # 把 kind 一起回给前端：门户「上次导出」与训练命令都按 kind 分派，
+                # 让前端自己记着导出时选的库，早晚会对不上
+                kind = "yolo_detect" if normalize(payload.get("lib") or LIB_OBJECTS) == LIB_DETECT else "detect"
+                self._send_json({"ok": True, "kind": kind, "export": export})
             elif parsed.path == "/api/export":
                 self._send_json({"ok": True, "export": self.store.export_pose_dataset(payload)})
             elif parsed.path == "/api/export/reveal":
@@ -1196,7 +1575,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/settings":
                 self._send_json(self.store.save_settings(payload))
             else:
-                self._send_json({"error": "not found"}, status=404)
+                raise UnknownEndpoint(parsed.path)
+        except UnknownEndpoint as exc:
+            # 这个异常是 ValueError 的子类，漏了那条 except 时它会被下面按 400 回，
+            # 于是同一个不存在的地址 GET 给 404、POST 给 400——前端按状态码分支就懵了。
+            self._send_json({"error": str(exc)}, status=404)
         except FileNotFoundError as exc:
             self._send_json({"error": str(exc)}, status=404)
         except KeyError as exc:
@@ -1204,7 +1587,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
         except Exception as exc:  # noqa: BLE001
-            self._send_json({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            # 异常类型名留着：用户截图反馈时那一串英文就是最有用的线索，
+            # 但整句得先是中文，否则界面弹出来只剩一串没人看得懂的东西。
+            self._send_json({"error": f"服务内部出错（{type(exc).__name__}）：{exc}"}, status=500)
 
     def _handle_upload(self, parsed, length: int) -> None:
         """原始字节上传（无 multipart 解析）：文件名走 ?name= 查询参数。
@@ -1229,7 +1614,9 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=400)
             return
         except Exception as exc:  # noqa: BLE001
-            self._send_json({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+            # 异常类型名留着：用户截图反馈时那一串英文就是最有用的线索，
+            # 但整句得先是中文，否则界面弹出来只剩一串没人看得懂的东西。
+            self._send_json({"error": f"服务内部出错（{type(exc).__name__}）：{exc}"}, status=500)
             return
         self._send_json(info)
 
@@ -1330,9 +1717,12 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bo
     url = f"{scheme}://{host}:{port}/"
     total = len(store.index.items)
     objects_total = len(store.objects_index.items)
-    # 用内存里已经读好的两本索引现算，别再为这一行去解析一遍 index.json
+    detect_total = len(store.detect_index.items)
+    # 用内存里已经读好的三本索引现算，别再为这一行去解析一遍 index.json
+    # （少传一个库，这一行就会少报一库的待办：目标检测刚进来时就这样）
     counts = review_counts(list(store.index.items.values()),
-                           list(store.objects_index.items.values()))  # noqa: E501
+                           list(store.objects_index.items.values()),
+                           list(store.detect_index.items.values()))
     print(f"[info] 工作台: {url}")
     from . import settings as system
 
@@ -1351,10 +1741,10 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bo
     if host in ("0.0.0.0", "::"):
         print(f"[info] 手机/同网电脑可访问 https://这台机器的IP:{port}/（需把 certs/ca.pem 装到那台设备）")
     print(f"[info] 自动标注 v{versioning.VERSION} · 开发者 {versioning.DEVELOPER} · {versioning.REPO_URL}")
-    print(f"[info] 数据集 {store.index.name}：姿态库 {total} 张 · 提示词库 {objects_total} 张，"
-          f"等你复核 {counts['pending']} 张（其中 {counts['flagged']} 张"
+    print(f"[info] 数据集 {store.index.name}：姿态库 {total} 张 · 提示词库 {objects_total} 张 · "
+          f"检测库 {detect_total} 张，等你复核 {counts['pending']} 张（其中 {counts['flagged']} 张"
           f"机器自己报了问题，进页面按 F 逐张跳）")
-    print("[info] 二级模块：/pose 姿态标注 · /objects 提示词标注 · /models 模型管理")
+    print("[info] 二级模块：/pose 姿态标注 · /objects 提示词标注 · /detect 目标检测 · /models 模型管理")
     print(f"[info] 右上角可上传视频/图片目录（单文件上限 {max_upload_mb} MB），上传后自动标注并生成坐标文件")
     if store.recovery["recovered"] or store.recovery["interrupted"] or store.recovery["missing_files"]:
         print(f"[warn] 启动对账：补回 {store.recovery['recovered']} 张未入库图片，"

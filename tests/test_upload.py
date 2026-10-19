@@ -10,6 +10,7 @@ import urllib.parse
 import urllib.request
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from _helpers import write_label
@@ -245,3 +246,43 @@ def test_label_dataset_stops_on_request(dataset):
     assert stats["labeled"] == 0 and stats["total"] > 0 and stats["cancelled"] == stats["total"]
 
 
+
+
+# --- 第 31 轮体检：界面能传的必须就是命令行能导的 ------------------------ #
+
+def test_the_browser_accepts_exactly_what_the_cli_can_import():
+    """同一个后缀不该"命令行导得进、界面里被拒"。
+
+    差的就是 ``.tif``/``.tiff``：命令行导入一路正常，浏览器里传同一张图只得到
+    一句"不支持的文件类型"。收进来之后统一转码成 JPEG，界面看的从来不是原图。
+    """
+    from autolabel import upload as up
+    from autolabel.dataset import IMAGE_EXTS as importable
+
+    assert set(up.IMAGE_EXTS) == set(importable)
+    assert kind_for(".tif") == "image" and kind_for(".TIFF") == "image"
+
+
+def test_a_tiff_upload_lands_as_a_normalized_jpeg(dataset):
+    """TIFF 进素材池要变成 JPEG：``<img>`` 渲染不了 TIFF，索引尺寸也得是转码后的。"""
+    from autolabel import upload as up
+    from autolabel.dataset import import_images, load_index
+
+    buf = io.BytesIO()
+    Image.new("RGB", (300, 120), (200, 60, 60)).save(buf, "TIFF")
+    saved = up.save_upload(dataset, "扫描件.tif", buf.getvalue())
+
+    assert saved["kind"] == "image"
+    stats = import_images(dataset, [os.path.join(up.uploads_dir(dataset), saved["stored"])])
+    assert stats["imported"] == 1 and stats["failed"] == 0
+    rel = stats["imported_files"][0][1]
+    assert rel.endswith(".jpg")
+    item = load_index(dataset).items[rel]
+    assert (item["width"], item["height"]) == (300, 120)
+
+
+def test_an_unsupported_extension_is_still_refused(dataset):
+    from autolabel import upload as up
+
+    with pytest.raises(ValueError, match="不支持的文件类型"):
+        up.save_upload(dataset, "报告.pdf", b"%PDF-1.4 fake")

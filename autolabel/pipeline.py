@@ -12,8 +12,8 @@ import numpy as np
 
 from .backends import BackendSettings, build_backend
 from .dataset import (
-    STATUS_APPROVED,
-    STATUS_EDITED,
+    DEFINITIVE_STATUSES,
+    HUMAN_STATUSES,
     STATUS_UNREVIEWED,
     label_path_for,
     load_index,
@@ -24,8 +24,8 @@ from .image_utils import load_rgb
 from .yolo_pose import Person, person_sanity_flags, write_label_file
 
 
-#: 人工在复核界面动过的状态：接受过的、手工改过骨骼的。模型重标默认不许覆盖它们。
-HUMAN_STATUSES = (STATUS_APPROVED, STATUS_EDITED)
+#: 人工碰过的状态直接从 dataset 取（唯一出处）：这里只是给老调用留个顺手的别名。
+__all__ = ["HUMAN_STATUSES", "image_level_flags", "label_dataset", "settings_signature"]
 
 
 def _human_reviewed(item: dict) -> bool:
@@ -142,6 +142,7 @@ def label_dataset(
 
     stats = {"total": len(targets), "labeled": 0, "people": 0, "empty": 0,
              "flagged": 0, "failed": 0, "skipped_reviewed": 0, "skipped_human": skipped_human,
+             "verdict_reset": 0,
              "cancelled": 0}
     if not targets:
         if skipped_human:
@@ -180,7 +181,10 @@ def label_dataset(
             h, w, persons, blurred=blur_score(image) < 40.0) if not f.startswith("obj:")]
         if not dry_run:
             write_label_file(label_path_for(root, rel), persons)
-        reviewable = item.get("status") in (None, STATUS_UNREVIEWED, "edited")
+        # 人工结论只对"当初那批框"有效：参数一换内容就是新的，接受过的也得重新确认。
+        # 同一套参数 --force 重跑结果本就一样，这种保留原结论，别把人工标记冲没。
+        had_verdict = item.get("status") in DEFINITIVE_STATUSES
+        keep_verdict = had_verdict and item.get("label_signature") in (None, signature)
         fields = dict(
             width=w, height=h,
             objects=len(persons),
@@ -191,10 +195,12 @@ def label_dataset(
             label_signature=None if dry_run else signature,
             labeled_at=now_str(),
             labeled_by=getattr(ensemble, "source_tag", "") or f"yolo:{settings.model}",
-            status=STATUS_UNREVIEWED if reviewable else item.get("status"),
+            status=item.get("status") if keep_verdict else STATUS_UNREVIEWED,
         )
         if fields["status"] != STATUS_UNREVIEWED:
             stats["skipped_reviewed"] += 1
+        elif had_verdict:
+            stats["verdict_reset"] += 1      # 人工结论作废，退回待复核
         idx.upsert(rel, **fields)
         updates.setdefault(rel, {}).update(fields)
         stats["labeled"] += 1

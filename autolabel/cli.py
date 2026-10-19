@@ -1,5 +1,6 @@
-"""命令行入口：init / import / video / label / qc / review / export / coords / validate / status /
-pool / migrate / fields / prompt / models / reset。"""
+"""命令行入口：init / import / video / auto / label / detect / qc / review / export / coords /
+validate / status / batches / pool / migrate / fields / prompt / models / settings / version / ca /
+reset。"""
 
 from __future__ import annotations
 
@@ -14,23 +15,34 @@ from .backends import BackendSettings
 from .settings import DEVICE_VALUES
 from . import __version__
 from .dataset import (
+    ALL_STATUSES,
     STATUS_APPROVED,
+    STATUS_REJECTED,
     STATUS_UNREVIEWED,
     import_images,
     init_dataset,
     label_path_for,
     load_index,
+    missing_sources,
+    status_of,
 )
-from .library import LIBRARIES, lib_name
+from .library import (
+    LIB_DETECT,
+    LIB_OBJECTS,
+    LIB_POSE,
+    LIBRARIES,
+    field_key,
+    label_field_keys,
+    lib_name,
+    normalize,
+    status_key,
+)
 from .upload import VIDEO_EXTS
 from .yolo_pose import validate_label_file
 
 
-def _pad(text: object, width: int) -> str:
-    """按终端显示宽度补空格：中文占两列，直接用 ``:<10`` 会把表格拉歪。"""
-    value = str(text)
-    wide = sum(1 for ch in value if unicodedata.east_asian_width(ch) in ("W", "F"))
-    return value + " " * max(0, width - len(value) - wide)
+#: 表格里用的库名短标签（``lib_name`` 给的是全称，列宽只有几格放不下）
+LIB_TAGS = {LIB_POSE: "姿态", LIB_OBJECTS: "提示词", LIB_DETECT: "检测"}
 
 
 def load_settings(args: argparse.Namespace) -> BackendSettings:
@@ -308,9 +320,7 @@ def cmd_settings(args: argparse.Namespace) -> int:
 def cmd_export(args: argparse.Namespace) -> int:
     from .export import export_dataset
 
-    exclude = [] if args.include_all else ["rejected"]
-    if args.only_approved:
-        exclude = [s for s in ("unreviewed", "rejected") if s not in (args.keep_status or [])]
+    exclude = _exclude_from_args(args)
     result = export_dataset(args.dataset, out=args.out, val_ratio=args.val_ratio, seed=args.seed,
                             exclude_status=exclude, max_empty_ratio=args.max_empty_ratio,
                             mode=args.mode, tag=args.tag, coco=args.coco, coords=args.coords)
@@ -323,6 +333,9 @@ def cmd_export(args: argparse.Namespace) -> int:
     if result.get("empty_dropped"):
         print(f"     背景图（无人）只保留 {result['empty']} 张，上限 --max-empty-ratio "
               f"{args.max_empty_ratio}；想全要就设 1")
+    if result.get("missing_source"):
+        print(f"     注意：{result['missing_source']} 帧索引里记着、images/ 里却没有了，"
+              f"本次已跳过；把图片放回 images/ 或在界面「全部素材」删掉这些帧再导一次")
     print(f"     data.yaml: {os.path.join(result['out'], 'data.yaml')}")
     if result.get("coords"):
         print(f"     坐标文件: {result['coords']}（coords.csv / coords_long.csv / coords.jsonl）")
@@ -335,8 +348,8 @@ def _exclude_from_args(args: argparse.Namespace) -> List[str]:
     """把 --only-approved / --include-all / --keep-status 折算成要排除的状态。"""
     exclude = [] if getattr(args, "include_all", False) else ["rejected"]
     if getattr(args, "only_approved", False):
-        exclude = [s for s in ("unreviewed", "rejected")
-                   if s not in (getattr(args, "keep_status", None) or [])]
+        keep = _flatten_status(getattr(args, "keep_status", None))
+        exclude = [s for s in (STATUS_UNREVIEWED, STATUS_REJECTED) if s not in keep]
     return exclude
 
 
@@ -357,6 +370,16 @@ def cmd_coords(args: argparse.Namespace) -> int:
           f"关键点 {result['persons'] * meta['num_keypoints']} 个 · "
           f"已排除状态 {meta['filter']['exclude_status'] or '无'}")
     print("     提示：v=0 不参与 YOLO 监督，v=1（遮挡）与 v=2（可见）都参与")
+    gone = [row for row in (result["meta"].get("skipped") or [])
+            if str(row.get("reason", "")).startswith("源文件缺失")]
+    if gone:
+        print(f"     注意：{len(gone)} 张图索引里记着、images/ 里却没有了，已跳过这些行")
+    if not result["images"]:
+        from .export import other_library_hint
+
+        hint = other_library_hint(args.dataset, flag="coords")
+        if hint:
+            print("     提示：姿态标注库里没有可导出的样本" + hint)
     return 0
 
 
@@ -422,7 +445,12 @@ def cmd_auto(args: argparse.Namespace) -> int:
         # 提示词库不跑 YOLO-pose：入库即收尾，骨骼标注 / QC / 骨骼坐标是姿态库那套流水线
         finish_batch(root, batch["id"], "done", _import_note(len(imported)))
         print(f"[2/4] {lib_name(lib)}不跑 YOLO-pose，已跳过骨骼标注、QC 与骨骼坐标")
-        print(f"      下一步：python3 -m autolabel prompt {root} --fields <字段名> --vlm <多模态配置> --coords")
+        if lib == LIB_DETECT:
+            print(f"      下一步：python3 -m autolabel detect {root} "
+                  "--add-classes all --coords（先看这个权重能标什么：--model-classes yolo11n.pt）")
+        else:
+            print(f"      下一步：python3 -m autolabel prompt {root} "
+                  "--fields <字段名> --vlm <多模态配置> --coords")
         return 0
 
     settings = load_settings(args)
@@ -457,13 +485,15 @@ def cmd_batches(args: argparse.Namespace) -> int:
         from .batches import delete_images
 
         try:
-            result = delete_images(args.dataset, args.delete_images, lib=lib or "pose",
+            result = delete_images(args.dataset, _split_multi(args.delete_images), lib=args.lib,
                                    mode=args.mode, keep_files=args.keep_files)
         except ValueError as exc:
             # 文件名是手打的，拼错很常见，别甩整段回溯给用户
             print(f"[error] {exc}")
             return 2
-        where = "两个库都摘" if result["mode"] == "purge" else f"仅{lib_name(result['lib'])}"
+        touched = [str(x) for x in (result.get("libs") or [])] or [result["lib"]]
+        where = ("三个库都摘" if result["mode"] == "purge" or len(touched) > 1
+                 else f"仅{lib_name(touched[0])}")
         kept = result["mode"] == "lib" or result["keep_files"]
         scope = "标签/复核历史，素材文件保留" if kept else "标签/复核历史 + 素材文件"
         print(f"[ok] 移除图片 {result['items']} 张（{where}）· 库引用 {result['removals']} 处 · "
@@ -480,7 +510,7 @@ def cmd_batches(args: argparse.Namespace) -> int:
         return 0
 
     if args.delete:
-        result = delete_batches(args.dataset, args.delete, keep_files=args.keep_files,
+        result = delete_batches(args.dataset, _split_multi(args.delete), keep_files=args.keep_files,
                                 force=args.force)
         scope = "保留文件" if args.keep_files else "标签/QC 叠加图/复核历史"
         print(f"[ok] 删除批次 {len(result['batches'])} 个 · 移除图片 {result['items']} 张 · "
@@ -499,18 +529,25 @@ def cmd_batches(args: argparse.Namespace) -> int:
     if not rows:
         print("还没有批次记录：import / video / auto 与复核界面上传都会自动登记")
         return 0
-    scope = "两个库合计" if not lib else lib_name(lib)
+    scope = "三个库合计" if not lib else lib_name(lib)
     print(f"共 {len(rows)} 个批次（{scope}）")
     print(f"{_pad('批次 ID', 26)} {_pad('库', 10)} {_pad('状态', 9)} {_pad('图片', 5)} "
           f"{_pad('已标', 5)} {_pad('人数', 5)} {_pad('检测框', 7)}  来源 · 名称")
+    from .batches import MODULE_ROW_KEYS
+
     for row in rows:
+        # 已标 / 框数取这批所属模块的小计：顶层的 labeled / people 是姿态库的，
+        # 照抄会让目标检测批次显示成「已标 0 · 检测框 0」
+        mine = row.get(MODULE_ROW_KEYS.get(str(row.get("module") or ""), "pose")) or {}
+        boxes = int(row.get("prompt_boxes") or 0) + int(row.get("detect_boxes") or 0)
         print(f"{_pad(row['id'], 26)} "
               f"{_pad(row.get('module_name') or row.get('module') or '-', 10)} "
-              f"{_pad(row['status'], 9)} {_pad(row['items'], 5)} {_pad(row['labeled'], 5)} "
-              f"{_pad(row['people'], 5)} {_pad(row.get('prompt_boxes') or 0, 7)}  "
+              f"{_pad(row['status'], 9)} {_pad(row['items'], 5)} "
+              f"{_pad(mine.get('labeled', row.get('labeled')) or 0, 5)} "
+              f"{_pad(row['people'], 5)} {_pad(boxes, 7)}  "
               f"[{row['source']}/{row['kind']}] {row['name']}")
     print(f"\n整批删除：batches {args.dataset} --delete <批次 ID>"
-          f"（未分组用 {UNGROUPED_ID} 一次清两个库，或 {UNGROUPED_ID}:objects；"
+          f"（未分组用 {UNGROUPED_ID} 一次清三个库，或 {UNGROUPED_ID}:detect；"
           f"加 --keep-files 只删记录、--force 强删僵尸批次）")
     print(f"按张删除：batches {args.dataset} --delete-images images/a.jpg --lib objects "
           f"[--mode lib|purge]（lib 只摘本库引用，purge 连素材文件一起删）")
@@ -523,26 +560,30 @@ def cmd_pool(args: argparse.Namespace) -> int:
 
     rows = pool_items(args.dataset)
     if args.add:
-        stats = adopt_from_pool(args.dataset, args.add, lib=args.lib)
+        stats = adopt_from_pool(args.dataset, _split_multi(args.add), lib=args.lib)
         print(f"[ok] 添加到{lib_name(stats['lib'])}：新增 {stats['added']} 张 · "
               f"本来就在库里 {stats['already']} 张 · 池里查无 {len(stats['missing'])} 张")
         if stats["missing"]:
             print(f"[warn] 找不到：{'、'.join(stats['missing'][:10])}")
         return 0
 
-    shared = sum(1 for row in rows if row["in_pose"] and row["in_objects"])
-    orphan = sum(1 for row in rows if not row["in_pose"] and not row["in_objects"])
-    print(f"素材池共 {len(rows)} 个文件 · 姿态库 {sum(1 for r in rows if r['in_pose'])} · "
-          f"提示词库 {sum(1 for r in rows if r['in_objects'])} · 两库共用 {shared} · 无人引用 {orphan}")
+    # 引用情况一律看 libs 那份清单：只写 ``in_pose and in_objects`` 会把
+    # 「只在目标检测库里」的素材报成无人引用，害人去重新认领已经在用的文件
+    used = {lib: sum(1 for row in rows if row.get("in_" + lib)) for lib in LIBRARIES}
+    shared = sum(1 for row in rows if len(row.get("libs") or []) > 1)
+    orphan = sum(1 for row in rows if not (row.get("libs") or []))
+    print(f"素材池共 {len(rows)} 个文件 · 姿态库 {used[LIB_POSE]} · 提示词库 {used[LIB_OBJECTS]} · "
+          f"检测库 {used[LIB_DETECT]} · 多库共用 {shared} · 无人引用 {orphan}")
     for row in rows[:args.limit]:
-        mark = ("姿态" if row["in_pose"] else "") + ("/提示词" if row["in_objects"] else "")
+        mark = "/".join(LIB_TAGS[lib] for lib in LIBRARIES if row.get("in_" + lib))
         size = f"{row['width']}x{row['height']}" if row["width"] else "未知"
         size_bytes = f"{row['bytes']:,} B"
         print(f"  {_pad(row['image'], 44)} {_pad(size, 11)} {_pad(size_bytes, 12)}  "
               f"在 {mark or '（没被任何库引用）'}")
     if len(rows) > args.limit:
         print(f"  …… 还有 {len(rows) - args.limit} 个，--limit 提高条数")
-    print(f"\n添加：pool {args.dataset} --add a.jpg --add b.jpg --lib objects")
+    print(f"\n添加：pool {args.dataset} --add a.jpg --add b.jpg "
+          f"--lib pose|objects|detect（默认 pose；这张图在别的库已经标过的，加进来不覆盖那边的标注）")
     return 0
 
 
@@ -665,6 +706,9 @@ def cmd_models(args: argparse.Namespace) -> int:
         _print_model_detail(row, model_admin)
         return 1 if failed else 0
 
+    if getattr(args, "search", "") or getattr(args, "remote", False):
+        return _print_model_search(args)
+
     payload = model_admin.vlm_payload(dataset_root=args.dataset or "")
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -699,8 +743,8 @@ def cmd_models(args: argparse.Namespace) -> int:
 
 
 def _display_width(text: str) -> int:
-    """显示宽度：中日韩字符占两列，表格才对得齐。"""
-    return sum(2 if ord(ch) > 0x2E80 else 1 for ch in str(text))
+    """显示宽度：全角字符占两列，表格才对得齐（``east_asian_width`` 才是准的）。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in str(text))
 
 
 def _pad(text: object, width: int) -> str:
@@ -751,6 +795,50 @@ def _print_model_rows(payload: dict, args: argparse.Namespace, model_admin) -> N
     print("\n看单个模型的完整中文说明：models --info <模型 ID>")
     print("写备注说明：            models --note <模型 ID>=说明")
     print("看可下载目录：          models --browse")
+
+
+def _print_model_search(args: argparse.Namespace) -> int:
+    """模型搜索：本地模型目录（含官方可下载的那些）+ 可选的 GitHub 社区权重。
+
+    断网/超时不算失败：modelhub 会把 ``ok`` 置 False 并把原因写在 ``note``，
+    这里照原话念出来，本地结果照样给。
+    """
+    from . import modelhub
+
+    payload = modelhub.search_payload(args.search or "", task=getattr(args, "task", "") or "",
+                                      remote=bool(getattr(args, "remote", False)),
+                                      dataset_root=args.dataset or "")
+    local = payload.get("local") or []
+    remote = payload.get("results") or []
+    query = payload.get("query") or "（空）"
+    line = f"搜索「{query}」：模型目录命中 {len(local)} 个"
+    if args.remote:
+        line += f" · GitHub 命中 {len(remote)} 个"
+    print(line)
+    if payload.get("note"):
+        print(f"  {payload['note']}")
+    for row in local:
+        size = f"{row.get('expected_mb') or 0:.1f} MB" if row.get("expected_mb") else "体积未知"
+        params = f"{row.get('params_m'):.1f}M 参数" if row.get("params_m") else "参数量官方未列明"
+        flag = "已在本机" if row.get("installed") else "未下载"
+        print(f"\n  {_pad(row.get('filename') or row.get('name') or '', 24)}"
+              f"{_pad(row.get('task_name') or row.get('task_label') or '', 12)}"
+              f"{_pad(flag, 10)}{_pad(size, 14)}{params}")
+        print(f"    说明：{(row.get('description') or row.get('intro') or '（目录里没写说明）')[:120]}")
+        if row.get("recommended_for"):
+            print(f"    适合：{row['recommended_for']} ｜ 速度：{row.get('speed') or '未标注'}")
+        if row.get("class_note"):
+            print(f"    类别：{row['class_note']}")
+        print(f"    下载：python3 -m autolabel models --download-weight {row.get('filename')}")
+    for row in remote:
+        print(f"\n  [GitHub] {row.get('name')}  {row.get('html_url')}")
+        if row.get("description"):
+            print(f"    {str(row['description'])[:120]}")
+    if not local and not remote:
+        print("\n  没搜到。换个关键词（yolo11 / 姿态 / 分割 / 旋转框），"
+              "或者去掉 --task 限制再看一次")
+    print("\n下载完就能在「目标检测」「姿态标注」的模型下拉框里选到。")
+    return 0
 
 
 def _print_catalog(payload: dict) -> None:
@@ -823,31 +911,37 @@ def cmd_fields(args: argparse.Namespace) -> int:
     """字段登记表：提示词标注要标哪些物品、每个物品用什么描述提示词。"""
     from .fields import delete_field, fields_payload, find_field, upsert_field
 
+    lib = getattr(args, "lib", LIB_OBJECTS) or LIB_OBJECTS
     for item in args.add or []:
         name, _, hint = str(item).partition("=")
-        field = upsert_field(args.dataset, name=name, prompt_hint=hint)
+        field = upsert_field(args.dataset, name=name, prompt_hint=hint, lib=lib)
         note = field["prompt_hint"] or "（还没写描述提示词，模型只能凭字段名猜）"
         print(f"[ok] 字段 {field['name']}（类别号 {field['class_id']}）：{note}")
     for item in args.set_label or []:
         name, _, label = str(item).partition("=")
-        hit = find_field(args.dataset, name)
+        hit = find_field(args.dataset, name, lib)
         if hit is None:
             raise ValueError(f"未知字段 {name}，先用 --add {name}=描述 新建")
         field = upsert_field(args.dataset, name=hit["name"], label=label,
-                             prompt_hint=hit.get("prompt_hint", ""))
+                             prompt_hint=hit.get("prompt_hint", ""), lib=lib)
         print(f"[ok] 字段 {field['name']} 的显示名改为「{field['label']}」")
     for item in args.delete or []:
-        result = delete_field(args.dataset, item, drop_boxes=args.drop_boxes)
+        result = delete_field(args.dataset, item, drop_boxes=args.drop_boxes, lib=lib)
         print(f"[ok] 已删除字段 {result['name']}（类别号 {result['class_id']}），"
               f"连带删掉 {result['boxes_removed']} 个框，改了 {result['labels_touched']} 个标签文件")
 
-    payload = fields_payload(args.dataset)
+    payload = fields_payload(args.dataset, lib)
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     if not payload["fields"]:
-        print("还没有字段。新建一个：autolabel fields <数据集> --add \"bottle=桌上或手里的水瓶、纸杯、易拉罐\"")
-        print("或者在网页「提示词标注」页里填字段名 + 描述提示词。")
+        if payload.get("lib") == LIB_DETECT:
+            print("目标检测库还没有类别表。类别来自权重自带，先看能标什么、再导入：")
+            print(f"  python3 -m autolabel detect {args.dataset} --model-classes yolo11n.pt")
+            print(f"  python3 -m autolabel detect {args.dataset} --model yolo11n.pt --add-classes all")
+        else:
+            print("还没有字段。新建一个：autolabel fields <数据集> --add \"bottle=桌上或手里的水瓶、纸杯、易拉罐\"")
+            print("或者在网页「提示词标注」页里填字段名 + 描述提示词。")
         return 0
     print(f"字段登记表 {payload['path']}（{len(payload['fields'])} 个字段）")
     for row in payload["fields"]:
@@ -938,38 +1032,248 @@ def cmd_prompt(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_validate(args: argparse.Namespace) -> int:
-    idx = load_index(args.dataset)
-    num_kpt = args.num_keypoints or idx.num_keypoints
-    issue_count: Dict[str, int] = {}
-    samples: List[str] = []
-    for rel, item in idx.ordered_items():
-        issues = validate_label_file(label_path_for(args.dataset, rel),
-                                    int(item.get("width", 0) or 0), int(item.get("height", 0) or 0),
-                                    num_keypoints=num_kpt, class_names=idx.class_names)
-        for issue in issues:
-            issue_count[issue.kind] = issue_count.get(issue.kind, 0) + 1
-            if len(samples) < 20:
-                samples.append(f"{issue.path}:{issue.line or '-'} [{issue.kind}] {issue.detail}")
-    # 目录侧检查：孤儿标签 / 缺图片
-    label_root = os.path.join(os.path.abspath(args.dataset), "labels")
-    indexed = {os.path.splitext(rel)[0] for rel in idx.items}
+def _split_multi(values: Sequence[str]) -> List[str]:
+    """把 ``--classes a,b --classes c`` 摊平成一个列表；界面和命令行都能少记一种写法。"""
+    out: List[str] = []
+    for item in values or []:
+        out += [piece.strip() for piece in str(item).split(",") if piece.strip()]
+    return out
+
+
+def cmd_detect(args: argparse.Namespace) -> int:
+    """目标检测：用本机 YOLO 权重标检测框，类别表由权重自带（非姿态的那类目标检测都走这里）。"""
+    from . import detect as detector
+    from .batches import batch_name, create_batch, finish_batch
+    from .fields import fields_payload
+    from .models import weights_dir
+
+    classes = _split_multi(args.classes)
+    images = _split_multi(args.images)
+
+    if args.list_models:
+        rows = detector.local_models()
+        print(f"权重目录：{os.path.abspath(weights_dir())}")
+        if not rows:
+            print("  本机还没有权重：在界面「模型管理」里搜 yolo 下载，"
+                  "或 python3 -m autolabel models --download-weight yolo11n.pt")
+            return 0
+        for row in rows:
+            mark = "可用" if row["usable"] else "用不了"
+            note = f"  {row['note']}" if row["note"] else ""
+            size = f"{row['bytes'] / 1024 / 1024:.1f} MB" if row.get("installed") else "未下载"
+            print(f"  [{mark:<3}] {row['name']:<26} {row['task_name']:<12} {_pad(size, 12)}"
+                  f"{_pad('已在本机' if row.get('installed') else '-', 10)}{note}")
+        return 0
+
+    if args.model_classes:
+        profile = detector.model_profile(args.model_classes, args.device or "")
+        print(f"{os.path.basename(profile['model'])}：{profile['task_name']} · "
+              f"{profile['class_count']} 类 · 算力 {profile['device']}")
+        for row in profile["classes"][:args.max_print]:
+            print(f"  [{row['class_id']:>3}] {row['name']:<18} {row['label']}")
+        if profile["class_count"] > args.max_print:
+            print(f"  …还有 {profile['class_count'] - args.max_print} 类，"
+                  f"--max-print {profile['class_count']} 看全")
+        print("导入到本库类别表：python3 -m autolabel detect <数据集> --model "
+              f"{os.path.basename(profile['model'])} --add-classes all")
+        return 0
+
+    if args.status:
+        summary = detector.detect_summary(args.dataset)
+        registry = fields_payload(args.dataset, LIB_DETECT)
+        # unreviewed 是"还没标注"的张数，不是"标了没复核"：两个数分开报，
+        # 否则会出现"已标 1 张 · 待复核 0"这种看着矛盾的两句
+        pending = summary["labeled"] - summary["reviewed"]
+        print(f"目标检测：已标 {summary['labeled']}/{summary['images']} 张 · "
+              f"框 {summary['boxes']} · 已确认 {summary['reviewed']} · "
+              f"没复核 {pending} · 未标 {summary['unreviewed']}")
+        print(f"  上次用的权重 {summary['model'] or '（还没跑过）'} · "
+              f"类别表 {len(registry['fields'])}/{registry['max_fields']} 类（{registry['path']}）")
+        if summary["per_class"]:
+            top = sorted(summary["per_class"].items(), key=lambda kv: (-kv[1], kv[0]))[:12]
+            print("  类别分布 " + " · ".join(f"{k}={v}" for k, v in top))
+        if summary["flag_counts"]:
+            print("  标记 " + " · ".join(f"{k}={v}" for k, v in sorted(summary["flag_counts"].items())))
+        return 0
+
+    model = detector.resolve_model(args.model or "", args.dataset)
+    if args.add_classes:
+        wanted = _split_multi(args.add_classes)
+        names = None if any(item.lower() == "all" for item in wanted) else wanted
+        payload = detector.add_model_classes(args.dataset, model, names, args.device or "")
+        not_in = payload.get("not_in_model") or []
+        print(f"[ok] 从 {os.path.basename(payload['model'])}（{payload['task_name']} · "
+              f"{payload['model_class_count']} 类）导入类别：新增 {payload['added']} · "
+              f"复用 {payload['updated']} · 跳过 {len(payload['skipped'])}")
+        if payload["added_names"]:
+            print("     " + "、".join(str(name) for name in payload["added_names"][:20]))
+        if not_in:
+            # 这些名字压根没进登记表（add_model_classes 只登记权重整报得出的类别），
+            # 说"已登记"会让人以为类别表里多了一行
+            print(f"[warn] 这些名字该权重认不出，没有登记：{'、'.join(map(str, not_in[:12]))}"
+                  "（换包含这些类别的权重，或在类别表里改掉）")
+        classes = classes or [row["name"] for row in payload["fields"]]
+        if args.no_label:
+            print("[ok] 只导入类别，没有跑标注（加 --no-label 就是这个意思）")
+            return 0
+
+    registry = detector.pick_classes(args.dataset, classes)
+    if not registry:
+        print(f"{lib_name(LIB_DETECT)}还没有类别表。先看权重能标什么，再导入：")
+        print(f"  python3 -m autolabel detect {args.dataset} --model-classes {model}")
+        print(f"  python3 -m autolabel detect {args.dataset} --model {model} --add-classes all")
+        return 2
+
+    # 批次名直接写"用哪个权重新标了几类"：batch_name() 的"图片 N 个"是给导入用的，
+    # 标注批次套用它会被读成"传进来 N 个文件"
+    batch = create_batch(args.dataset,
+                         name=batch_name("detect", [os.path.basename(model)],
+                                         args.batch_name or f"目标检测 {os.path.basename(model)} · "
+                                                           f"{len(registry)} 类"),
+                         kind="detect", source="cli", lib=LIB_DETECT,
+                         params={"model": os.path.basename(model), "detect_classes": classes,
+                                 "conf": args.conf, "overwrite": args.overwrite,
+                                 "targets": len(images)},
+                         uploads=[os.path.basename(model)])
+    print(f"[info] 用 {os.path.basename(model)} 标 {len(registry)} 个类别"
+          f"（本地推理，不联网，比多模态大模型快得多）")
+    try:
+        stats = detector.run_detect_labeling(args.dataset, model=model, classes=classes,
+                                            images=images or None, limit=args.limit or 0,
+                                            overwrite=args.overwrite, device=args.device or "",
+                                            conf=args.conf, verbose=not args.quiet)
+    except Exception as exc:  # noqa: BLE001 批次要留下失败原因，界面里才看得见
+        finish_batch(args.dataset, batch["id"], "failed", str(exc))
+        raise
+    if stats.get("missing_classes"):
+        print(f"[warn] 该权重认不出 {'、'.join(stats['missing_classes'][:10])}："
+              "这些类别本次不产出框，换权重或在类别表里改掉")
+    if args.coords:
+        from .detect import write_detect_coordinate_files
+
+        written = write_detect_coordinate_files(args.dataset, tag=f"cli-{batch['id']}")
+        print(f"[ok] 坐标文件：{written['out']}（{written['images']} 张 / {written['boxes']} 个框）")
+    if args.export:
+        from .detect import export_detect_dataset
+
+        exported = export_detect_dataset(args.dataset, out=args.out or None)
+        print(f"[ok] detection 训练集：{exported['out']}（train {exported['train']} / "
+              f"val {exported['val']}，{exported['data_yaml']}）")
+    finish_batch(args.dataset, batch["id"], "done",
+                 f"用 {os.path.basename(model)} 标注 {stats['labeled']} 张，产出 {stats['boxes']} 个框")
+    print(f"[ok] 批次 {batch['id']}：标注 {stats['labeled']} 张 · 框 {stats['boxes']} · "
+          f"失败 {stats['failed']} · 跳过 {stats['skipped']}")
+    if stats.get("protected"):
+        print(f"[info] 人工保护 {stats['protected']} 张（已接受或手动画过框，默认不覆盖；要重标加 --overwrite）")
+    if stats["failed"]:
+        print(f"[warn] {stats['failed']} 张失败，最后一条错误：{stats['last_error']}")
+    if not args.coords and not args.export:
+        print("     要导出坐标文件加 --coords，直接出训练集加 --export")
+    return 0
+
+
+def _collect_issues(issues: Sequence[object], issue_count: Dict[str, int],
+                    samples: List[str], lib: str) -> None:
+    """把一次校验的问题并进料数与样例清单（样例最多 20 条，并标出是哪个库）。"""
+    for issue in issues:
+        issue_count[issue.kind] = issue_count.get(issue.kind, 0) + 1
+        if len(samples) < 20:
+            samples.append(f"[{LIB_TAGS.get(lib, lib)}] "
+                           f"{issue.path}:{issue.line or '-'} [{issue.kind}] {issue.detail}")
+
+
+def _orphan_labels(root: str, lib: str, items: Sequence[Tuple[str, dict]]) -> List[str]:
+    """标签目录里有、索引里没有的 ``.txt``（删了图没删标签，训练时会多算样本）。"""
+    from .library import labels_dir
+
+    label_root = labels_dir(root, lib)
+    indexed = {os.path.splitext(rel)[0] for rel, _ in items}
     orphans = []
     for dirpath, _dirs, files in os.walk(label_root):
-        for fn in files:
-            if fn.endswith(".txt"):
-                stem = os.path.splitext(os.path.relpath(os.path.join(dirpath, fn), label_root))[0]
-                if stem not in indexed:
-                    orphans.append(os.path.relpath(os.path.join(dirpath, fn), label_root))
-    if orphans:
-        issue_count["orphan_label"] = len(orphans)
-        samples.extend(f"孤儿标签: {o}" for o in orphans[:10])
+        for name in files:
+            if not name.endswith(".txt"):
+                continue
+            full = os.path.join(dirpath, name)
+            stem = os.path.splitext(os.path.relpath(full, label_root))[0]
+            if stem not in indexed:
+                orphans.append(os.path.relpath(full, label_root))
+    return orphans
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    """校验标签格式：三个库都查，``--lib`` 可以只看一个。
+
+    以前只看姿态库。提示词库与检测库的标签是五列的 detection 格式，坏行在
+    ``fields.read_label_rows`` 里是**静默跳过**的（标注时这样对，一批里不能
+    因为一行脏数据全崩），所以这两个库的坏标签以前没人报——框悄悄少了，
+    要到训练结果不行才发现。
+    """
+    from .fields import box_counts_by_image, list_fields, validate_box_label_file
+
+    root = args.dataset
+    libs = list(LIBRARIES) if args.lib == "all" else [normalize(args.lib)]
+    issue_count: Dict[str, int] = {}
+    samples: List[str] = []
+    checked = 0
+    kpt_note = ""
+    for lib in libs:
+        idx = load_index(root, lib)
+        items = list(idx.ordered_items())
+        if not items:
+            continue
+        checked += len(items)
+        gone = missing_sources(root, [rel for rel, _item in items])
+        if gone:
+            # 图被手工删了：标签格式再干净也没用，导出会跳帧、训练会读不到图。
+            # 这条以前哪儿都不报，只有 export 复制文件时才炸。
+            issue_count["missing_source"] = issue_count.get("missing_source", 0) + len(gone)
+            samples.extend(f"[{LIB_TAGS.get(lib, lib)}] 缺源文件: {rel}" for rel in gone[:10])
+        if lib == LIB_POSE:
+            num_kpt = args.num_keypoints or idx.num_keypoints
+            kpt_note = f"（关键点数 {num_kpt}）"
+            for rel, item in items:
+                _collect_issues(validate_label_file(
+                    label_path_for(root, rel, lib),
+                    int(item.get("width", 0) or 0), int(item.get("height", 0) or 0),
+                    num_keypoints=num_kpt, class_names=idx.class_names), issue_count, samples, lib)
+        else:
+            class_ids = {int(row.get("class_id", -1)) for row in list_fields(root, lib)}
+            for rel, _item in items:
+                _collect_issues(validate_box_label_file(label_path_for(root, rel, lib), class_ids),
+                                issue_count, samples, lib)
+            # 索引里那笔框数账和磁盘上的标签文件对不对得上：手工改过标签、
+            # 或者上次写在两步之间被打断，列表页就会一直显示一个不存在的数字
+            on_disk = box_counts_by_image(root, lib)
+            for rel, item in items:
+                counted = on_disk.get(os.path.splitext(rel)[0])
+                indexed = item.get(field_key(lib, "objects"))
+                if counted is None or (indexed is None and counted == 0):
+                    continue      # 没有标签文件的，上面按 missing_label 报过了
+                if indexed is not None and int(indexed) == counted:
+                    continue
+                issue_count["count_mismatch"] = issue_count.get("count_mismatch", 0) + 1
+                if len(samples) < 20:
+                    # 索引里写着"没标过"而标签文件里有框，导出会整张跳过：
+                    # 用户看到的就是"我明明标了 3 个框，导出来一个都没有"
+                    claimed = "没标过" if indexed is None else f"{indexed} 个框"
+                    samples.append(f"[{LIB_TAGS.get(lib, lib)}] {rel}: 索引记 {claimed}，"
+                                   f"标签文件里是 {counted} 个（重跑一次标注即可对齐）")
+        orphans = _orphan_labels(root, lib, items)
+        if orphans:
+            issue_count["orphan_label"] = issue_count.get("orphan_label", 0) + len(orphans)
+            samples.extend(f"[{LIB_TAGS.get(lib, lib)}] 孤儿标签: {o}" for o in orphans[:10])
+
+    scope = "、".join(lib_name(item) for item in libs)
     if issue_count:
         print("[warn] 发现问题：" + ", ".join(f"{k}={v}" for k, v in sorted(issue_count.items())))
         for line in samples:
             print("   - " + line)
+        print(f"     查的是：{scope}")
         return 1
-    print(f"[ok] 校验通过：{len(idx.items)} 张图，标签格式与关键点数（{num_kpt}）均一致")
+    if not checked:
+        print(f"[ok] 没有需要校验的标签：{scope} 都还没有素材")
+        return 0
+    print(f"[ok] 校验通过：{scope} 共 {checked} 张，标签格式一致{kpt_note}")
     return 0
 
 
@@ -979,10 +1283,18 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     stats = dataset_stats(args.dataset)
     print(f"数据集 {idx.name}  ({idx.root})")
-    print(f"  姿态库 图片 {stats['images']} · 人数 {stats['persons_total']} · "
-          f"缺标签 {stats['missing_labels']}")
+    if stats["images"]:
+        print(f"  姿态库 图片 {stats['images']} · 人数 {stats['persons_total']} · "
+              f"缺标签 {stats['missing_labels']}")
+    if stats.get("missing_files"):
+        # 只报数字没用：得说清是哪几张、以及"导出会自动跳过"，否则用户以为导出了
+        sample = "、".join(stats.get("missing_images") or [])
+        more = "…" if stats["missing_files"] > len(stats.get("missing_images") or []) else ""
+        print(f"  缺文件 {stats['missing_files']} 张（索引有记录、images/ 里不在了）：{sample}{more}"
+              f" —— 导出会自动跳过，删掉这些帧或把图片放回 images/ 即可对齐")
     if not stats["images"]:
-        # 空库就别打印一堆 0 了，直接告诉用户往哪儿灌素材
+        # 空库就别打印一堆 0 了，直接告诉用户往哪儿灌素材——提示词库与检测库
+        # 空着时本来就只给这一行，三个库同一个说法，别让人以为姿态库丢了数据
         print("  姿态库还没有素材：autolabel import <数据集> --lib pose，或界面「导入素材」")
     else:
         print("  状态 " + " · ".join(f"{k}={v}" for k, v in sorted(stats["status_counts"].items())))
@@ -1005,19 +1317,37 @@ def cmd_status(args: argparse.Namespace) -> int:
         prompt = {"per_field": {}, "flag_counts": {}}
     else:
         print(f"  提示词标注 已标 {prompt['labeled']}/{prompt['images']} 张 · 框 {prompt['boxes']} · "
-              f"已确认 {prompt['reviewed']} · 未标 {prompt['unreviewed']}")
+              f"已确认 {prompt['reviewed']} · 未标 {prompt['unreviewed']} · "
+              f"没复核 {prompt['labeled'] - prompt['reviewed']}")
     if prompt["per_field"]:
         top = sorted(prompt["per_field"].items(), key=lambda kv: (-kv[1], kv[0]))[:8]
         print("  字段分布 " + " · ".join(f"{k}={v}" for k, v in top))
     if prompt["flag_counts"]:
         print("  提示词标记 " + " · ".join(f"{k}={v}" for k, v in sorted(prompt["flag_counts"].items())))
 
+    from .detect import detect_summary
+
+    detect = detect_summary(args.dataset)
+    if not detect["images"]:
+        print("  检测库还没有素材：autolabel import <数据集> --lib detect，"
+              "或界面「目标检测」页上传（类别来自权重：autolabel detect <数据集> --model-classes yolo11n.pt）")
+    else:
+        print(f"  目标检测 已标 {detect['labeled']}/{detect['images']} 张 · 框 {detect['boxes']} · "
+              f"已确认 {detect['reviewed']} · 未标 {detect['unreviewed']} · "
+              f"没复核 {detect['labeled'] - detect['reviewed']} · 上次权重 {detect['model'] or '（还没跑过）'}")
+    if detect["per_class"]:
+        top = sorted(detect["per_class"].items(), key=lambda kv: (-kv[1], kv[0]))[:8]
+        print("  检测类别分布 " + " · ".join(f"{k}={v}" for k, v in top))
+    if detect["flag_counts"]:
+        print("  检测标记 " + " · ".join(f"{k}={v}" for k, v in sorted(detect["flag_counts"].items())))
+
     from .dataset import pool_items
 
     pool = pool_items(args.dataset)
-    shared = sum(1 for row in pool if row["in_pose"] and row["in_objects"])
-    orphan = sum(1 for row in pool if not row["in_pose"] and not row["in_objects"])
-    print(f"  素材池 {len(pool)} 个文件 · 两库共用 {shared} · 无人引用 {orphan}"
+    # 只按两个库判断会把「只在检测库里」的素材说成无人引用
+    shared = sum(1 for row in pool if len(row.get("libs") or []) > 1)
+    orphan = sum(1 for row in pool if not (row.get("libs") or []))
+    print(f"  素材池 {len(pool)} 个文件 · 多库共用 {shared} · 无人引用 {orphan}"
           f"（{os.path.join(os.path.abspath(args.dataset), 'images')}）")
     return 0
 
@@ -1025,34 +1355,90 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_reset(args: argparse.Namespace) -> int:
     """把复核状态退回未复核，方便重跑或换参数后重来。"""
 
-    idx = load_index(args.dataset)
-    targets = {s.strip() for s in (args.status or "").split(",") if s.strip()} or None
-    changed = 0
-    for _rel, item in idx.items.items():
-        status = item.get("status", STATUS_UNREVIEWED)
+    lib = normalize(args.lib)
+    idx = load_index(args.dataset, lib)
+    key = status_key(lib)
+    wanted = set(args.status or ())
+    changed: List[str] = []
+    for rel, item in idx.items.items():
+        status = status_of(item, lib)
         if status == STATUS_UNREVIEWED:
             continue
-        if targets and status not in targets:
+        if wanted and status not in wanted:
             continue
         if args.keep_approved and status == STATUS_APPROVED:
             continue
-        item["status"] = STATUS_UNREVIEWED
-        item.pop("reviewed_at", None)
-        changed += 1
-    idx.save()
+        item[key] = STATUS_UNREVIEWED
+        item.pop(field_key(lib, "reviewed_at"), None)
+        changed.append(rel)
+    # `--labels` 删的是**上面真的被退回那些**：以前它无差别删光整库标签，
+    # `--status rejected --labels` 会把已接受样本的标签一起删掉。标签没了还得把
+    # 索引里由标签派生的计数一起抹掉，否则索引继续报「这张有 1 个人」，
+    # 门户和 `status` 的人数立刻开始说谎。
     removed = 0
     if args.labels:
-        for rel in list(idx.items):
-            path = label_path_for(args.dataset, rel)
+        keys = label_field_keys(lib)
+        for rel in changed:
+            path = label_path_for(args.dataset, rel, lib)
             if os.path.exists(path):
                 os.remove(path)
                 removed += 1
-    print(f"[ok] 已退回 {changed} 张为未复核" + (f"，删除 {removed} 个标签文件" if args.labels else ""))
+            for field in keys:
+                idx.items[rel].pop(field, None)
+    idx.save()
+    note = ""
+    if args.labels:
+        note = (f"，删掉标签 {removed} 个（与退回的是同一批，索引里的标注计数一起清）"
+                if changed else "，但这批里没有可退回的图，标签一个都没删")
+    print(f"[ok] 已退回 {len(changed)} 张为未复核（{lib_name(lib)}）{note}")
+    if not changed:
+        print("     这批里没有可退回的复核状态；想看现在都是什么状态：autolabel status <数据集>")
     print("     提示：标注参数变化时 label 会自动重标，无需手动 reset")
     return 0
 
 
 # --- 参数校验：错在参数上就在参数上报，别等流水线跑到一半 ---------- #
+
+def _review_statuses(text: str) -> List[str]:
+    """``--status rejected,edited`` 拆成列表；写错的状态当场拦。
+
+    以前拼错一个字母（``aprovied``）只会得到一句「已退回 0 张」，退出码 0，
+    用户以为执行过了，其实什么都没发生。
+    """
+    values: List[str] = []
+    for item in str(text or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item not in ALL_STATUSES:
+            raise argparse.ArgumentTypeError(
+                f"不认识的状态「{item}」，可选：{'、'.join(ALL_STATUSES)}")
+        if item not in values:
+            values.append(item)
+    return values
+
+
+def _status_words(text: str) -> List[str]:
+    """``--keep-status rejected,edited``：逗号写法摊平，拼错的状态当场拦。
+
+    以前 ``--keep-status aprieved`` 与漏写没区别——它只参与"要不要把某个状态
+    留在导出范围里"的判断，拼错的词谁都匹配不上，用户以为多留了一批，
+    其实导出的还是那一份。
+    """
+    return _review_statuses(text)
+
+
+def _flatten_status(values) -> List[str]:
+    """argparse 用 ``type=_status_words`` 后每项是个列表，这里统一摊平成一个列表。"""
+    out: List[str] = []
+    for value in values or []:
+        pieces = value if isinstance(value, (list, tuple)) else str(value).split(",")
+        for piece in pieces:
+            item = str(piece).strip()
+            if item and item not in out:
+                out.append(item)
+    return out
+
 
 def _positive_int(text: str) -> int:
     try:
@@ -1145,7 +1531,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--extra-models", help="逗号分隔的校验模型，用于多模型共识与分歧标记")
         p.add_argument("--vlm", dest="vlm_profile", metavar="配置",
                        help="改用多模态大模型标注，取「模型管理」里的配置 ID 或名称")
-        p.add_argument("--device", choices=["auto", "mps", "cuda", "cpu", "0", "1"])
+        # 可选值来自「系统设置」那一处定义，别再手抄一份漏掉 CUDA
+        p.add_argument("--device", choices=[*DEVICE_VALUES, "0", "1"],
+                       help="推理算力：auto / cuda（N 卡）/ mps（Apple 加速）/ cpu，0、1 指定第几块 N 卡")
         p.add_argument("--imgsz", type=_positive_int)
         p.add_argument("--conf", type=_fraction)
         p.add_argument("--iou", type=_fraction)
@@ -1173,8 +1561,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_lib(parser: argparse.ArgumentParser, default: str = "pose") -> None:
         parser.add_argument("--lib", choices=list(LIBRARIES), default=default,
-                            help="入库到哪个标注库：pose=姿态标注（默认），objects=提示词标注；"
-                                 "素材文件两个库共用，images/ 里已有的直接引用，不重复落盘")
+                            help="入库到哪个标注库：pose=姿态标注（默认）、objects=提示词标注、"
+                                 "detect=目标检测；素材文件三个库共用，images/ 里已有的直接引用，不重复落盘")
 
     p = sub.add_parser("import", help="导入图片（自动规范化 RGB/EXIF/尺寸并去重）")
     add_dataset(p)
@@ -1208,7 +1596,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_label_args(p)
     p.set_defaults(func=cmd_label)
 
-    p = sub.add_parser("qc", help="生成质量报告与复核清单")
+    p = sub.add_parser("qc", help="生成质量报告与复核清单（骨骼质量与复核优先级，只管姿态库）")
     add_dataset(p)
     p.add_argument("--top", type=_positive_int, default=30)
     p.add_argument("--render", type=_non_negative_int, default=0, help="渲染 N 张叠加图")
@@ -1271,7 +1659,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--coco", action="store_true", help="同时导出 COCO keypoint JSON")
     p.add_argument("--coords", action="store_true", help="同时导出 CSV/JSONL 坐标文件（含 split 列）")
     p.add_argument("--only-approved", action="store_true", help="只导出已接受/已修改的样本")
-    p.add_argument("--keep-status", nargs="*", default=[], help="配合 --only-approved 额外保留的状态")
+    p.add_argument("--keep-status", nargs="*", default=[], type=_status_words,
+                   metavar="状态",
+                   help="配合 --only-approved 额外保留的状态，逗号分隔可重复"
+                        f"（可选：{'、'.join(ALL_STATUSES)}）")
     p.add_argument("--include-all", action="store_true", help="连 rejected 一起导出")
     p.set_defaults(func=cmd_export)
 
@@ -1282,7 +1673,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--formats", default="csv,long,jsonl",
                    help="逗号分隔：csv 一行一个人 / long 一行一个关键点 / jsonl 一行一张图")
     p.add_argument("--only-approved", action="store_true", help="只导出已接受/已修改的样本")
-    p.add_argument("--keep-status", nargs="*", default=[], help="配合 --only-approved 额外保留的状态")
+    p.add_argument("--keep-status", nargs="*", default=[], type=_status_words,
+                   metavar="状态",
+                   help="配合 --only-approved 额外保留的状态，逗号分隔可重复"
+                        f"（可选：{'、'.join(ALL_STATUSES)}）")
     p.add_argument("--include-all", action="store_true", help="连 rejected 一起导出")
     p.add_argument("--include-unlabeled", action="store_true", help="缺标签的图也输出一行（objects 为空）")
     p.set_defaults(func=cmd_coords)
@@ -1308,15 +1702,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--formats", default="csv,long,jsonl", help="坐标文件格式")
     p.add_argument("--coords-out", help="坐标输出目录，默认 <dataset>/coords/<时间戳>")
     p.add_argument("--only-approved", action="store_true")
-    p.add_argument("--keep-status", nargs="*", default=[])
+    p.add_argument("--keep-status", nargs="*", default=[], type=_status_words,
+                   metavar="状态")
     p.add_argument("--include-all", action="store_true")
     p.add_argument("--include-unlabeled", action="store_true")
     p.add_argument("--batch-name", help="批次名称，用于「批次管理」分组显示")
     p.set_defaults(func=cmd_auto)
 
-    p = sub.add_parser("validate", help="校验标签格式")
+    p = sub.add_parser("validate", help="校验标签格式（三个库都查）")
     add_dataset(p)
     p.add_argument("--num-keypoints", type=_non_negative_int, default=0)
+    p.add_argument("--lib", choices=["all", *LIBRARIES], default="all",
+                   help="只查某个库的标签：all=三个库都查（默认）、pose=姿态标注、"
+                        "objects=提示词标注、detect=目标检测")
     p.set_defaults(func=cmd_validate)
 
     p = sub.add_parser("status", help="数据集概览")
@@ -1326,15 +1724,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("batches", help="按批次查看已标注数据，或整批删除图片与记录")
     add_dataset(p)
     p.add_argument("--lib", choices=["all", *LIBRARIES], default="all",
-                   help="看/删哪个库的批次，默认 all 两个库一起看")
+                   help="看/删哪个库的批次，默认 all：列表三个库一起看，"
+                        "按张删除则三个库的引用一起摘（素材文件仍保留）")
     p.add_argument("--delete", action="append", default=[], metavar="批次ID",
-                   help="删除该批次的图片与记录，可重复；未分组用 __ungrouped__")
+                   help="删除该批次的图片与记录，逗号分隔可重复；未分组用 __ungrouped__")
     p.add_argument("--delete-images", action="append", default=[], metavar="图片路径",
-                   help="按张删除（a.jpg 或 images/a.jpg 都认），可重复；批次记录里同步摘除，删空的批次连记录一起删")
+                   help="按张删除（a.jpg 或 images/a.jpg 都认），逗号分隔可重复；"
+                        "批次记录里同步摘除，删空的批次连记录一起删")
     p.add_argument("--keep-files", action="store_true", help="只删索引与批次记录，保留图片/标签文件")
     p.add_argument("--mode", choices=["lib", "purge"], default="lib",
-                   help="按张删除的粒度：lib 只摘本库引用（默认，素材留给另一个库），"
-                        "purge 两个库一起摘并删素材文件")
+                   help="按张删除的粒度：lib 只摘引用（默认，素材文件留给别的库），"
+                        "purge 三个库一起摘并把素材文件删掉")
     p.add_argument("--force", action="store_true",
                    help="忽略「仍在标注中」的保护，用于服务中断留下的僵尸批次")
     p.add_argument("--json", action="store_true", help="以 JSON 输出批次列表")
@@ -1343,7 +1743,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("pool", help="素材池：查看共享素材被哪些库引用，或把已有素材添加进某个库")
     add_dataset(p)
     p.add_argument("--add", action="append", default=[], metavar="图片路径",
-                   help="把素材池里的这张图添加进 --lib 指定的库（不复制文件），可重复")
+                   help="把素材池里的这张图添加进 --lib 指定的库（不复制文件），逗号分隔可重复")
     p.add_argument("--limit", type=_non_negative_int, default=30, help="最多列几条，默认 30")
     add_lib(p)
     p.set_defaults(func=cmd_pool)
@@ -1362,6 +1762,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="删除字段，可重复；仍有框时需要 --drop-boxes")
     p.add_argument("--drop-boxes", action="store_true",
                    help="配合 --delete：连带删掉这个字段已经标出的框")
+    p.add_argument("--lib", choices=[LIB_OBJECTS, LIB_DETECT], default=LIB_OBJECTS,
+                   help="哪张类别表：objects=提示词标注（默认，字段名+描述提示词）、"
+                        "detect=目标检测（类别来自 YOLO 权重自带，一般用 autolabel detect --add-classes 导入）")
     p.add_argument("--json", action="store_true", help="以 JSON 输出字段表")
     p.set_defaults(func=cmd_fields)
 
@@ -1384,6 +1787,37 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--quiet", action="store_true", help="不逐张打印进度")
     p.set_defaults(func=cmd_prompt)
 
+    p = sub.add_parser("detect", help="目标检测：用本机 YOLO 权重标检测框（非姿态的目标检测任务都走这里）")
+    add_dataset(p)
+    p.add_argument("--model", default="",
+                   help="权重文件名或路径，默认上次用的那个（没有就 yolo11n.pt）；它决定能标哪些类别")
+    p.add_argument("--list-models", action="store_true",
+                   help="列出本机权重，并标出哪些能用在目标检测（姿态权重会说明为什么用不了）")
+    p.add_argument("--model-classes", metavar="权重",
+                   help="列出这个权重自带的类别表（中文名 + 类别号），只看不动数据")
+    p.add_argument("--add-classes", action="append", default=[], metavar="类名",
+                   help="把权重自带的类别导入本库类别表，逗号分隔可重复；all=全部导入", )
+    p.add_argument("--no-label", action="store_true", help="配合 --add-classes：只导入类别，不跑标注")
+    p.add_argument("--classes", action="append", default=[], metavar="类名",
+                   help="只标这些类别（逗号分隔可重复），默认用本库类别表里全部")
+    p.add_argument("--images", action="append", default=[], metavar="相对路径",
+                   help="只标这些图（逗号分隔可重复），默认整个目标检测库")
+    p.add_argument("--device", choices=[*DEVICE_VALUES, "0", "1"], default="",
+                   help="推理算力，默认用「系统设置」里那档；0、1 指定第几块 N 卡")
+    p.add_argument("--conf", type=_fraction, default=None, help="置信度阈值，默认用系统设置里的值")
+    p.add_argument("--limit", type=_non_negative_int, default=0, help="只标前 N 张，用于试跑")
+    p.add_argument("--overwrite", action="store_true",
+                   help="已经标过的也重标（默认跳过同参数已标的、人工接受过的、人工画过框的图）")
+    p.add_argument("--coords", action="store_true", help="顺带导出坐标文件（CSV + JSONL）")
+    p.add_argument("--export", action="store_true", help="顺带导出 YOLO detection 训练集")
+    p.add_argument("--out", default="", help="配合 --export：导出目录")
+    p.add_argument("--max-print", type=_positive_int, default=40,
+                   help="配合 --model-classes：最多打印多少类，默认 40")
+    p.add_argument("--batch-name", help="批次名称，用于「批次管理」分组显示")
+    p.add_argument("--status", action="store_true", help="只看已标/待复核汇总，不跑标注")
+    p.add_argument("--quiet", action="store_true", help="不逐张打印进度")
+    p.set_defaults(func=cmd_detect)
+
     p = sub.add_parser("models", help="列出/管理姿态权重与多模态大模型（本地或云端）配置")
     p.add_argument("--dataset", default="",
                    help="兼容性检查用的数据集目录（比对关键点数量，判这个模型能不能用）")
@@ -1392,6 +1826,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--catalog", action="store_true", help="同 --browse")
     p.add_argument("--info", metavar="模型ID", help="看单个模型的完整中文说明、下载地址与下载记录")
     p.add_argument("--capability", default="", help="只看一类能力：pose | vlm | custom_task")
+    p.add_argument("--search", metavar="关键词",
+                   help="按关键词搜模型（yolo11 / 姿态 / 分割…），本机已登记 + 官方目录一起给；"
+                        "配合 --remote 再查 GitHub 上的自制权重")
+    p.add_argument("--task", default="", help="配合 --search：只看一类任务 "
+                                             "pose | detect | segment | obb | classify")
+    p.add_argument("--remote", action="store_true", help="配合 --search：连 GitHub 上的自制权重一起搜（要联网）")
     p.add_argument("--note", action="append", default=[], metavar="模型ID=说明",
                    help="给模型写备注说明，可重复；说明留空即清空")
     p.add_argument("--register", metavar="路径", help="登记一个本地模型/权重文件（只记路径，不动文件）")
@@ -1419,9 +1859,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("reset", help="退回复核状态（可选同时删除标签）")
     add_dataset(p)
-    p.add_argument("--status", help="只重置这些状态，逗号分隔，如 rejected,edited")
+    add_lib(p)
+    p.add_argument("--status", type=_review_statuses, default=[],
+                   help=f"只重置这些状态，逗号分隔（可选 {'、'.join(ALL_STATUSES)}；"
+                        f"不填 = 除未复核以外的全部）")
     p.add_argument("--keep-approved", action="store_true", help="保留已接受的样本")
-    p.add_argument("--labels", action="store_true", help="同时删除标签文件")
+    p.add_argument("--labels", action="store_true",
+                   help="同时删除标签文件（只删上面被退回那些，并清掉索引里的标注计数）")
     p.set_defaults(func=cmd_reset)
     return parser
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -99,12 +100,87 @@ def resolve_half(half: bool, device: str) -> bool:
     return False
 
 
-def resolve_model_path(model: str, weights_dir: str = "models") -> str:
+#: 半截下载的临时名与"谁正在下这个权重"的锁文件名
+PART_SUFFIX = ".part"
+LOCK_SUFFIX = ".lock"
+
+
+def default_weights_dir() -> str:
+    """推理这头该去哪个目录找权重：和「模型管理」面板共用一个口径。
+
+    ``AUTOLABEL_WEIGHTS_DIR`` 是对外承诺过的环境变量（见 08-模型管理.md），
+    以前只有 ``models.py`` 认它、推理侧把 ``models/`` 写死。改了变量的用户会看到
+    界面里权重"已就绪"，真点开始标注却又往 ``./models`` 重新下一份，白等还多占磁盘。
+    """
+    from .models import weights_dir
+
+    return weights_dir()
+
+
+def claim_download(path: str, *, wait: bool = True, deadline: float = 0.0) -> Tuple[bool, object]:
+    """尽量独占某个权重的一次下载。返回 ``(是否独占, 锁句柄)``。
+
+    一台机器同时开两个实例（一卡一实例是这本项目的正常用法），或者界面点着「下载」
+    的同时标注任务正在补下同一个权重，两边会写同一份 ``x.pt.part``：后开的把对方
+    正在追加的文件截断，续传的起点成了对方刚写下的偏移量，换名失败的一方还会报
+    "已下载部分保留"而那份文件早就不在。这里用文件锁把第二个下载者挡在门外，
+    让它等第一个下完——同一份权重下两遍本来就是白等一倍时间。
+
+    没有 ``flock`` 的平台（Windows）按"没别人"处理，行为与加锁之前一致。
+    """
+    handle = None
+    try:
+        import fcntl
+    except ImportError:
+        return True, None
+    try:
+        handle = open(path + LOCK_SUFFIX, "a+b")
+    except OSError:
+        return True, None          # 目录不让建锁文件：照常下载，别因为锁挡了正事
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True, handle
+    except OSError:
+        handle.close()
+        if not wait:
+            return False, None
+        while time.time() < deadline:
+            if weights_ready(path):
+                return False, None
+            time.sleep(0.5)
+        return False, None
+
+
+def partial_paths(weights_dir: str, model: str) -> List[str]:
+    """某个权重在目录里剩下的半截下载文件。
+
+    界面要能看见它们（"有 12 MB 没下完"）、删除时要连着它们一起删干净，
+    否则会留下一个看不见又占着磁盘的文件，用户只能整个目录清空。
+    """
+    base = os.path.basename(str(model or ""))
+    if not base or not os.path.isdir(weights_dir):
+        return []
+    found = []
+    try:
+        entries = os.listdir(weights_dir)
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.endswith(PART_SUFFIX):
+            continue
+        head = entry[: -len(PART_SUFFIX)]
+        if head == base or head.startswith(base + "."):
+            found.append(os.path.join(weights_dir, entry))
+    return sorted(found)
+
+
+def resolve_model_path(model: str, weights_dir: Optional[str] = None) -> str:
     """把 `yolo11n-pose.pt` 解析到本地 weights 目录，缺失时交给 ultralytics 下载。
 
     ultralytics 会按请求路径的父目录存放下载文件，因此这里显式加上目录前缀，
     避免权重散落在工作区根目录。
     """
+    weights_dir = default_weights_dir() if weights_dir is None else weights_dir
     expanded = os.path.expanduser(model)
     if os.path.sep in expanded or os.path.exists(expanded):
         return expanded
@@ -131,7 +207,8 @@ def weights_ready(path: str) -> bool:
     return bool(path) and os.path.isfile(path) and zipfile.is_zipfile(path)
 
 
-def ensure_weights(model: str, weights_dir: str = "models", mirror: Optional[str] = None,
+def ensure_weights(model: str, weights_dir: Optional[str] = None,
+                   mirror: Optional[str] = None,
                    attempts: int = 3, timeout: int = 30, verbose: bool = True,
                    force: bool = False, progress: Optional[Callable[[int, int], None]] = None,
                    on_error: Optional[Callable[[Exception], None]] = None) -> str:
@@ -154,28 +231,44 @@ def ensure_weights(model: str, weights_dir: str = "models", mirror: Optional[str
 
     prefix = DEFAULT_MIRROR if mirror is None else mirror
     url = weights_url(model, prefix)
-    part = path + ".part"
-    for try_no in range(1, max(1, attempts) + 1):
-        try:
-            got = _download_to(url, part, timeout=timeout, verbose=verbose, progress=progress)
-            if not weights_ready(part):
-                raise OSError("下载结果不是完整的 zip 包")
-            os.replace(part, path)
-            bad = path + ".bad"
-            if os.path.exists(bad):
-                os.remove(bad)
-            if verbose:
-                print(f"[ok] 权重 {model} 就绪（{got / 1048576:.1f} MB）")
-            return path
-        except Exception as exc:  # noqa: BLE001 镜像不可用要能退回直连
-            if on_error is not None:
-                try:
-                    on_error(exc)
-                except Exception:  # noqa: BLE001 回调报错不该影响下载
-                    pass
-            if verbose:
-                print(f"[warn] 第 {try_no} 次经镜像下载 {model} 失败："
-                      f"{type(exc).__name__}: {exc}（已下载部分保留，可续传）")
+    # 临时名保持固定（``x.pt.part``）：服务重启、断网重连之后还能接着这半截续传，
+    # 几十 MB 的权重不必从头再来——这是这个文件存在的意义，不能改成一次性随机名。
+    # 并发的问题交给文件锁解决：抢不到锁的一方在这里等对方下完，而不是插一脚进来。
+    part = path + PART_SUFFIX
+    deadline = time.time() + max(60.0, float(timeout) * max(1, attempts) * 2)
+    mine, handle = claim_download(path, deadline=deadline)
+    if not mine:
+        if verbose:
+            print(f"[info] {model} 已经有别的进程/任务在下载，等它下完")
+        return path
+    try:
+        for try_no in range(1, max(1, attempts) + 1):
+            try:
+                got = _download_to(url, part, timeout=timeout, verbose=verbose, progress=progress)
+                if not weights_ready(part):
+                    raise OSError("下载结果不是完整的 zip 包")
+                os.replace(part, path)
+                bad = path + ".bad"
+                if os.path.exists(bad):
+                    os.remove(bad)
+                if verbose:
+                    print(f"[ok] 权重 {model} 就绪（{got / 1048576:.1f} MB）")
+                return path
+            except Exception as exc:  # noqa: BLE001 镜像不可用要能退回直连
+                if on_error is not None:
+                    try:
+                        on_error(exc)
+                    except Exception:  # noqa: BLE001 回调报错不该影响下载
+                        pass
+                if verbose:
+                    print(f"[warn] 第 {try_no} 次经镜像下载 {model} 失败："
+                          f"{type(exc).__name__}: {exc}（已下载部分保留，可续传）")
+    finally:
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
     return path
 
 
@@ -192,7 +285,11 @@ def _download_to(url: str, dst: str, timeout: int = 30, verbose: bool = True,
     with urllib.request.urlopen(request, timeout=timeout) as resp:
         status = getattr(resp, "status", 200)
         resume = status == 206 and start > 0
-        total = start + int(resp.headers.get("Content-Length") or 0)
+        length = int(resp.headers.get("Content-Length") or 0)
+        # 只有服务器真的按 Range 回了一段（206），已下过的字节才算在总量里。
+        # 镜像/代理常常把 Range 头直接吃掉、回 200 + 整包：那份总量加上 start
+        # 就凭空多出一截，永远等不满，最后判"下载不完整"，重试几次都是这个结果。
+        total = start + length if resume else length
         done = start if resume else 0
         with open(dst, "ab" if resume else "wb") as fh:
             if not resume:
@@ -229,7 +326,7 @@ def _download_to(url: str, dst: str, timeout: int = 30, verbose: bool = True,
 UI_MODEL_CHOICES: Tuple[str, ...] = ("yolo11n-pose.pt", "yolo11s-pose.pt", "yolo11m-pose.pt")
 
 
-def model_status(model: str, weights_dir: str = "models") -> Dict[str, object]:
+def model_status(model: str, weights_dir: Optional[str] = None) -> Dict[str, object]:
     """查本地权重是否可用；下载中断留下的半截文件按“未就绪”处理。
 
     ultralytics 权重是 zip 包，`is_zipfile` 只读尾部目录，能便宜地识破被截断的下载，
@@ -243,16 +340,18 @@ def model_status(model: str, weights_dir: str = "models") -> Dict[str, object]:
             "ready": bool(size) and zipfile.is_zipfile(path)}
 
 
-def model_inventory(models: Sequence[str] = UI_MODEL_CHOICES, weights_dir: str = "models") -> List[dict]:
+def model_inventory(models: Sequence[str] = UI_MODEL_CHOICES,
+                    weights_dir: Optional[str] = None) -> List[dict]:
     """批量返回候选权重的就绪状态，供界面标注。"""
     return [model_status(name, weights_dir) for name in models]
 
 
-def weights_hint_retryable(path: str, weights_dir: str = "models") -> bool:
+def weights_hint_retryable(path: str, weights_dir: Optional[str] = None) -> bool:
     """是否允许自动重下：只认权重目录里的裸文件名，用户自己给的路径不动。"""
     if not path or not os.path.isfile(path):
         return False
-    return os.path.dirname(os.path.abspath(path)) == os.path.abspath(weights_dir)
+    return os.path.dirname(os.path.abspath(path)) == os.path.abspath(
+        default_weights_dir() if weights_dir is None else weights_dir)
 
 
 def weights_hint(path: str, exc: Exception) -> str:
@@ -338,16 +437,12 @@ class PoseBackend:
 
         model = self.load()
         bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-        results = model.predict(
-            source=bgr,
-            device=self._device,
-            imgsz=self.settings.imgsz,
-            conf=self.settings.conf,
-            iou=self.settings.iou,
-            max_det=self.settings.max_det,
-            half=self._half,
-            verbose=False,
-        )
+        kwargs = dict(source=bgr, device=self._device, imgsz=self.settings.imgsz,
+                      conf=self.settings.conf, iou=self.settings.iou,
+                      max_det=self.settings.max_det, verbose=False)
+        if self._half:          # 8.4 起传 half 会喊弃用，关着就别传
+            kwargs["half"] = True
+        results = model.predict(**kwargs)
         persons: List[Person] = []
         for res in results:
             h, w = res.orig_shape[:2]
@@ -388,6 +483,145 @@ class PoseBackend:
                         for p in self._predict(cv2.flip(bgr, 1), flipped=True)]
             persons = fuse_flips(persons, mirrored, image.shape[1], image.shape[0], self.settings)
         return [finalize_box(p, image.shape[1], image.shape[0], self.settings) for p in persons]
+
+
+#: 目标检测库能吃的 YOLO 任务。姿态模型不算：它输出的是关键点，塞进检测库会
+#: 把 person 之外的目标全丢掉，得让界面先说清楚而不是标完才发现少了一堆框。
+DETECT_TASKS = ("detect", "segment", "obb")
+TASK_NAMES = {"detect": "目标检测", "segment": "实例分割", "obb": "旋转框检测",
+              "pose": "人体姿态", "classify": "图像分类", "depth": "深度估计"}
+
+
+@dataclass
+class Detection:
+    """一个检出目标：类别 + 置信度 + 归一化中心框（和 YOLO detection 一个口径）。"""
+
+    class_id: int
+    class_name: str
+    score: float
+    cx: float
+    cy: float
+    w: float
+    h: float
+    has_mask: bool = False
+
+    def as_row(self) -> List[float]:
+        return [float(self.class_id), self.cx, self.cy, self.w, self.h]
+
+
+class DetectionBackend:
+    """目标检测 / 实例分割后端：出框，不出关键点。
+
+    与 ``PoseBackend`` 分开是有意的：检测库关心的是「这是什么、在哪」，
+    类别表由模型给；姿态库的类别永远是 person，多出来的东西全是关键点。
+    混在一个后端里会让两边的参数互相牵制（``imgsz`` 之外还有 ``box_mode``、
+    可见性策略这些只对姿态有意义）。
+    """
+
+    def __init__(self, settings: BackendSettings, model_name: Optional[str] = None):
+        self.settings = settings
+        self.model_name = model_name or settings.model
+        self._model = None
+        self._device = resolve_device(settings.device)
+        self._half = resolve_half(settings.half, self._device)
+        self.task = ""
+        self.names: Dict[int, str] = {}
+
+    # --- 生命周期 ---
+    def load(self):
+        if self._model is not None:
+            return self._model
+        from ultralytics import YOLO
+
+        path = ensure_weights(self.model_name)
+        print(f"[info] 加载检测模型 {path} -> device={self._device}")
+        try:
+            self._model = YOLO(path)
+        except Exception as exc:  # noqa: BLE001 先试着重下，再给修复建议
+            if not self._retry_after_redownload(path, exc, verbose=True):
+                raise RuntimeError(weights_hint(path, exc)) from exc
+            self._model = YOLO(path)
+        task = str(getattr(self._model, "task", "") or "")
+        if task and task not in DETECT_TASKS:
+            raise ValueError(
+                f"{os.path.basename(path)} 是「{TASK_NAMES.get(task, task)}」模型，"
+                f"目标检测库要的是 {'、'.join(TASK_NAMES[t] for t in DETECT_TASKS)}；"
+                "人体骨骼请回姿态标注里用带 -pose 的权重")
+        self.task = task or "detect"
+        names = getattr(self._model, "names", None) or {}
+        if isinstance(names, dict):
+            self.names = {int(k): str(v) for k, v in names.items()}
+        report_model_use(self.model_name, 0, tuple(self.names.values()), self._device)
+        return self._model
+
+    def _retry_after_redownload(self, path: str, exc: Exception, verbose: bool) -> bool:
+        name = os.path.basename(path)
+        if not weights_hint_retryable(path):
+            return False
+        if verbose:
+            print(f"[warn] {name} 加载失败（{type(exc).__name__}），尝试经镜像重新下载…")
+        return ensure_weights(name, weights_dir=os.path.dirname(path) or "models",
+                             verbose=verbose, force=True, attempts=2) == path
+
+    # --- 类别表 ---
+    def class_names(self) -> Dict[int, str]:
+        """模型能认出哪些类（先加载，第一次会慢一点）。"""
+        self.load()
+        return dict(self.names)
+
+    # --- 推理 ---
+    def predict(self, image: np.ndarray, class_ids: Sequence[int] = (),
+                conf: Optional[float] = None) -> List[Detection]:
+        """跑一张图；``class_ids`` 非空时把筛选下推给模型（比事后丢弃省时间）。"""
+        model = self.load()
+        wanted = [int(v) for v in class_ids] if class_ids else None
+        if wanted == []:
+            return []
+        kwargs = dict(imgsz=self.settings.imgsz, conf=self.settings.conf if conf is None else conf,
+                      iou=self.settings.iou, max_det=self.settings.max_det,
+                      device=self._device, verbose=False)
+        # 8.4 起 predict 里传 half 会喊弃用：关着的时候干脆别传
+        if self._half:
+            kwargs["half"] = True
+        if wanted is not None:
+            kwargs["classes"] = wanted
+        import cv2
+
+        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        result = model.predict(bgr, **kwargs)[0]
+        height, width = result.orig_shape[:2]
+        boxes = getattr(result, "boxes", None)
+        if boxes is None or len(boxes) == 0:
+            boxes = getattr(result, "obb", None)      # 旋转框模型的结果挂在 obb 上
+        # masks.data 是 (N, H, W) 的张量，套 bool() 会直接抛"truth value is
+        # ambiguous"，整张分割图就全军覆没；只看第 0 维有没有东西
+        mask_rows = getattr(getattr(result, "masks", None), "data", None)
+        try:
+            has_mask = bool(mask_rows is not None and len(mask_rows) > 0)
+        except TypeError:                     # 遇上游哪天换成不带长度的对象
+            has_mask = mask_rows is not None
+        out: List[Detection] = []
+        if boxes is None:
+            return out
+        for i in range(len(boxes)):
+            class_id = int(boxes.cls[i])
+            name = self.names.get(class_id, str(class_id))
+            if wanted is not None and class_id not in wanted:
+                continue                              # 个别版本不认 classes，兜底再滤一次
+            x1, y1, x2, y2 = (float(v) for v in boxes.xyxy[i].tolist())
+            out.append(Detection(
+                class_id=class_id, class_name=name, score=float(boxes.conf[i]),
+                cx=((x1 + x2) / 2.0) / max(1.0, width), cy=((y1 + y2) / 2.0) / max(1.0, height),
+                w=max(0.0, x2 - x1) / max(1.0, width), h=max(0.0, y2 - y1) / max(1.0, height),
+                has_mask=has_mask))
+        return out
+
+    def describe(self) -> dict:
+        """给界面看的模型概况（类别数、任务、认得出哪些类）。"""
+        self.load()
+        return {"model": os.path.basename(self.model_name), "task": self.task,
+                "task_name": TASK_NAMES.get(self.task, self.task),
+                "class_count": len(self.names), "device": self._device}
 
 
 class PoseEnsemble:

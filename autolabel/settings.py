@@ -33,6 +33,36 @@ DEVICE_LABELS = {item["value"]: item["label"] for item in DEVICE_CHOICES}
 
 DEFAULTS = {"device": "auto", "half": False}
 
+#: 开关类字段的合法写法。``bool("false")`` 在 Python 里是 ``True``，
+#: 所以字符串绝不能直接 ``bool()``——见 :func:`as_bool`。
+TRUE_WORDS = ("1", "true", "yes", "on", "y", "开", "是")
+FALSE_WORDS = ("0", "false", "no", "off", "n", "关", "否")
+
+
+def as_bool(value: object, *, default: bool = False, strict: bool = False) -> bool:
+    """把开关读成真正的布尔值，字符串按字面意思判。
+
+    实测踩过：界面上把半精度**关掉**，请求里带的是字符串 ``"false"``，
+    而 ``bool("false") == True``，存下来半精度是**开着**的——而且界面还显示"已保存"。
+    读文件时宽松（坏值退回默认，不让一个手写坏的文件把服务弄崩），
+    存用户改动时严格（认不出就报错，别让一个填错的开关悄悄改了行为）。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        token = value.strip().lower()
+        if token in TRUE_WORDS:
+            return True
+        if token in FALSE_WORDS:
+            return False
+    if value is None:
+        return default
+    if strict:
+        raise ValueError(f'半精度只能选「开」或「关」，现在是「{value}」')
+    return default
+
 #: 启动参数 / 环境变量覆盖：想"一个实例跑一块卡"就在起服务时带上 ``review --device cuda``，
 #: 它只影响这一个进程，不改家目录里那份设置，两个实例各用各的卡互不干扰。
 ENV_DEVICE = "AUTOLABEL_DEVICE"
@@ -55,7 +85,7 @@ def normalize(raw: Optional[dict]) -> dict:
         device = "cuda"
     if device not in DEVICE_VALUES:
         device = DEFAULTS["device"]
-    half = bool(raw.get("half", DEFAULTS["half"]))
+    half = as_bool(raw.get("half", DEFAULTS["half"]), default=DEFAULTS["half"])
     return {"device": device, "half": half}
 
 
@@ -66,8 +96,8 @@ def env_override() -> dict:
     if raw_device:
         out["device"] = normalize({"device": raw_device})["device"]
     raw_half = os.environ.get(ENV_HALF, "").strip()
-    if raw_half in ("0", "1", "true", "false", "yes", "no"):
-        out["half"] = raw_half.lower() in ("1", "true", "yes")
+    if raw_half:
+        out["half"] = as_bool(raw_half, default=DEFAULTS["half"])
     return out
 
 
@@ -96,12 +126,15 @@ def load(*, ignore_env: bool = False) -> dict:
 
 def save(patch: Optional[dict] = None) -> dict:
     """改几项存回去（只认 device / half），返回存好之后的完整设置。"""
-    next_settings = normalize({**load(ignore_env=True), **(patch or {})})
     wanted = {k: v for k, v in (patch or {}).items() if v is not None}
     if "device" in wanted:
         asked = str(wanted["device"]).strip().lower()
         if asked not in DEVICE_VALUES and asked not in ("0", "1", "cuda:0", "cuda:1"):
             raise ValueError(f"不认识的设备「{wanted['device']}」，可选：{' / '.join(DEVICE_VALUES)}")
+    # 半精度也要挡住：填进来一个看不懂的词，静默按"开"存下去比报错难查得多
+    if "half" in wanted:
+        wanted["half"] = as_bool(wanted["half"], strict=True)
+    next_settings = normalize({**load(ignore_env=True), **wanted})
     target = path()
     os.makedirs(os.path.dirname(target), exist_ok=True)
     with open(target, "w", encoding="utf-8") as fh:

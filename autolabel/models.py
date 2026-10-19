@@ -29,8 +29,11 @@ import urllib.request
 import uuid
 from typing import Dict, List, Optional, Sequence
 
+from .atomic import atomic_write_json
+
 from . import secrets as secret_store
-from .backends import UI_MODEL_CHOICES, ensure_weights, model_status, weights_url
+from .backends import (UI_MODEL_CHOICES, ensure_weights, model_status, partial_paths,
+                       weights_url)
 from .dataset import load_index, now_str
 
 DEFAULT_WEIGHTS_DIR = "models"
@@ -245,6 +248,24 @@ def model_config_path() -> str:
 # 姿态权重
 # --------------------------------------------------------------------------- #
 
+def partial_weight(dir_: str, name: str) -> str:
+    """半截下载/失败残留的文件属于哪个权重；不是残留返回空串。
+
+    临时名固定成 ``x.pt.part``（重启后还能续传），并发由文件锁挡住；
+    ``x.pt.<任何东西>.part`` 也一起认，用户手工改过名或历史版本留下的都能识别。
+    """
+    if name.endswith(".part"):
+        head = name[: -len(".part")]
+    elif name.endswith(".bad"):
+        head = name[: -len(".bad")]
+    else:
+        return ""
+    if head.endswith(".pt"):
+        return head
+    marker = head.rfind(".pt.")
+    return head[: marker + 3] if marker > 0 else ""
+
+
 def weight_names(dir_: Optional[str] = None) -> List[str]:
     """候选权重 = 界面预置 + 权重目录里实际存在的 ``.pt``（含自定义权重）。"""
     dir_ = weights_dir() if dir_ is None else dir_
@@ -253,9 +274,10 @@ def weight_names(dir_: Optional[str] = None) -> List[str]:
         for name in sorted(os.listdir(dir_)):
             if name.endswith(".pt") and os.path.isfile(os.path.join(dir_, name)):
                 found.append(name)
-            elif name.endswith((".pt.part", ".pt.bad")):
-                # 下载中断的残留也要能被看到、被删掉
-                bare = name[: -len(".part")] if name.endswith(".part") else name[: -len(".bad")]
+            elif partial_weight(dir_, name):
+                # 下载中断的残留（``x.pt.part`` / ``x.pt.4211.3.part`` / ``x.pt.bad``）
+                # 也要能被看到、被删掉，否则只剩一个看不见又占着磁盘的文件
+                bare = partial_weight(dir_, name)
                 if bare not in found:
                     found.append(bare)
     # 目录里的权重按「推荐档在前」的顺序排在前面，用户自己放进来的自定义权重跟在后面
@@ -268,12 +290,17 @@ def weight_info(name: str, dir_: Optional[str] = None, dataset_kps: int = 0) -> 
     dir_ = weights_dir() if dir_ is None else dir_
     info = dict(model_status(name, weights_dir=dir_))
     path = str(info["path"])
-    part = path + ".part"
     info["source"] = "disk" if os.path.isfile(path) else "preset"
     info["custom"] = _registry().get(name) is None
     info["mtime"] = (time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(path)))
                      if os.path.isfile(path) else None)
-    info["partial_mb"] = round(os.path.getsize(part) / 1048576, 1) if os.path.exists(part) else 0.0
+    leftover = 0
+    for path_part in partial_paths(dir_, name):
+        try:
+            leftover += os.path.getsize(path_part)
+        except OSError:
+            pass
+    info["partial_mb"] = round(leftover / 1048576, 1)
     info.update(_registry().weight_overlay(name, dataset_kps=dataset_kps))
     return info
 
@@ -306,7 +333,8 @@ def delete_weight(name: str, active_names: Sequence[str] = (), dir_: Optional[st
     active = {str(a) for a in active_names}
     if base in active:
         raise ValueError(f"{base} 正在被标注任务使用，请先在上传面板点「清除任务」")
-    targets = [path, path + ".part", path + ".bad"]
+    resolved_dir = os.path.dirname(path)
+    targets = [path, path + ".bad"] + partial_paths(resolved_dir, base)
     removed, freed = [], 0
     for target in targets:
         if not os.path.exists(target):
@@ -507,10 +535,7 @@ def save_vlm(config: dict, path: Optional[str] = None) -> None:
     profiles = [{k: v for k, v in item.items() if k != "api_key"}
                 for item in (config.get("profiles") or []) if isinstance(item, dict)]
     payload = {"profiles": profiles, "default": config.get("default"), "updated_at": now_str()}
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    atomic_write_json(path, payload)
 
 
 def mask_key(key: str) -> str:
@@ -690,12 +715,20 @@ def delete_profile(profile_id: str) -> dict:
     with _LOCK:
         config = load_vlm()
         before = len(config["profiles"])
+        gone = [p for p in config["profiles"] if p["id"] == profile_id]
         config["profiles"] = [p for p in config["profiles"] if p["id"] != profile_id]
         if len(config["profiles"]) == before:
             raise ValueError(f"未知配置: {profile_id}")
         if config.get("default") == profile_id:
             config["default"] = config["profiles"][0]["id"] if config["profiles"] else None
         save_vlm(config)
+        # Key 得跟着配置一起走。配置文件里只留 ``key_ref``，真 Key 在 Key 文件里；
+        # 只删配置的话那串明文就再没人引用了——界面里看不见、也删不掉，
+        # 用户以为换掉/删掉了，磁盘上其实还躺着一把幽灵密钥。
+        for profile in gone:
+            ref = str(profile.get("key_ref") or "")
+            if ref:
+                secret_store.delete_secret(ref)
     return config_summary(config)
 
 
@@ -939,11 +972,7 @@ def save_model_config(config: dict, path: Optional[str] = None) -> None:
     merged.update({k: v for k, v in (config or {}).items() if k in empty_model_config()})
     merged["version"] = MODEL_CONFIG_VERSION
     merged["updated_at"] = now_str()
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(merged, fh, ensure_ascii=False, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)
+    atomic_write_json(path, merged, newline=True)
 
 
 def dataset_keypoints(root: str) -> "tuple[int, str]":
@@ -1205,8 +1234,14 @@ class ModelRegistry:
         out["exists"] = bool(size)
         out["size_mb"] = round(size / 1048576, 1)
         out["ready"] = bool(ready)
-        out["partial_mb"] = (round(os.path.getsize(path + ".part") / 1048576, 1)
-                             if os.path.exists(path + ".part") else 0.0)
+        leftover = 0
+        if path:
+            for partial in partial_paths(os.path.dirname(path), os.path.basename(path)):
+                try:
+                    leftover += os.path.getsize(partial)
+                except OSError:
+                    pass
+        out["partial_mb"] = round(leftover / 1048576, 1)
         preset = str(row.get("origin")) == ORIGIN_ULTRALYTICS and not row.get("path")
         if not size:
             out["status"] = STATUS_MISSING

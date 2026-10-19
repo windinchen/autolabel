@@ -755,9 +755,7 @@ boot();
 const up = { files: [], poll: null, seenStages: {}, busy: false, warm: false, hadActive: false };
 
 function upLog(msg) {
-  const el = $("up-log");
-  el.textContent += `[${new Date().toLocaleTimeString("zh-CN")}] ${msg}\n`;
-  el.scrollTop = el.scrollHeight;
+  appendLog("up-log", msg);
 }
 
 function renderUpFiles() {
@@ -830,11 +828,8 @@ async function clearJobs() {
   await refreshDataset();
 }
 
-async function uploadOne(file) {
-  const res = await fetch("/api/upload?name=" + encodeURIComponent(file.name), { method: "POST", body: file });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || res.statusText);
-  return data;
+async function uploadOne(file, onProgress) {
+  return uploadFile(file, onProgress);
 }
 
 async function startUpload() {
@@ -855,21 +850,33 @@ async function startUpload() {
     model: $("up-model").value,
     batch_name: $("up-batch-name") ? $("up-batch-name").value.trim() : "",
     vlm_profile: vlmProfile,
-    fps: parseFloat($("up-fps").value),
-    max_frames: parseInt($("up-max-frames").value, 10) || 300,
+    // 留空回落默认；填 0 是实义值，交给服务端说人话。
+    // 以前这里 parseFloat 出来的 NaN 会被 JSON 变成 null，任务里 float(None) 直接炸英文错。
+    fps: readNumber("up-fps", 0.5),
+    max_frames: Math.round(readNumber("up-max-frames", 600)),
     label: $("up-label").checked,
     video_dedupe: $("up-keep-similar").checked ? "none" : "perceptual",
   };
   upLog(`开始上传 ${files.length} 个文件…`);
   const stored = { image: [], video: [] };
-  let sent = 0;
+  // 进度按字节走，不按"传完几个文件"跳：一条 500 MB 的录像能让人盯着静止的条看几分钟
+  const totalBytes = files.reduce((sum, f) => sum + f.size, 0) || 1;
+  const acked = new Map();
+  const paintUpload = () => {
+    let done = 0;
+    acked.forEach((value) => { done += value; });
+    $("up-bar").style.width = Math.round((done / totalBytes) * 60) + "%";
+  };
   for (let i = 0; i < files.length; i += 3) {
     const batch = files.slice(i, i + 3);
-    const results = await Promise.all(batch.map(async (f) => {
+    const results = await Promise.all(batch.map(async (f, offset) => {
+      const slot = i + offset;
       try {
-        const info = await uploadOne(f);
+        const info = await uploadOne(f, (loaded) => { acked.set(slot, loaded); paintUpload(); });
+        acked.set(slot, f.size);
         return { ok: true, name: f.name, info };
       } catch (err) {
+        acked.set(slot, f.size);      // 失败的文件也要把进度条推走，否则永远停在 90%
         return { ok: false, name: f.name, error: err.message };
       }
     }));
@@ -877,8 +884,7 @@ async function startUpload() {
       if (r.ok) { stored[r.info.kind].push(r.info.stored); upLog(`已上传 ${r.name}（${kb(r.info.bytes)}）`); }
       else upLog(`上传失败 ${r.name}: ${r.error}`);
     }
-    sent += batch.length;
-    $("up-bar").style.width = Math.round((sent / files.length) * 60) + "%";
+    paintUpload();
   }
   for (const kind of ["video", "image"]) {
     if (!stored[kind].length) continue;
@@ -1116,7 +1122,7 @@ async function exportYoloDataset(button) {
   button.disabled = true;
   button.textContent = "导出中…";
   try {
-    const data = await postJson("/api/export", { val_ratio: 0.2 });
+    const data = await postJson("/api/export", { val_ratio: DEFAULT_VAL_RATIO });
     const info = data.export || {};
     const opened = await revealExport(info.out, { quiet: true });
     const verb = info.reused ? "标签没有变化，已复用上次导出" : "YOLO 训练集已导出";

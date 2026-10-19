@@ -9,6 +9,7 @@ import zipfile
 import pytest
 
 from autolabel import models
+from autolabel import secrets
 
 
 def zip_bytes(payload: bytes = b"weights") -> bytes:
@@ -355,3 +356,20 @@ def _send(url: str, payload: dict = None) -> str:
             return resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         return exc.read().decode("utf-8")
+
+
+def test_deleting_profile_takes_the_key_with_it(workspace):
+    """删掉的配置不能留下一把界面里看不见、也删不掉的幽灵密钥。
+
+    Key 存在 Key 文件里，配置文件只留 ``key_ref``：以前 ``delete_profile`` 只删
+    配置，那串明文就再没人引用——用户以为已经撤销了，磁盘上其实还躺着。
+    """
+    created = models.upsert_profile({"name": "云端", "base_url": "https://api.x/v1",
+                                     "model": "gpt-4o-mini", "api_key": "sk-secretvalue98765"})
+    ref = created["key_ref"]
+    assert secrets.get_secret(ref) == "sk-secretvalue98765"
+
+    models.delete_profile(created["id"])
+
+    assert secrets.get_secret(ref) == ""
+    assert ref not in secrets.secret_refs()

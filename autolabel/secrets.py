@@ -13,6 +13,8 @@ import re
 import threading
 from typing import Dict, List, Optional
 
+from .atomic import atomic_write_json
+
 DEFAULT_SECRETS = os.path.join("~", ".autolabel", "secrets.json")
 _REF_PATTERN = re.compile(r"^[0-9A-Za-z._:-]{1,80}$")
 _LOCK = threading.RLock()
@@ -44,12 +46,8 @@ def save_secrets(secrets: Dict[str, str], path: Optional[str] = None) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({k: v for k, v in sorted(secrets.items()) if v}, fh, ensure_ascii=False, indent=2)
-        fh.write("\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    atomic_write_json(path, {k: v for k, v in sorted(secrets.items()) if v},
+                      mode=0o600, newline=True)
     try:
         os.chmod(path, 0o600)
     except OSError:  # 只读挂载之类的文件系统，不因权限设置失败而报错
