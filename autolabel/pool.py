@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import uuid
 from contextlib import contextmanager
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -70,8 +71,33 @@ def _blank() -> dict:
     return {"version": 1, "categories": [], "batches": [], "items": {}}
 
 
+#: 已经留过底的坏账本：一个进程里同一份文件只挪一次，别每次读都去动盘
+_BROKEN_KEPT: set = set()
+
+
+def preserve_broken_catalog(path: str) -> str:
+    """把读不出来的池账本原样留一份 ``pool.json.bad``，返回留底路径（没留就返回空串）。
+
+    坏账本当空账本用是有意为之（拦启动等于整个工作台打不开），但下一次落笔就会
+    照着这份空账本整本重写——分类表和"只进池还没入库"的那些记账会跟着没了，
+    而且用户完全不知道。留一份原件，至多重一次，用户还能自己捞。
+    """
+    if path in _BROKEN_KEPT:
+        return ""
+    _BROKEN_KEPT.add(path)
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            return ""
+        keep = path + ".bad"
+        shutil.copyfile(path, keep)
+    except OSError:
+        return ""
+    print(f"[warn] 池账本读不出来，原件已留到 {keep}（这一轮的账本按空的重新写）")
+    return keep
+
+
 def load_catalog(root: str) -> dict:
-    """读池账本；缺文件/坏文件都退化成空账本，不拦启动。"""
+    """读池账本；缺文件/坏文件都退化成空账本，不拦启动（坏原件先留一份 ``.bad``）。"""
     path = catalog_path(root)
     if not os.path.exists(path):
         return _blank()
@@ -79,8 +105,10 @@ def load_catalog(root: str) -> dict:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):  # 坏账本当空的，下次写的时候自然重建
+        preserve_broken_catalog(path)
         return _blank()
     if not isinstance(data, dict):
+        preserve_broken_catalog(path)
         return _blank()
     rows = data.get("categories")
     batches = data.get("batches")

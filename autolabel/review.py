@@ -546,7 +546,9 @@ class ReviewStore:
         rels = [str(rel) for rel in (payload.get("images") or []) if str(rel).strip()]
         if not rels:
             raise ValueError("没有选择要分类的素材")
-        return pool_catalog.assign(self.root, rels, str(payload.get("category") or ""))
+        # 空串是有意的动作（退回未分类），所以这里只能"有值才取"，不能拿默认值顶
+        return pool_catalog.assign(self.root, rels,
+                                   _first_text(payload, "category", "category_id", "id"))
 
     def adopt_pool(self, image_rels: List[str], lib: str = LIB_POSE,
                    batch_name_text: str = "") -> dict:
@@ -1486,6 +1488,15 @@ def _clamp01(value: float) -> float:
 # HTTP
 # --------------------------------------------------------------------------- #
 
+def _first_text(payload: dict, *keys: str) -> str:
+    """按优先级取请求体里第一个填了的字段，用于同一概念有多种叫法的接口。"""
+    for key in keys:
+        value = str((payload or {}).get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 class MissingImage(ValueError):
     """要点名的那张图已经不在本库了（多半是另一个标签页刚删掉）。
 
@@ -1835,9 +1846,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/pool/category":
                 self._send_json(self.store.save_pool_category(payload))
             elif parsed.path == "/api/pool/category/delete":
-                wanted = str(payload.get("id") or "").strip()
+                # 分类这一家子以前三个接口两种叫法：建/改认 ``id``，归类认 ``category``，
+                # 删只认 ``id``。传错的那个当场只说"没有指定要删除的分类"，
+                # 看不出是字段名的事。三个名字都认，报错也说清要什么。
+                wanted = _first_text(payload, "id", "category", "category_id")
                 if not wanted:
-                    raise ValueError("没有指定要删除的分类")
+                    raise ValueError("没有指定要删除的分类（请求体里要带 id）")
                 self._send_json(self.store.delete_pool_category(wanted))
             elif parsed.path == "/api/pool/assign":
                 self._send_json(self.store.assign_pool_category(payload))
@@ -2159,6 +2173,7 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bo
     pruned = prune_thumbs(store.root)
     if pruned:
         print(f"[info] 清理缩略图缓存 {pruned} 张（超过 30 天未使用）")
+    from .coords import COORD_KEEP_RECENT, prune_coord_snapshots
     from .upload import prune_stale_uploads
 
     # 上传的原始文件在任务成功后才删，中途被打断就没人认领了（一次视频就几百 MB）
@@ -2166,6 +2181,11 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bo
     if stale["files"]:
         print(f"[info] 清理上次遗留的上传临时文件 {stale['files']} 个"
               f"（{stale['bytes'] / 1048576:.1f} MB，超过 24 小时未使用）")
+    # 每次标注任务都在 coords/ 留一份坐标快照，界面上只印一行路径，攒起来全是占地方的旧账
+    coords = prune_coord_snapshots(store.root)
+    if coords["dirs"]:
+        print(f"[info] 清理坐标快照 {coords['dirs']} 份"
+              f"（{coords['bytes'] / 1048576:.1f} MB，只保留最近 {COORD_KEEP_RECENT} 份）")
     # 启动对账顺手清的素材空账：不清的话素材池页多报张数，重导同一批图还会被当成重复
     ledger = int((store.recovery or {}).get("ledger_pruned") or 0)
     if ledger:

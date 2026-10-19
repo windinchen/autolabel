@@ -22,7 +22,7 @@ from .yolo_pose import (
     merge_person_flips,
     mirror_person,
 )
-from .platform_utils import remove_hint
+from .platform_utils import file_lock_acquire, file_lock_supported, remove_hint
 
 
 @dataclass
@@ -128,21 +128,19 @@ def claim_download(path: str, *, wait: bool = True, deadline: float = 0.0) -> Tu
     "已下载部分保留"而那份文件早就不在。这里用文件锁把第二个下载者挡在门外，
     让它等第一个下完——同一份权重下两遍本来就是白等一倍时间。
 
-    没有 ``flock`` 的平台（Windows）按"没别人"处理，行为与加锁之前一致。
+    锁本身哪种系统用哪种（POSIX ``flock`` / Windows ``msvcrt.locking``）交给
+    :func:`platform_utils.file_lock_acquire` 判断，这里只管"占到就下、占不到就等"。
     """
     handle = None
-    try:
-        import fcntl
-    except ImportError:
+    if not file_lock_supported():
         return True, None
     try:
         handle = open(path + LOCK_SUFFIX, "a+b")
     except OSError:
         return True, None          # 目录不让建锁文件：照常下载，别因为锁挡了正事
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if file_lock_acquire(handle, blocking=False):
         return True, handle
-    except OSError:
+    else:
         handle.close()
         if not wait:
             return False, None
@@ -157,12 +155,11 @@ def claim_download(path: str, *, wait: bool = True, deadline: float = 0.0) -> Tu
             retry = None
             try:
                 retry = open(path + LOCK_SUFFIX, "a+b")
-                fcntl.flock(retry.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
-                if retry is not None:
-                    retry.close()
                 continue
-            return True, retry
+            if file_lock_acquire(retry, blocking=False):
+                return True, retry
+            retry.close()
         return False, None
 
 

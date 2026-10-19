@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -378,3 +379,83 @@ __all__ = [
     "service_backend",
     "service_log", "state_dir", "tcc_hint", "uv_argv",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# 跨进程文件锁
+# --------------------------------------------------------------------------- #
+
+def _posix_fcntl():
+    try:
+        import fcntl
+    except ImportError:          # Windows 上没有这个模块
+        return None
+    return fcntl
+
+
+def _win_msvcrt():
+    try:
+        import msvcrt
+    except ImportError:
+        return None
+    return msvcrt
+
+
+def file_lock_supported() -> bool:
+    """这台机器有没有真正的跨进程文件锁（POSIX 用 ``flock``，Windows 用 ``msvcrt``）。"""
+    return _posix_fcntl() is not None or _win_msvcrt() is not None
+
+
+def file_lock_acquire(handle, blocking: bool = False) -> bool:
+    """给一个已打开的文件句柄占独占锁，占不到返回 ``False``。
+
+    Windows 上没有 ``flock``，只有 ``msvcrt.locking``——它锁的是"从当前读写位置起
+    的若干字节"，所以必须先 ``seek(0)``。以前 Windows 一律当成"没别人"，
+    结果是两个实例同时写素材账本会互相覆盖、同时下同一个权重会把对方正在
+    追加的 ``.part`` 截断，而这两种情况在 mac 上都复现不了。
+
+    ``blocking=True`` 与 ``flock`` 同一口径：一直等到拿到锁为止（进程一退出系统就
+    自动放锁，不会留下没人解的死锁）。
+    """
+    fcntl = _posix_fcntl()
+    if fcntl is not None:
+        flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(handle.fileno(), flags)
+            return True
+        except OSError:
+            return False
+    msvcrt = _win_msvcrt()
+    if msvcrt is None:
+        return True                      # 哪种锁都没有：别因为锁挡了正事
+    while True:
+        try:
+            handle.seek(0)
+        except OSError:
+            pass
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            if not blocking:
+                return False
+            time.sleep(0.05)
+
+
+def file_lock_release(handle) -> None:
+    """放掉 :func:`file_lock_acquire` 占的锁；句柄关掉时系统也会自己放，所以失败不报。"""
+    fcntl = _posix_fcntl()
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return
+    msvcrt = _win_msvcrt()
+    if msvcrt is None:
+        return
+    try:
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass

@@ -389,3 +389,68 @@ def get_json(base, path):
 
     with urllib.request.urlopen(base + path, timeout=30) as response:
         return response.status, json.loads(response.read())
+
+
+def test_one_batch_run_loads_the_weight_once(monkeypatch, detect_ds, tmp_path):
+    """一次批量标注只准加载一遍权重。
+
+    类名配对和真跑推理共用同一份后端缓存，而缓存键带着输入分辨率和设备：
+    以前配类别那一路一律按系统默认值取（1280），真跑按这次填的 640，缓存当场
+    分成两把，几百 MB 的权重复加载一遍——日志里两行「加载检测模型」，
+    看着像整批跑了两遍，还白等好几秒。
+    """
+    from autolabel import fields as fd
+    from autolabel import models as model_manager
+
+    fd.add_classes(detect_ds, ["person"], source="test", lib=LIB_DETECT)
+    monkeypatch.setattr(system, "label_defaults",
+                        lambda: {"device": "auto", "half": False, "imgsz": 1280, "conf": 0.25})
+    monkeypatch.setattr(model_manager, "resolve_weight_in_dir",
+                        lambda name, dir_=None: os.path.join(str(tmp_path), os.path.basename(name)))
+    monkeypatch.setattr(dt, "_BACKENDS", {})
+
+    loads = []
+
+    class CountingBackend(FakeBackend):
+        def __init__(self, settings, model_name=""):
+            super().__init__(model=model_name or settings.model)
+            self.settings = settings
+
+        def load(self):
+            loads.append((self.settings.device, self.settings.imgsz))
+            return self
+
+    monkeypatch.setattr(dt, "DetectionBackend", CountingBackend)
+    stats = dt.run_detect_labeling(detect_ds, model="yolo11n.pt", classes=["person"],
+                                   imgsz=640, device="cpu", verbose=False)
+    assert stats["labeled"] > 0
+    assert loads == [("cpu", 640)], f"权重加载了 {len(loads)} 次：{loads}"
+
+
+def test_profile_follows_the_saved_device(monkeypatch, tmp_path):
+    """配类别那一路的设备要跟系统设置一致：留空写成 "auto" 会和真跑那次的
+    具体设备名对不上，同一份权重又要多加载一遍。"""
+    from autolabel import models as model_manager
+
+    monkeypatch.setattr(system, "label_defaults",
+                        lambda: {"device": "mps", "half": False, "imgsz": 1024, "conf": 0.25})
+    monkeypatch.setattr(model_manager, "resolve_weight_in_dir",
+                        lambda name, dir_=None: os.path.join(str(tmp_path), os.path.basename(name)))
+    monkeypatch.setattr(dt, "_BACKENDS", {})
+
+    seen = {}
+
+    class SpyBackend(FakeBackend):
+        def __init__(self, settings, model_name=""):
+            super().__init__(model=model_name or settings.model)
+            seen["device"] = settings.device
+            seen["imgsz"] = settings.imgsz
+
+        def load(self):
+            return self
+
+    monkeypatch.setattr(dt, "DetectionBackend", SpyBackend)
+    dt.model_profile("yolo11n.pt")
+    assert seen == {"device": "mps", "imgsz": 1024}, seen
+    dt.model_profile("yolo11n.pt", device="cpu", imgsz=640)
+    assert seen == {"device": "cpu", "imgsz": 640}, seen

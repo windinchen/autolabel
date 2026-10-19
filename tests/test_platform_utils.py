@@ -348,3 +348,105 @@ def test_url_for_host_honours_scheme():
 ])
 def test_normalize_host_only_strips_brackets_and_blanks(host, expected):
     assert pu.normalize_host(host) == expected
+
+
+# --------------------------------------------------------------------------- #
+# 跨进程文件锁：Windows 上没有 flock，以前直接当"没别人"，两个实例会互相覆盖账本
+# --------------------------------------------------------------------------- #
+class FakeMsvcrt:
+    """Windows ``msvcrt.locking`` 的替身：按字节段记账，锁同一字节就撞车。"""
+
+    LK_NBLCK = 1
+    LK_UNLCK = 2
+    LK_LOCK = 4
+
+    def __init__(self):
+        self.locked = set()
+
+    def locking(self, fd, mode, nbytes):
+        # 真 msvcrt 锁的是"这个文件的这一段字节"，不是"这个描述符"：
+        # 按 fd 记就等于两个句柄永远不撞车，测试会假绿
+        stat = os.fstat(fd)
+        key = (stat.st_dev, stat.st_ino)
+        if mode == self.LK_UNLCK:
+            self.locked.discard(key)
+            return
+        if key in self.locked:
+            raise OSError(36, "Resource deadlock avoided")
+        self.locked.add(key)
+
+
+@pytest.fixture()
+def windows_lock(monkeypatch):
+    monkeypatch.setattr(pu, "_posix_fcntl", lambda: None)
+    fake = FakeMsvcrt()
+    monkeypatch.setattr(pu, "_win_msvcrt", lambda: fake)
+    return fake
+
+
+def test_two_processes_cannot_hold_the_same_lock(tmp_path):
+    """同一台机器上两个"实例"= 两个独立句柄：第二个必须拿不到锁。
+
+    素材账本和批次表都是"读全表→改→写全表"，没锁就会互相覆盖，
+    而且 mac 上一个进程里跑测试永远撞不出来。
+    """
+    path = tmp_path / "ledger.lock"
+    first = open(path, "a+b")
+    second = open(path, "a+b")
+    try:
+        assert pu.file_lock_supported()
+        assert pu.file_lock_acquire(first, blocking=False) is True
+        assert pu.file_lock_acquire(second, blocking=False) is False, "第二个实例没被挡住"
+        pu.file_lock_release(first)
+        assert pu.file_lock_acquire(second, blocking=False) is True, "放锁之后接手不了"
+    finally:
+        first.close()
+        second.close()
+
+
+def test_windows_fallback_locks_from_the_start_of_the_file(windows_lock, tmp_path):
+    """``msvcrt.locking`` 锁的是"当前指针往后的若干字节"：不先 seek(0) 就等于没锁。
+
+    追加打开时指针在文件末尾，末尾那一段根本没有字节，锁了个寂寞。
+    """
+    target = str(tmp_path / "batches.lock")
+    first = open(target, "a+b")
+    first.write(b"xxxx")
+    first.flush()
+    assert first.tell() == 4
+    second = open(target, "a+b")
+    try:
+        assert pu.file_lock_acquire(first, blocking=False) is True
+        assert first.tell() == 0, "没回到文件开头，锁的是指针后面那段空字节"
+        assert pu.file_lock_acquire(second, blocking=False) is False, "第二个实例没被挡住"
+        pu.file_lock_release(first)
+        assert windows_lock.locked == set()
+        assert pu.file_lock_acquire(second, blocking=False) is True
+    finally:
+        pu.file_lock_release(second)
+        first.close()
+        second.close()
+
+
+def test_no_lock_at_all_still_lets_work_through(monkeypatch, tmp_path):
+    """哪种锁都没有的机器：当成"没别人"，宁可少一层保护也别把正事挡住。"""
+    monkeypatch.setattr(pu, "_posix_fcntl", lambda: None)
+    monkeypatch.setattr(pu, "_win_msvcrt", lambda: None)
+    handle = open(tmp_path / "x.lock", "a+b")
+    try:
+        assert pu.file_lock_supported() is False
+        assert pu.file_lock_acquire(handle, blocking=False) is True
+        assert pu.file_lock_release(handle) is None
+    finally:
+        handle.close()
+
+
+def test_batch_ledger_lock_uses_the_cross_platform_helper():
+    """批次表那把锁不许再自己 ``import fcntl``：Windows 上会静默退化成没有锁。"""
+    import inspect
+
+    from autolabel import batches as bt
+
+    source = inspect.getsource(bt)
+    assert "fcntl.flock" not in source, "还在直接用 flock，Windows 上等于不加锁"
+    assert "file_lock_acquire" in source

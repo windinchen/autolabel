@@ -191,9 +191,16 @@ def near_miss_hint(stats: dict) -> str:
     return line
 
 
-def model_profile(model: str, device: str = "", dir_: Optional[str] = None) -> dict:
-    """加载权重并回报它是什么任务、认得出哪些类（第一次加载会下载权重，慢）。"""
-    settings = system_settings(model=resolve_model(model), device=device or "auto")
+def model_profile(model: str, device: str = "", dir_: Optional[str] = None,
+                  imgsz: Optional[int] = None) -> dict:
+    """加载权重并回报它是什么任务、认得出哪些类（第一次加载会下载权重，慢）。
+
+    ``device`` / ``imgsz`` 要照**真正要跑的那一次**传：后端按"权重+设备+分辨率"缓存，
+    这里以前一律按系统默认值取，批量标注就会为同一份权重新加载一遍——界面日志里
+    两行「加载检测模型」，几百 MB 的权重视觉上像跑了两遍，白等几秒。留空表示
+    "跟系统设置一致"，正好和 :func:`run_detect_labeling` 兜底出来的那套对齐。
+    """
+    settings = system_settings(model=resolve_model(model), device=device, imgsz=imgsz)
     backend = _backend(settings, dir_)
     described = backend.describe()
     described["classes"] = [{"class_id": cid, "name": name, "label": zh_for(name) or name}
@@ -233,7 +240,7 @@ def pick_classes(root: str, wanted: Optional[Sequence[str]] = None) -> List[dict
 
 
 def match_model_classes(root: str, model: str, wanted: Optional[Sequence[str]] = None,
-                        device: str = "") -> dict:
+                        device: str = "", imgsz: Optional[int] = None) -> dict:
     """把登记的类别名对到模型自带的类别号上，返回能用的与对不上的。
 
     对不上是常态而不是错误：上一轮用 COCO 权重标了 ``bottle``，这次换成自训练的
@@ -243,7 +250,7 @@ def match_model_classes(root: str, model: str, wanted: Optional[Sequence[str]] =
     if not picked:
         raise ValueError(f"{lib_name(LIB)}还没有类别：先在界面上从模型类别表里勾选，"
                          f"或跑 autolabel detect --model {model or 'yolo11n.pt'} --add-classes bus,person")
-    profile = model_profile(resolve_model(model, root), device)
+    profile = model_profile(resolve_model(model, root), device, imgsz=imgsz)
     kind = str(profile.get("open_vocab") or "") or open_vocab_kind(profile["model"])
     if kind:
         return _match_open_vocab(profile, picked, kind)
@@ -571,7 +578,11 @@ def run_detect_labeling(
     :param overwrite: 默认跳过人工接受过、改过、手工画过框的图，勾了才覆盖
     """
     root = os.path.abspath(root)
-    matched = match_model_classes(root, model, classes, device)
+    base = settings or system_settings()
+    # 分辨率和设备先定下来再去配类别：后端缓存键带着这两样，两边口径不一致时
+    # 同一份权重要加载两遍（几百 MB 的权重复核一遍就要几秒，日志还像跑了两遍）
+    wanted_size = int(imgsz) if imgsz else int(base.imgsz)
+    matched = match_model_classes(root, model, classes, device, imgsz=wanted_size)
     pairs = matched["pairs"]
     if not pairs:
         raise ValueError(
@@ -590,9 +601,8 @@ def run_detect_labeling(
                          f"先入库再标：autolabel import <数据集> --lib {LIB} <图片>，"
                          f"或在界面「{lib_name(LIB)}」里上传")
 
-    base = settings or system_settings()
     resolved = BackendSettings(model=matched["model"], device=device or base.device,
-                               imgsz=int(imgsz) if imgsz else base.imgsz,
+                               imgsz=wanted_size,
                                max_det=base.max_det, iou=base.iou, half=base.half,
                                conf=float(conf) if conf is not None else base.conf)
     backend = _backend(resolved)

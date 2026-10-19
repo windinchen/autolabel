@@ -416,3 +416,46 @@ def test_split_legacy_index_merges_into_an_existing_objects_index(tmp_path):
     assert "keep-me.jpg" in objects_items(root), "并进来不能把库里原有的记录挤掉"
     # 姿态库这边照旧剥干净，否则同样的键在两库里各留一份、以后不知以谁为准
     assert not any(key.startswith("prompt_") for key in load_index(root).get(rel))
+
+
+def test_reading_a_library_backfills_the_index_the_old_dataset_never_had(dataset, capsys):
+    """老数据集没有新加的库，网页一开就顺手补一本空的，命令行以前没这一步：
+    同一个数据集网页用得好好的，``autolabel validate`` 却来一句"先执行 init"，
+    像让人把标好的数据重做一遍。两边得是同一套行为。"""
+    from autolabel.library import index_path
+
+    detect_index = index_path(dataset, "detect")
+    # 老布局的数据集就是没有这本账本，这里手动摘掉来还原那个年代的状态
+    os.path.exists(detect_index) and os.remove(detect_index)
+    assert not os.path.exists(detect_index), "老布局本来就没有目标检测库"
+
+    index = load_index(dataset, "detect")
+    assert index.items == {} and os.path.exists(detect_index), "读一次就该把这本空账本补上"
+    # 补出来的那本得是真能用的账本，不能是个空壳
+    backfilled = load_index(dataset, "detect")
+    backfilled.upsert("img0.jpg", detect_objects=1)
+    backfilled.save()
+    assert load_index(dataset, "detect").get("img0.jpg")["detect_objects"] == 1
+
+    capsys.readouterr()
+    assert main(["status", dataset]) == 0
+    main(["validate", dataset])
+    report = capsys.readouterr().out + capsys.readouterr().err
+    assert "先执行 init" not in report, "同一个数据集网页开得了，命令行不该当它是废目录"
+
+
+def test_a_directory_that_is_not_a_dataset_still_says_init(tmp_path):
+    """补齐只救"老数据集缺本新账本"，不能把随便一个目录认成数据集。"""
+    import pytest
+
+    from autolabel.library import index_path
+
+    blank = tmp_path / "不是数据集"
+    blank.mkdir()
+    try:
+        load_index(str(blank), "detect")
+    except FileNotFoundError as exc:
+        assert "先执行 init" in str(exc)
+        assert not os.path.exists(index_path(str(blank), "detect"))
+    else:
+        raise AssertionError("空目录被当成数据集补齐了账本")

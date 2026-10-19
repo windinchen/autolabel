@@ -15,8 +15,10 @@ from __future__ import annotations
 import csv
 import json
 import os
+import re
 import shutil
 import tempfile
+import time
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .dataset import label_path_for, load_index, now_str, source_missing
@@ -67,6 +69,66 @@ COLUMN_DOC = {
 
 def coords_dir(root: str) -> str:
     return os.path.join(os.path.abspath(root), "coords")
+
+
+#: 每次标注任务都会在 ``coords/`` 下留一份坐标快照，界面上只印一行路径，之后没人再回来看。
+#: 而界面上的「下载坐标」是按需求现渲染的，旧快照对训练、对复核都不顶用——
+#: 本机实测一个数据集三天攒下 107 个目录 57 MB。留最近这些份足够回头核对，其余清掉。
+COORD_KEEP_RECENT = 20
+
+#: 只认"某次任务留下的快照"这种目录名。认不出的（用户自己指的路径、删批次前
+#: 留的那一份 ``batch-delete``）一律不动：宁可少删，别删掉人家真正要留的东西。
+_JOB_SNAPSHOT = re.compile(
+    r"^(?:detect|pose|prompt|ensemble|upload)-[0-9a-f]{8,}"   # 某次上传 / 标注任务
+    r"|^cli-b_\d{8}-\d{6}_[0-9a-f]{4,}"                       # 命令行按批次补写的
+    r"|^\d{4}-\d{2}-\d{2}_\d{4,6}$")                       # 没给 tag 时的时间戳目录
+
+
+def prune_coord_snapshots(root: str, keep: int = COORD_KEEP_RECENT,
+                         min_age_minutes: float = 60.0) -> dict:
+    """清掉攒下来的任务坐标快照，只留最近 ``keep`` 份，返回 ``{"dirs", "bytes"}``。
+
+    刚写完一分钟以内的不动：同一台机器上可能还开着另一个复核服务，
+    它的任务列表里正指着那份快照。
+    """
+    report = {"dirs": 0, "bytes": 0}
+    folder = coords_dir(root)
+    if not os.path.isdir(folder):
+        return report
+    try:
+        entries = [entry for entry in os.scandir(folder)
+                   if entry.is_dir() and _JOB_SNAPSHOT.match(entry.name)]
+    except OSError:
+        return report
+    deadline = time.time() - max(0.0, float(min_age_minutes)) * 60.0
+    dated = []
+    for entry in entries:
+        try:
+            stat = entry.stat()
+        except OSError:
+            continue
+        dated.append((stat.st_mtime, entry.path))
+    dated.sort(reverse=True)
+    for _mtime, path in dated[max(0, int(keep)):]:
+        try:
+            if os.path.getmtime(path) > deadline:
+                continue
+        except OSError:
+            continue
+        size = 0
+        for base, _dirs, names in os.walk(path):
+            for name in names:
+                try:
+                    size += os.path.getsize(os.path.join(base, name))
+                except OSError:
+                    pass
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            continue
+        report["dirs"] += 1
+        report["bytes"] += size
+    return report
 
 
 def wide_columns(keypoint_names: Sequence[str]) -> List[str]:

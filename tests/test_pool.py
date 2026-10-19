@@ -317,6 +317,39 @@ def test_pool_category_and_assign_endpoints(server, dataset):
     assert "category" not in ledger(dataset).get(rel, {}), "删分类得把素材退回未分类"
 
 
+def test_category_endpoints_accept_either_field_name(server, dataset):
+    """分类这一家子以前两种叫法各认各的：归类只认 category，删只认 id，
+    传错的当场只回「没有指定要删除的分类」，完全看不出是字段名的事。"""
+    base = server[0]
+    status, _headers, body = call(base, "/api/pool/category",
+                                 data=json.dumps({"name": "字段名"}).encode(), headers=JSON)
+    assert status == 200, body
+    cat = json.loads(body)["category"]
+    rel = sorted(pool_rows(dataset))[0]
+
+    for key in ("category", "category_id", "id"):
+        status, _headers, body = call(base, "/api/pool/assign",
+                                     data=json.dumps({"images": [rel], key: cat["id"]}).encode(),
+                                     headers=JSON)
+        assert status == 200, (key, body)
+        assert json.loads(body)["set"] == 1, (key, body)
+
+    # 空串是有意的动作（退回未分类），不能被当成"没填"
+    status, _headers, body = call(base, "/api/pool/assign",
+                                 data=json.dumps({"images": [rel], "category": ""}).encode(),
+                                 headers=JSON)
+    assert status == 200 and json.loads(body)["cleared"] == 1, body
+
+    status, _headers, body = call(base, "/api/pool/category/delete",
+                                 data=json.dumps({}).encode(), headers=JSON)
+    assert status == 400 and "要带 id" in body.decode("utf-8"), body
+
+    status, _headers, body = call(base, "/api/pool/category/delete",
+                                 data=json.dumps({"category": cat["id"]}).encode(), headers=JSON)
+    assert status == 200 and json.loads(body)["ok"], body
+    assert "category" not in ledger(dataset).get(rel, {})
+
+
 def test_pool_upload_job_pools_without_touching_any_library(server, dataset):
     """素材池页的导入任务：文件进池就完事，不进库、不标注；删除走的也是池的口径。"""
     base = server[0]
@@ -713,3 +746,27 @@ def test_record_files_writes_the_whole_batch_in_one_pass(dataset, fresh_dir):
     for rel in imported:
         assert book[rel].get("sha256"), f"{rel} 缺哈希，下次导入认不出重复"
         assert book[rel].get("bytes"), f"{rel} 缺体积，素材池卡片会写 0 KB"
+
+
+def test_broken_pool_ledger_is_kept_before_being_rewritten(dataset):
+    """坏账本当空账本是故意的（拦启动等于整个工作台打不开），但下一次落笔就会
+    照着空的整本重写——分类表和"只进池"的记账全没了还没人知道。留一份原件。"""
+    path = pool_catalog.catalog_path(dataset)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("{ 同步软件只写了一半 ")
+
+    assert pool_catalog.load_catalog(dataset)["items"] == {}, "坏账本没退化成空账本"
+    kept = path + ".bad"
+    assert os.path.exists(kept), "坏原件没留底，下一次写账本就把它覆盖没了"
+    assert open(kept, encoding="utf-8").read() == "{ 同步软件只写了一半 "
+
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("still broken")
+    pool_catalog.load_catalog(dataset)
+    assert open(kept, encoding="utf-8").read() == "{ 同步软件只写了一半 ", \
+        "同一个进程里反复读坏账本，把留底也冲掉了"
+
+    pool_catalog.save_category(dataset, "重新建的一类")
+    assert any(row["name"] == "重新建的一类"
+               for row in pool_catalog.load_catalog(dataset)["categories"])

@@ -22,11 +22,6 @@ import uuid
 from contextlib import contextmanager
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-try:  # pragma: no cover - 非 POSIX 平台退化成只有进程内锁
-    import fcntl
-except ImportError:  # pragma: no cover
-    fcntl = None  # type: ignore[assignment]
-
 from .dataset import (
     IMAGE_EXTS,
     STATUS_UNREVIEWED,
@@ -65,6 +60,8 @@ from .library import (
     qc_dir,
     spec,
 )
+# 跨进程锁的"这台机器用哪种锁"也归 platform_utils 管，别在业务模块里写 sys.platform
+from .platform_utils import file_lock_acquire, file_lock_release, file_lock_supported
 
 # 索引里没有 batch_id 的历史数据，归到这个虚拟批次里，同样可以整批删除
 UNGROUPED_ID = "__ungrouped__"
@@ -101,6 +98,10 @@ def _file_lock(root: str) -> Iterator[None]:
 
     必须可重入：``reconcile_with_disk()`` 握锁期间还会调 ``attach_items()``，而 flock
     是按打开的文件描述符判定归属的，同线程再开一个描述符等锁会直接把自己锁死。
+
+    POSIX 用 ``flock``，Windows 用 ``msvcrt.locking``（见
+    :func:`platform_utils.file_lock_acquire`）——以前 Windows 直接不加锁，
+    两个实例同时改批次表就会互相覆盖。
     """
     path = os.path.join(os.path.abspath(root), ".autolabel", "batches.lock")
     held = getattr(_HELD, "paths", None)
@@ -110,11 +111,11 @@ def _file_lock(root: str) -> Iterator[None]:
         yield
         return
     handle = None
-    if fcntl is not None:  # pragma: no branch
+    if file_lock_supported():
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             handle = open(path, "a+", encoding="utf-8")
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            file_lock_acquire(handle, blocking=True)
         except OSError:  # pragma: no cover - 只读目录等极端情况，宁可少一层保护
             if handle is not None:
                 handle.close()
@@ -127,7 +128,7 @@ def _file_lock(root: str) -> Iterator[None]:
         held.discard(path)
         if handle is not None:  # pragma: no cover
             try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                file_lock_release(handle)
             finally:
                 handle.close()
 

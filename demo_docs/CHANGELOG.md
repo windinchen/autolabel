@@ -1,5 +1,50 @@
 # 变更记录
 
+## 2026-10-20 04:12 — v1.4.16：权重只加载一遍；坐标快照会清了；Windows 上终于有锁
+
+往深处查了推理链路、坏账本表现、磁盘旧产物、Windows 兼容、命令行与网页的一致性，六个真问题全部改在根因上。
+
+### 一、一次批量标注把同一份权重加载两遍
+
+- `detect.model_profile()` / `match_model_classes()` 新增 `imgsz`：按**真跑那一次**的分辨率与设备取后端。
+  以前对类别那一路一律按系统默认值取，后端缓存的钥匙上挂着分辨率，钥匙不一样缓存分成两把，
+  几百 MB 的权重加载两遍，日志里两行「加载检测模型」。
+- `detect.run_detect_labeling()`：分辨率与设备先定下来再去配类别，两边同一套口径。
+
+### 二、坐标快照只增不减（本机实测：一个数据集三天 107 个目录 57 MB）
+
+- 新增 `coords.prune_coord_snapshots()`：启动时清任务留下的坐标快照，只留最近 `COORD_KEEP_RECENT`（20）份，
+  一分钟以内刚写完的不动（另一个复核服务可能正指着它）。目录名认不出的（用户自己指的 `--out`、
+  删批次前那份 `batch-delete`）一律不动。`review.main` 接上，与上传临时文件、缩略图缓存同一处启动清理。
+
+### 三、账本被写坏时报英文原文，是个数组就直接 500
+
+- `dataset.load_index()`：坏 JSON 抛中文 `ValueError`，说清哪个库、断在第几行第几列、文件在哪、
+  框还在哪个目录、怎么修；内容不是对象（数组/字符串）时同样报，不再一路撞到 `setdefault` 变 500。
+- 新增 `dataset.index_broken_reason()`：三库的"框还在哪儿"跟着库走（`labels/`、`prompt_labels/`、`detect_labels/`）。
+
+### 四、素材池账本坏了会被静默重写，分类与记账跟着没了
+
+- 新增 `pool.preserve_broken_catalog()`：读不出来的池账本先原样留一份 `pool.json.bad`（一个进程只留一次），
+  再当空账本用。以前下一次落笔就照着空的整本重写，分类表和"只进池"的记账全没了还没人知道。
+
+### 五、Windows 上两处文件锁是空转的
+
+- 新增 `platform_utils.file_lock_supported()` / `file_lock_acquire()` / `file_lock_release()`：
+  POSIX 用 `flock`，Windows 用 `msvcrt.locking`（先 `seek(0)`，它锁的是当前指针往后的字节段）。
+- `batches._file_lock()`、`backends.claim_download()` 改走这套；两处以前在 Windows 上直接当"没别人"，
+  两个实例会互相覆盖批次表 / 截断对方正在追加的 `.part`。业务模块里不再自己 `import fcntl`。
+
+### 六、同一个老数据集，网页开得了、命令行叫你重跑 init
+
+- `dataset.load_index()`：缺某本库账本且姿态账本在（说明它确实是数据集）时，就地调 `library.ensure_lib_index()`
+  补一本空的——与网页启动时同一件事，两边只剩一套行为。真不是数据集才说"先执行 init"，
+  目录只读补不上就说"跑一次 autolabel migrate"。
+
+### 测试
+
+- 全量 1260 项通过 / 8 项跳过（新增 15 项，含用假 `msvcrt` 钉住 Windows 分支）。
+
 ## 2026-10-20 04:05 — v1.4.15：素材账本上锁；认自己人不能只认哈希；报错统一说人话
 
 五个方向重新查了一遍已上线的链路（素材账本与并发 / 撤销后的置信度 / 图被别的页删掉 / 模型找不到 / 素材去重与导出），

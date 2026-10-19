@@ -30,8 +30,8 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .library import (LIB_DETECT, LIB_NAMES, LIB_OBJECTS, LIB_POSE, LIBRARIES, backups_dir,
-                      deleted_dir, ensure_lib, exports_dir, history_root, images_dir,
-                      index_path, labels_dir, meta_dir, normalize,
+                      deleted_dir, ensure_lib, ensure_lib_index, exports_dir, history_root,
+                      images_dir, index_path, labels_dir, meta_dir, normalize,
                       pool_files, qc_dir)
 from .atomic import atomic_write_json
 from .library import field_key
@@ -294,15 +294,62 @@ def _init_objects_index(root: str, name: Optional[str] = None) -> DatasetIndex:
     return _init_box_index(root, LIB_OBJECTS, name)
 
 
+#: 账本坏了以后能照着做的两件事，写在同一个地方，免得各条报错各说一套
+def index_broken_reason(lib: str, path: str, detail: str) -> str:
+    """某库 ``index.json`` 读不出来时给人看的那句话。
+
+    这份文件以前坏了会直接甩一句英文解析器的原文（``Expecting property name
+    enclosed in double quotes: line 1 column 3``），既没说是哪个文件，也没说怎么办；
+    内容是个数组时更糟，一路撞到 ``setdefault`` 变成 500。
+    """
+    return (f"{LIB_NAMES.get(lib, lib)}的账本读不出来：{detail}\n"
+            f"文件在 {path}，多半是手工改过、或同步软件只写了一半。\n"
+            f"标注本身没丢（框都在 {labels_dir(root_path_of(path), lib)} 里），"
+            "把这份文件修好或从备份还原，再重新打开数据集就行")
+
+
+def root_path_of(index_file: str) -> str:
+    """从 ``<数据集>/.autolabel/[lib/]index.json`` 反推数据集根目录。"""
+    folder = os.path.dirname(os.path.abspath(index_file))
+    if os.path.basename(folder) in LIBRARIES:
+        folder = os.path.dirname(folder)
+    return os.path.dirname(folder)
+
+
 def load_index(root: str, lib: str = LIB_POSE) -> DatasetIndex:
-    """读某个库的索引；文件缺失时抛 :class:`FileNotFoundError`。"""
+    """读某个库的索引；文件缺失时抛 :class:`FileNotFoundError`。
+
+    账本被改坏时抛 :class:`ValueError` 并说清是哪个文件、怎么修——
+    让一句英文解析器原文或者 500 冒出来，用户只会以为软件坏了。
+    """
     root = os.path.abspath(root)
     lib = normalize(lib)
     path = index_path(root, lib)
     if not os.path.exists(path):
-        raise FileNotFoundError(f"不是有效的自动标注数据集（缺少 {path}），先执行 init")
-    with open(path, "r", encoding="utf-8") as fh:
-        data = json.load(fh)
+        # 后加的库在老数据集里从没有过索引。网页一开就顺手补一本空的（见
+        # ``library.ensure_lib_index``），命令行以前没这一步：同一个老数据集，
+        # 网页用得好好的，命令行却来一句"先执行 init"，像让人把数据重做一遍。
+        if lib != LIB_POSE and os.path.exists(index_path(root, LIB_POSE)):
+            try:
+                ensure_lib_index(root, lib)
+            except OSError:  # 目录只读：补不上也得把原来那句报错留着
+                pass
+        if not os.path.exists(path):
+            if not os.path.exists(index_path(root, LIB_POSE)):
+                raise FileNotFoundError(f"不是有效的自动标注数据集（缺少 {path}），先执行 init")
+            raise FileNotFoundError(f"{LIB_NAMES[lib]}的账本（{path}）没了，而且就地补一本也没成功——"
+                                    "数据集目录是不是只读的？跑一次 autolabel migrate 试试")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except json.JSONDecodeError as exc:
+        # JSONDecodeError 的 str() 整句都是英文，抄过来等于让人自己翻译；
+        # 位置才是有用的一半，单独拎出来用中文说
+        raise ValueError(index_broken_reason(
+            lib, path, f"不是合法的 JSON，第 {exc.lineno} 行第 {exc.colno} 列就断了（{exc.msg}）")) from exc
+    if not isinstance(data, dict):
+        kind = "一个数组" if isinstance(data, list) else f"一个 {type(data).__name__}"
+        raise ValueError(index_broken_reason(lib, path, f"里面装的是{kind}，不是记账用的对象"))
     data.setdefault("items", {})
     return DatasetIndex(root=root, data=data, lib=lib)
 

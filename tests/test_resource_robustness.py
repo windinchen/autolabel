@@ -212,3 +212,94 @@ def test_snapshot_pruning_keeps_files_it_does_not_understand(dataset):
 
     assert removed > 0
     assert "手工备份.json" in os.listdir(folder)
+
+
+def test_coord_snapshots_keep_only_the_recent_ones(dataset):
+    """每次标注任务都在 ``coords/`` 留一份坐标快照，界面上只印一行路径，之后没人回来看。
+
+    本机实测一个数据集三天攒了 107 个目录 57 MB，而界面上的「下载坐标」是按需求
+    现渲染的，旧快照对训练和复核都不顶用。删的时候只认"某次任务留下的"那种名字，
+    用户自己指的路径和删批次前留的那一份一律不动。
+    """
+    from autolabel import coords as cd
+
+    folder = cd.coords_dir(dataset)
+    names = [f"detect-{index:010x}-detect" for index in range(25)]
+    names += ["batch-delete", "2026-10-16_214939", "cli-b_20261016-214939_ab12", "我自己的导出"]
+    for offset, name in enumerate(names):
+        path = os.path.join(folder, name)
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, cd.WIDE_FILE), "wb") as handle:
+            handle.write(b"x" * 1024)
+        stamp = time.time() - (len(names) - offset) * 3600
+        os.utime(path, (stamp, stamp))
+
+    report = cd.prune_coord_snapshots(dataset, keep=20)
+    left = os.listdir(folder)
+    # 27 份是任务快照（25 detect + 时间戳 + cli-），留最近 20 份 → 删 7 份最旧的
+    assert report["dirs"] == 7 and report["bytes"] == 7 * 1024, report
+    assert "detect-0000000000-detect" not in left and "detect-0000000006-detect" not in left
+    assert "detect-0000000007-detect" in left and "detect-0000000018-detect" in left
+    for keep in ("batch-delete", "我自己的导出", "2026-10-16_214939"):
+        assert keep in left, f"{keep} 不是任务快照，不该被删"
+    assert cd.prune_coord_snapshots(dataset, keep=20) == {"dirs": 0, "bytes": 0}
+
+    review_py = open(os.path.join(os.path.dirname(STATIC), "review.py"), encoding="utf-8").read()
+    assert "prune_coord_snapshots(" in review_py, "启动流程没接坐标快照清理"
+
+
+def test_fresh_coord_snapshot_survives_pruning(dataset):
+    """刚写完一分钟以内的快照不许删：同一台机器上可能还开着另一个复核服务。"""
+    from autolabel import coords as cd
+
+    folder = cd.coords_dir(dataset)
+    names = [f"prompt-{index:010x}-prompt" for index in range(4)]
+    for name in names:
+        path = os.path.join(folder, name)
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, cd.JSONL_FILE), "wb") as handle:
+            handle.write(b"{}")
+    long_ago = time.time() - 6 * 3600
+    os.utime(names[0] and os.path.join(folder, names[0]), (long_ago, long_ago))
+
+    # 只有一份够旧（超过一小时），删它；剩下三份刚写完，即使名额只剩一个也不动
+    assert cd.prune_coord_snapshots(dataset, keep=1) == {"dirs": 1, "bytes": 2}
+    left = os.listdir(folder)
+    assert names[0] not in left
+    assert all(name in left for name in names[1:]), "刚写完的快照被抢走了"
+
+
+def test_broken_index_names_the_file_instead_of_an_http_500(dataset):
+    """账本被改坏时报的得是"哪个文件、怎么修"，不是解析器原文，更不是 500。"""
+    for lib, rel in (("pose", "index.json"), ("detect", os.path.join("detect", "index.json"))):
+        path = os.path.join(ds.meta_dir(dataset), rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("{ 手滑删了一个引号,)")
+        with pytest.raises(ValueError) as caught:
+            ds.load_index(dataset, lib)
+        text = str(caught.value)
+        assert path in text, f"没说要修哪个文件：{text}"
+        first = text.split("\n")[0]
+        assert first.startswith(("姿态标注", "目标检测标注")) and "第 1 行第 3 列" in first, \
+            f"第一行该说中文和断在哪：{first}"
+
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("[]")
+        with pytest.raises(ValueError) as caught:
+            ds.load_index(dataset, lib)
+        assert "数组" in str(caught.value), str(caught.value)
+        assert ds.load_index_or_none(dataset, lib) is None, "对账时跨库看一眼，坏一个库不该抛"
+
+
+def test_broken_index_hint_points_at_the_labels_of_that_library(dataset):
+    """三句话里那句"框还在哪儿"必须跟着库走：检测库的框在 detect_labels/，
+    写成 labels/ 等于让人去翻一个空目录。"""
+    labels = ds.meta_dir(dataset)
+    for lib, want in (("pose", "labels"), ("objects", "prompt_labels"), ("detect", "detect_labels")):
+        path = os.path.join(labels, lib, "index.json") if lib != "pose" else os.path.join(labels, "index.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w", encoding="utf-8").write("{bad")
+        with pytest.raises(ValueError) as caught:
+            ds.load_index(dataset, lib)
+        assert want in str(caught.value).replace(os.sep, "/"), str(caught.value)
