@@ -5,8 +5,13 @@
 右侧动作区用 sticky 把目标列表整个盖住，筛选下拉里多一个没人处理的值，
 以及门户/模型页迟迟没跟上新壳、顶栏和左导航条各长各的。
 """
+import json
 import os
 import re
+import shutil
+import subprocess
+
+import pytest
 
 STATIC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                       "autolabel", "static")
@@ -225,3 +230,80 @@ def test_portal_leads_with_next_actions_and_drops_internalese():
         block = portal_js[portal_js.index("const MODULE_CARDS"):portal_js.index("function buildStats")]
         assert banned not in block, f"门户卡片/数字文案还留着「{banned}」"
     assert ".stat-strip" in read("app.css"), "门户概览应该是紧凑数字条，不是十几张卡片"
+
+
+# --------------------------------------------------------------------------- //
+# 模型管理：目录只看已下载、备注说明已取消
+# --------------------------------------------------------------------------- #
+def run_models_function(name, state, argument):
+    """把 models.js 里依赖 modelState 的纯函数抠出来交给 node 求值。
+
+    过滤规则用正则猜是猜不准的：一个 `||` 写错，「搜到了却看不见」就得靠肉眼逛十遍。
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("本机没有 node，跳过前端纯函数求值")
+    source = read("models.js")
+    params, body = source.split("function %s(" % name, 1)[1].split(") {", 1)
+    body = body.split("\n}", 1)[0]
+    script = ("const rows = JSON.parse(process.argv[1]);"
+              "const state = JSON.parse(process.argv[2]);"
+              "const fn = Function(...JSON.parse(process.argv[3]), process.argv[4]);"
+              "process.stdout.write(JSON.stringify(fn(state, rows)));")
+    done = subprocess.run([node, "-e", script, json.dumps(argument), json.dumps(state),
+                           json.dumps(["modelState"] + [p.strip() for p in params.split(",")]),
+                           body], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+CATALOG_ROWS = [
+    {"id": "yolo11n", "task": "detect", "installed": True},
+    {"id": "yolov8x", "task": "detect", "installed": False},
+    {"id": "ollama-qwen", "task": "vlm", "installed": False, "ready": True},
+]
+
+
+def test_catalog_defaults_to_installed_models_only():
+    """官方目录一摆就是一百六十档，默认只留本机已有的，下载按钮才找得到。"""
+    html = read("models.html")
+    source = read("models.js")
+
+    assert 'class="switch on" id="model-installed-only"' in html, "开关默认得是开的"
+    assert "installedOnly: true" in source
+    assert "visibleCatalogRows(" in source and "toggleInstalledOnly()" in source
+    assert "另有" in source and "未下载没显示" in source, "藏掉多少条要说出来，否则像目录只剩几个"
+
+    got = run_models_function("visibleCatalogRows",
+                              {"installedOnly": True, "query": "", "filter": ""}, CATALOG_ROWS)
+    assert [row["id"] for row in got["shown"]] == ["yolo11n", "ollama-qwen"], got
+    assert got["hidden"] == 1
+
+
+def test_searching_the_catalog_beats_the_installed_only_switch():
+    """搜到了却看不见是最气人的一种「搜不到」：搜索或筛任务时开关必须让路。"""
+    for state in ({"installedOnly": True, "query": "yolov8x", "filter": ""},
+                  {"installedOnly": True, "query": "", "filter": "detect"},
+                  {"installedOnly": False, "query": "", "filter": ""}):
+        got = run_models_function("visibleCatalogRows", state, CATALOG_ROWS)
+        assert len(got["shown"]) == len(CATALOG_ROWS), (state, got)
+        assert got["hidden"] == 0, (state, got)
+
+
+def test_model_page_has_no_leftover_note_ui():
+    """备注说明整条功能删了：输入框、保存按钮、接口调用都不许留残骸。"""
+    html = read("models.html")
+    source = read("models.js")
+
+    for leftover in ("model-reg-note", "model-note-row", "note-save", "saveModelNote",
+                     "bindModelNote"):
+        assert leftover not in html + source, f"备注功能还留着 {leftover}"
+
+
+def test_local_weight_list_only_lists_real_files():
+    """「本机权重」按磁盘上真有的文件列，未下载的预置档不在这里占行。"""
+    source = read("models.js")
+
+    assert "function localWeightRows()" in source
+    assert "for (const info of localWeightRows())" in source or \
+        "const rows = localWeightRows();" in source

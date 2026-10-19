@@ -997,7 +997,7 @@ function registryRows() {
     capability: "pose", ready: Boolean(w.ready), size_mb: w.size_mb || 0, expected_mb: 0,
     status: w.ready ? "available" : (w.size_mb ? "incomplete" : "missing"),
     status_label: w.ready ? "可用" : (w.size_mb ? "文件不完整" : "未下载"),
-    compatible: true, compatibility_reasons: [], note: "", description: "",
+    compatible: true, compatibility_reasons: [], description: "",
   }));
 }
 
@@ -1047,7 +1047,6 @@ function renderModelDesc() {
     if (row.speed) facts.push(`速度 ${row.speed}`);
     if (row.recommended_for) facts.push(`适合 ${row.recommended_for}`);
   }
-  if (row.note) facts.push(`备注：${row.note}`);
   if (!row.compatible) facts.push(`不兼容：${(row.compatibility_reasons || []).join("；")}`);
   const desc = document.createElement("div");
   desc.textContent = row.description || "（目录里没写说明）";
@@ -1064,12 +1063,18 @@ function renderModelOptions(models, vlm) {
   if (!rows.length) return;
   select.innerHTML = "";
   for (const capability of ["pose", "vlm", "custom_task"]) {
-    const group = rows.filter((r) => (r.capability || "pose") === capability)
+    const all = rows.filter((r) => (r.capability || "pose") === capability)
       .slice().sort((a, b) => Number(b.ready === true) - Number(a.ready === true));
-    if (!group.length) continue;
-    // 一条都能没用（全没下载或全不兼容）时至少留一条能选的，行为退回「首次标注自动经镜像下载」
-    const usable = group.some((r) => r.ready && r.compatible !== false);
-    const firstFallback = capability === "vlm" || usable ? -1 : 0;
+    if (!all.length) continue;
+    // 没下载的权重不再摆进下拉框：选了它就等于在第一个标注任务里偷偷下几百 MB。
+    // 下载统一去「模型管理」页做，这里只列本机已经装好的（多模态是配置，不按下载算）。
+    const ready = capability === "vlm"
+      ? all.filter((r) => r.compatible !== false)
+      : all.filter((r) => r.ready && r.compatible !== false);
+    // 一条都没有（全没下载，或关键点数量都跟本数据集对不上）就留第一条兜底，
+    // 下拉框整个空着最容易被当成坏了
+    const group = ready.length ? ready : all.slice(0, 1);
+    const firstFallback = ready.length ? -1 : 0;
     const optgroup = document.createElement("optgroup");
     optgroup.label = CAPABILITY_GROUP_LABEL[capability] || capability;
     group.forEach((row, index) => {

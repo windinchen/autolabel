@@ -55,7 +55,7 @@ const up = { files: [] };
 const fieldState = { editing: null };
 // 目标检测页的权重状态：下拉框选项、权重自带类别、上次选的那一档（后端 prefs 记的）
 const modelState = {
-  loading: false, models: [], unusable: [], device: "auto",
+  loading: false, models: [], unusable: [], device: "auto", emptyNote: "",
   model: "", conf: 0.25, prefsClasses: [],
   list: [], listModel: "", listLoading: false, note: "", result: "",
   // 开放词表权重（YOLOE / YOLO-World）：类别不是权重自带的，而是这次现填的英文词
@@ -1402,6 +1402,7 @@ async function loadModelChoices() {
     const data = await getJson("/api/detect/models");
     modelState.models = data.models || [];
     modelState.unusable = data.unusable || [];
+    modelState.emptyNote = data.empty_note || "";
     modelState.device = data.device || "auto";
     const prefs = data.prefs || {};
     const known = modelState.models.map((row) => row.name);
@@ -1418,6 +1419,7 @@ async function loadModelChoices() {
   } catch (err) {
     modelState.note = "本机权重清单读取失败：" + err.message;
     modelState.models = [];
+    modelState.emptyNote = "";
     renderModelChoices();
   }
   modelState.loading = false;
@@ -1461,7 +1463,8 @@ function renderModelChoices() {
     if (!modelState.models.length) {
       const el = document.createElement("option");
       el.value = "";
-      el.textContent = "（models/ 里还没有能用在检测库的权重）";
+      el.textContent = modelState.emptyNote
+        || "（本机还没有能用在检测库的权重：去「模型管理」下载一个）";
       select.append(el);
       select.disabled = true;
       continue;
@@ -1696,7 +1699,11 @@ function openRun(open) {
   if (open) {
     renderRunFields();
     renderVlmChoices();
-    if (IS_LOCAL) { renderModelChoices(); renderRunFields(); }
+    // 摊开面板就重新取一次本机权重：刚从「模型管理」下好的权重必须立刻能选到，
+    // 不能等用户回本页刷新（renderModelChoices 只是重画，取新数据靠 loadModelChoices）
+    if (IS_LOCAL) loadModelChoices();
+    renderModelChoices();
+    renderRunFields();
   }
 }
 
@@ -1979,7 +1986,9 @@ function openUpload(open) {
   if (open) {
     renderRunFields("up-fields");
     renderVlmChoices("up-vlm");
-    if (IS_LOCAL) { renderModelChoices(); renderRunFields("up-fields"); }
+    if (IS_LOCAL) loadModelChoices();   // 同批量面板：刚下好的权重要立刻选得到
+    renderModelChoices();
+    renderRunFields("up-fields");
     renderUpFiles();
   }
 }

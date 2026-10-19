@@ -145,6 +145,11 @@
             <option value="classify">图像分类</option>
           </select>
         </label>
+        <label class="model-remote-toggle" title="默认只列本机已下载的模型；要看官方完整目录、下载新的就关掉它">
+          <button class="switch on" id="model-installed-only" type="button" role="switch"
+                  aria-checked="true"><span></span></button>
+          <span class="muted small">只看已下载</span>
+        </label>
         <span id="model-catalog-note" class="muted small"></span>
       </div>
       <div class="model-tools" id="model-search-bar">
@@ -166,18 +171,17 @@
       <div class="model-tools">
         <input type="text" id="model-reg-path" placeholder="本地权重路径，如 ~/models/my-pose.pt" spellcheck="false">
         <input type="text" id="model-reg-name" placeholder="中文名（选填）" spellcheck="false">
-        <input type="text" id="model-reg-note" placeholder="备注说明（选填）" spellcheck="false">
         <button id="model-register">登记本地模型</button>
       </div>
       <div class="muted small">目录内容可在 <span class="mono">configs/models.json</span> 的
-        <span class="mono" id="model-config-path">catalog</span> 里增删改；备注说明也写在这份登记表里，不动模型文件。
+        <span class="mono" id="model-config-path">catalog</span> 里增删改，不动模型文件。
         API Key 单独存在 <span class="mono" id="model-secrets-path">~/.autolabel/secrets.json</span>，界面上只显示掩码。
-        未下载的模型在「姿态标注」「提示词标注」里是灰的，必须先在这里下载（或首次用时自动经镜像下载）。</div>
+        标注页的模型下拉框只列本机已经下好的权重——这里点「下载」，装完再回标注页选。</div>
     </div>
 
     <div class="model-section">
       <div class="model-section-head">
-        <span class="panel-title">姿态权重（YOLO-pose）</span>
+        <span class="panel-title">本机权重<span class="muted small"> · 只列 <span class="mono">models/</span> 里真有的文件</span></span>
         <span class="spacer"></span>
         <span id="model-weight-note" class="muted small"></span>
       </div>
@@ -188,7 +192,7 @@
         <button id="model-download-new">下载</button>
         <button id="model-del-weight" class="danger" disabled>删除所选</button>
       </div>
-      <div class="muted small">删除后下次标注会自动经镜像重新下载；正在标注的权重不能删。自定义权重把
+      <div class="muted small">未下载的档位不在这里占行，要下新的回上面「模型目录」搜。删除后下次标注会自动经镜像重新下载；正在标注的权重不能删。自定义权重把
         <span class="mono">.pt</span> 放进 <span class="mono">models/</span> 目录即可出现在这里（当前 <span class="mono" id="model-dir"></span>）。</div>
     </div>
 
@@ -257,12 +261,13 @@
 
 <div id="help-modal" class="modal hidden">
   <div class="modal-card">
-    <div class="modal-title">模型管理怎么用<span class="muted small"> · 没下载的模型在标注页是灰的，先在这里下载或登记</span></div>
+    <div class="modal-title">模型管理怎么用<span class="muted small"> · 标注页只列本机已下载的模型，先在这里下载或登记</span></div>
     <div class="help-grid">
       <div class="panel-title">这里管什么</div>
-      <div><span>模型目录</span><span>按任务搜（分割 / 旋转框 / 分类…），中文介绍里写了能标哪些类别</span></div>
+      <div><span>模型目录</span><span>默认只列本机已下载的；关掉「只看已下载」或搜一下就能看官方完整目录，
+        中文介绍里写了每档能标哪些类别</span></div>
       <div><span>联网检索</span><span>本地搜不到就打开「联网搜 GitHub」，社区权重自己下载后登记进来</span></div>
-      <div><span>姿态权重</span><span>删掉后下次标注会自动重新下载；正在用的不能删</span></div>
+      <div><span>本机权重</span><span>models/ 里真有的文件；删掉后下次标注会自动重新下载，正在用的不能删</span></div>
       <div><span>多模态配置</span><span>本地 Ollama / LM Studio 或云端 API，填完可测连通</span></div>
       <div><span>两种「默认」</span><span>「设为默认」管这台机器的姿态权重（存 configs/models.json）；
         「设为检测默认」管目标检测页用哪个权重（存数据集 .autolabel/detect/prefs.json），互不影响</span></div>

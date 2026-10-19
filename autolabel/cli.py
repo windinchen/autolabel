@@ -809,7 +809,6 @@ def cmd_models(args: argparse.Namespace) -> int:
         info = model_admin.delete_weight(name)
         print(f"[ok] 已删除权重 {info['name']}（释放 {info['freed_mb']} MB，含 {len(info['removed'])} 个文件）")
 
-    # 先登记再写备注：--register 新生成的 ID 也能在同一句命令里直接备注
     if args.register:
         try:
             saved = model_admin.register_local_model(
@@ -821,21 +820,9 @@ def cmd_models(args: argparse.Namespace) -> int:
             return 2
         if saved.get("already_in_catalog"):
             print(f"[ok] {os.path.basename(args.register)} 本来就在目录里（{saved['id']}），"
-                  f"直接 --note {saved['id']}=说明 更合适")
+                  f"不用重复登记")
         else:
             print(f"[ok] 已登记本地模型 {saved['id']} -> {saved['path']}")
-
-    for item in args.note:
-        model_id, _, text = str(item).partition("=")
-        if not model_id.strip() or "=" not in str(item):
-            print(f"[error] --note 要写成 模型ID=备注文字，收到 {item}")
-            return 2
-        try:
-            saved = model_admin.set_model_note(model_id.strip(), text)
-        except KeyError as exc:
-            print(f"[error] {exc}")
-            return 2
-        print(f"[ok] 已备注 {saved['id']}：{saved['note'] or '（已清空）'}")
 
     for model_id in args.forget:
         try:
@@ -873,7 +860,7 @@ def cmd_models(args: argparse.Namespace) -> int:
         return 1 if failed else 0
 
     print(f"姿态权重目录：{os.path.abspath(model_admin.weights_dir())}")
-    print(f"模型登记表：  {payload['model_config_path']}（登记路径、默认模型、备注、下载记录）")
+    print(f"模型登记表：  {payload['model_config_path']}（登记路径、默认模型、下载记录）")
     print(f"API Key 文件：{payload['secrets_path']}（Key 只存这里，配置里只留引用名）")
 
     if args.browse or args.catalog:
@@ -919,7 +906,7 @@ def _model_size(row: dict) -> str:
 
 
 def _model_hints(row: dict) -> str:
-    """备注行之外的临时提示：默认标记、半截文件、不兼容原因。"""
+    """一行提示：默认标记、半截文件残留、与数据集不兼容的原因。"""
     hints: List[str] = []
     if row.get("default"):
         hints.append("默认")
@@ -931,7 +918,7 @@ def _model_hints(row: dict) -> str:
 
 
 def _print_model_rows(payload: dict, args: argparse.Namespace, model_admin) -> None:
-    """按能力分组打印统一清单：中文名、状态、体积、最后使用、备注。"""
+    """按能力分组打印统一清单：中文名、状态、体积、最后使用。"""
     rows = payload.get("models") or []
     if args.capability:
         rows = [row for row in rows if row.get("capability") == args.capability]
@@ -941,17 +928,13 @@ def _print_model_rows(payload: dict, args: argparse.Namespace, model_admin) -> N
             continue
         print(f"\n{model_admin.capability_label(capability)}")
         print(f"{_pad('模型 ID', 18)}{_pad('中文名', 22)}{_pad('状态', 12)}"
-              f"{_pad('体积', 14)}{_pad('最后使用', 20)}备注 / 提示")
+              f"{_pad('体积', 14)}{_pad('最后使用', 20)}提示")
         for row in group:
             line = (f"{_pad(row.get('id', ''), 18)}{_pad(row.get('display_name', ''), 22)}"
                     f"{_pad(row.get('status_label', ''), 12)}{_pad(_model_size(row), 14)}"
                     f"{_pad(row.get('last_used') or '-', 20)}")
-            hints = _model_hints(row)
-            print(line + (hints or (row.get("note") or "-")))
-            if row.get("note") and hints:
-                print(" " * 76 + "备注：" + str(row["note"]))
+            print(line + (_model_hints(row) or "-"))
     print("\n看单个模型的完整中文说明：models --info <模型 ID>")
-    print("写备注说明：            models --note <模型 ID>=说明")
     print("看可下载目录：          models --browse")
 
 
@@ -1015,10 +998,10 @@ def _print_catalog(payload: dict) -> None:
               f" ｜ 速度：{row.get('speed') or '未标注'}"
               f" ｜ 关键点：{row.get('num_keypoints', 17)} 个（{row.get('keypoint_set') or '未标注'}）"
               f" ｜ 精度：{params}{accuracy if accuracy else '，精度官方未列明'}")
-        if row.get("note"):
-            print(f"  备注：{row['note']}")
         print(f"  下载：python -m autolabel models --download-weight {row.get('filename')}")
-    print("\n下载完成后回到「导入素材」的模型下拉框即可选用。")
+    print("\n这里是姿态精选目录。其余任务（目标检测 / 实例分割 / 旋转框 / 图像分类）连同官方"
+          "完整 160 档，用 models --search <关键词> 找；界面上把「只看已下载」关掉看的是同一份。")
+    print("下载完成后回到「导入素材」的模型下拉框即可选用。")
 
 
 def _print_model_detail(row: dict, model_admin) -> None:
@@ -1042,8 +1025,10 @@ def _print_model_detail(row: dict, model_admin) -> None:
         ("最后使用", row.get("last_used") or "还没用过"),
         ("兼容性", "与当前数据集兼容" if row.get("compatible", True)
          else "；".join(row.get("compatibility_reasons") or ["不兼容"])),
-        ("备注说明", row.get("note") or "（空）"),
     ]
+    if str(row.get("capability")) == "vlm":
+        # 多模态配置那句备注写在 vlm.json 的 remark 里，是配置本身的一部分
+        fields.append(("备注", row.get("note") or "（空）"))
     if row.get("url"):
         fields.append(("下载地址", f"{row['url']}（镜像 {row.get('mirror') or '直连'}）"))
     if row.get("sha256"):
@@ -2096,8 +2081,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--task", default="", help="配合 --search：只看一类任务 "
                                              "pose | detect | segment | obb | classify")
     p.add_argument("--remote", action="store_true", help="配合 --search：连 GitHub 上的自制权重一起搜（要联网）")
-    p.add_argument("--note", action="append", default=[], metavar="模型ID=说明",
-                   help="给模型写备注说明，可重复；说明留空即清空")
     p.add_argument("--register", metavar="路径", help="登记一个本地模型/权重文件（只记路径，不动文件）")
     p.add_argument("--id", default="", help="配合 --register：指定模型 ID，默认取文件名")
     p.add_argument("--display-name", default="", help="配合 --register：模型中文名")

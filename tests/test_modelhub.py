@@ -1,4 +1,4 @@
-"""模型目录与离线搜索：字段完整性、中文搜索、联网降级、下载转调。
+"""模型目录与离线搜索：字段完整性、官方完整清单、中文搜索、联网降级、下载转调。
 
 联网那几条全部 monkeypatch 掉 ``urllib.request.urlopen``，测试不碰真实网络。
 """
@@ -118,25 +118,75 @@ def test_pose_entries_are_carried_over_verbatim(weights):
         assert row["num_keypoints"] == 17 and "COCO-17" in row["class_note"]
 
 
-def test_catalog_covers_all_tasks(weights):
-    rows = modelhub.catalog()
-    assert len(rows) == len(models.PRESET_CATALOG) + len(modelhub.EXTRA_CATALOG) == 43
-    counts = {task: sum(1 for row in rows if row["task"] == task) for task in modelhub.TASK_VALUES}
-    # detect/segment 里含开放词表那几档（YOLO-World 两档 + worldv2、YOLOE 三档）：
-    # 它们的类别表不是权重自带的，但任务型照旧归在 detect / segment 下
-    assert counts == {"pose": 13, "detect": 17, "segment": 8, "obb": 3, "classify": 2}
+def test_catalog_covers_every_official_release(weights):
+    """官方 release 里的每一档都要在目录里。
+
+    以前目录只有精选的 43 条，用户自己下的 ``yolo26x.pt`` 根本搜不到，
+    界面就成了「明明有这一档，搜索却说没有」。
+    """
+    rows = {row["filename"].lower(): row for row in modelhub.catalog()}
+    missing = [name for name, _ in modelhub.WIDE_MANIFEST if name.lower() not in rows]
+    assert missing == []
+    assert len(rows) == len(modelhub.WIDE_MANIFEST) == 160
+    counts = {task: sum(1 for row in rows.values() if row["task"] == task)
+              for task in modelhub.TASK_VALUES}
+    # 五个任务都得有成体量：只堆检测档等于其它任务照旧搜不到
+    assert all(counts[task] >= 10 for task in modelhub.TASK_VALUES), counts
+    assert modelhub.catalog() == list(modelhub.catalog(""))
+
+
+def test_wide_entries_are_renderable_but_do_not_invent_numbers(weights):
+    """宽目录条目：界面要能直接渲染，但官方没给的精度/参数一律留空。"""
+    rows = {row["filename"]: row for row in modelhub.catalog() if not row.get("curated")}
+    assert rows, "宽目录一条都没有，说明合并没生效"
+    for filename, size in modelhub.WIDE_MANIFEST:
+        row = rows.get(filename)
+        if row is None:
+            continue                        # 与精选条目同名的以精选为准，这里不重复查
+        assert row["expected_bytes"] == size, filename
+        assert not row["display_name"].endswith(".pt"), filename       # 不许拿文件名当中文名
+        assert row["intro"] and row["speed"] and row["recommended_for"], filename
+        assert row["class_note"], filename
+        assert row["score"] is None and row["params_m"] is None, filename
+
+
+def test_curated_entries_win_over_wide_templates(weights):
+    """同名的宽目录条目不能盖掉手写说明的精选条目。"""
+    curated = {row["filename"] for row in modelhub.catalog() if row.get("curated")}
+    assert len(curated) == len(models.PRESET_CATALOG) + len(modelhub.EXTRA_CATALOG)
+    assert {row["filename"] for row in modelhub.EXTRA_CATALOG} <= curated
+    by_name = {row["filename"]: row for row in modelhub.catalog()}
+    assert by_name["yolo11n.pt"]["score"] == 39.5          # 精选里核过的 mAP 还在
+
+
+def test_every_wide_entry_parses_family_and_size(weights):
+    """每一档都要推得出系列和尺寸档，否则中文名会变成文件名。"""
+    for filename, _ in modelhub.WIDE_MANIFEST:
+        stem = filename[:-3]
+        assert modelhub._wide_family(stem), filename
+        assert modelhub._wide_size(stem), filename
+
+
+def test_just_downloaded_weight_is_searchable(weights):
+    """用户本机真有 yolo26x.pt：搜得到才谈得上「模型搜索全」。"""
+    names = {row["filename"] for row in modelhub.search("yolo26x")}
+    assert {"yolo26x.pt", "yolo26x-pose.pt", "yolo26x-seg.pt"} <= names
 
 
 def test_open_vocab_rows_say_the_class_table_is_yours(weights):
-    """开放词表那几档必须自己说清"类别自己填"，否则用户会按 COCO-80 理解它。"""
+    """开放词表那几档必须自己说清「类别自己填」，否则用户会按 COCO-80 理解它。"""
     rows = [row for row in modelhub.catalog()
             if "-world" in row["filename"] or row["filename"].startswith("yoloe")]
-    assert len(rows) == 6
+    assert len(rows) >= 20        # 官方这两条系列本身就几十档
     for row in rows:
         assert "开放词表" in row["class_note"]
         assert row["downloadable"] and row["task"] in ("detect", "segment")
         # 精度这一列留空：官方数字量的是 LVIS，和本目录里 COCO 的 mAP 不是一把尺子
         assert row["score"] is None
+        if row["task"] == "segment":
+            # 1.4.8 起分割权重的轮廓真的会落盘，别再说「多边形暂不落盘」
+            assert "不落盘" not in row["class_note"], row["filename"]
+            assert "轮廓" in row["class_note"], row["filename"]
     hosts = {row["homepage"] for row in rows}
     assert "https://docs.ultralytics.com/models/yolo-world/" in hosts
     assert "https://docs.ultralytics.com/models/yoloe/" in hosts
@@ -262,7 +312,8 @@ def test_search_chinese_task_words(weights, query, task, expected):
     rows = modelhub.search(query)
     assert rows and all(row["task"] == task for row in rows), query
     if expected is not None:
-        assert {row["filename"] for row in rows} == expected
+        # 宽目录补齐后同一任务词命中的档位多了一倍，这里只保证精选那几档一定在
+        assert expected <= {row["filename"] for row in rows}, query
 
 
 def test_search_exact_filename_beats_everything(weights):
@@ -279,17 +330,21 @@ def test_search_version_numbers(weights, query):
     rows = modelhub.search(query)
     assert rows and query in rows[0]["filename"]
     if query == "12":
-        assert [row["filename"] for row in rows] == ["yolo12n.pt", "yolo12s.pt"]
+        assert [row["filename"] for row in rows[:5]] == [
+            "yolo12n.pt", "yolo12s.pt", "yolo12l.pt", "yolo12m.pt", "yolo12x.pt"]
 
 
 def test_search_size_words_match_the_size_not_the_letter(weights):
     for query in ("n", "nano"):
         rows = modelhub.search(query)
         assert {row["filename"] for row in rows[:len(NANO_FILES)]} == set(NANO_FILES)
-    # x 档现在多了开放词表的三档（YOLO-World x / worldv2、YOLOE-26x-seg）
-    assert [row["filename"] for row in modelhub.search("x")] == [
+    # x 档：精选里那七档仍排在最前（写好了说明的在前），后面才跟着宽目录的其它 x 档
+    assert [row["filename"] for row in modelhub.search("x")][:7] == [
         "yolo11x-pose.pt", "yolov8x-pose.pt", "yolo11x.pt", "yolov8x.pt",
         "yolov8x-world.pt", "yolov8x-worldv2.pt", "yoloe-26x-seg.pt"]
+    # 尺寸词按档位匹配，不能把 l 档、c 档混进来（文件名里有 x 不算）
+    assert all(modelhub._size_of(row["filename"][:-3]) == "x"
+               for row in modelhub.search("x")), [row["filename"] for row in modelhub.search("x")]
 
 
 def test_search_speed_hint_prefers_fastest(weights):

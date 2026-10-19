@@ -1,7 +1,11 @@
 "use strict";
 
-// 二级模块「模型管理」：姿态权重的查看/下载/删除、模型目录备注、
+// 二级模块「模型管理」：官方模型目录的搜索与下载、本机权重的查看/删除、
 // 本地权重登记，以及多模态大模型（本地服务 / 云端 API）配置与连通性验证。
+//
+// 页面上的两个列表各管一件事，别再混：
+//   「模型目录」= 能下什么（默认只显示本机已下载的那几档，要看官方全量就关掉开关或搜一下）；
+//   「本机权重」= models/ 里真有什么文件（未下载的预置档不占这里的行）。
 
 const modelState = {
   weights: [], weightsDir: "", downloads: {}, presets: [], profiles: [], defaultId: null,
@@ -12,6 +16,9 @@ const modelState = {
   // loaded：成功拿到过一次目录结果；没拿到之前只能退回本机登记表粗筛
   hub: { ok: true, loaded: false, query: "", task: "", local: [], results: [], note: "",
          error: "", remote_state: "skipped" },
+  // installedOnly：目录默认只摆本机已下载的模型。官方一摆就是一百六十档，
+  // 全列出来真正能点的下载按钮反而找不到；要看全量随时能关。
+  installedOnly: true,
   // 目标检测库当前用的权重：存在数据集 .autolabel/detect/prefs.json，跟姿态默认是两件事
   detectPrefs: {},
 };
@@ -28,7 +35,7 @@ function registryRows() {
     capability: "pose", ready: Boolean(w.ready), size_mb: w.size_mb || 0, expected_mb: 0,
     status: w.ready ? "available" : (w.size_mb ? "incomplete" : "missing"),
     status_label: w.ready ? "可用" : (w.size_mb ? "文件不完整" : "未下载"),
-    compatible: true, compatibility_reasons: [], note: "", description: "",
+    compatible: true, compatibility_reasons: [], description: "",
   }));
 }
 
@@ -128,14 +135,22 @@ function syncWeightRows() {
   }
 }
 
+/** 本机权重 = models/ 里真存在的文件（含下载中、半截残留）；未下载的预置档不在这里。 */
+function localWeightRows() {
+  return (modelState.weights || []).filter((w) => w.ready || (w.size_mb || 0) > 0
+    || (w.partial_mb || 0) > 0 || modelState.downloads[w.name]);
+}
+
 function renderWeights() {
   syncWeightRows();
   const box = $("model-weights");
+  const rows = localWeightRows();
   box.innerHTML = "";
-  if (!modelState.weights.length) {
-    box.innerHTML = '<div class="batch-empty muted small">权重目录里什么都没有，点「下载」拉一个开始。</div>';
+  if (!rows.length) {
+    box.innerHTML = '<div class="batch-empty muted small">models/ 里还没有权重文件：'
+      + '在上面「模型目录」里搜一个（yolo11n.pt 只有 5 MB），点「下载」就能用。</div>';
   }
-  for (const info of modelState.weights) {
+  for (const info of rows) {
     const task = modelState.downloads[info.name] || null;
     const running = Boolean(task && task.stage === "running");
     const state = running
@@ -148,16 +163,23 @@ function renderWeights() {
             ? { cls: "failed", text: "不完整，仅 " + mb(info.size_mb) + " MB" }
             : { cls: "", text: "未下载" };
     const deletable = info.size_mb > 0 || info.partial_mb > 0;
+    const weightTask = info.task || "";
+    const openVocab = String(info.task_name || "").includes("开放词表");
     const row = document.createElement("div");
     row.className = "model-row" + (modelState.selected.has(info.name) ? " selected" : "");
     row.innerHTML = `
       <input type="checkbox" ${modelState.selected.has(info.name) ? "checked" : ""} ${deletable ? "" : "disabled"}>
       <div class="model-main">
-        <div class="model-name"></div>
+        <div class="model-title-line">
+          <span class="badge task-badge ${TASK_BADGE_CLASS[weightTask] || "module"}"></span>
+          <span class="model-name"></span>
+          <span class="chip ${openVocab ? "" : "hidden"}">开放词表·填词</span>
+        </div>
         <div class="muted small model-meta"></div>
       </div>
       <span class="badge ${state.cls}">${state.text}</span>
       <button class="dl">${running ? "下载中…" : info.ready ? "重新下载" : "下载"}</button>`;
+    row.querySelector(".task-badge").textContent = TASK_LABEL[weightTask] || "任务未知";
     row.querySelector(".model-name").textContent = info.name;
     const lead = info.custom ? "自定义权重 · "
       : MODEL_HINTS[info.name] ? MODEL_HINTS[info.name] + " · " : "";
@@ -175,12 +197,19 @@ function renderWeights() {
     button.onclick = (e) => { e.preventDefault(); downloadWeight(info.name, Boolean(info.ready)); };
     box.appendChild(row);
   }
-  const ready = modelState.weights.filter((w) => w.ready);
-  const total = modelState.weights.reduce((a, w) => a + (w.size_mb || 0), 0);
-  $("model-weight-note").textContent = `已就绪 ${ready.length}/${modelState.weights.length} · 合计 ${total.toFixed(1)} MB`;
-  const chosen = modelState.weights.filter((w) => modelState.selected.has(w.name));
+  const ready = rows.filter((w) => w.ready);
+  const total = ready.reduce((a, w) => a + (w.size_mb || 0), 0);
+  const tally = new Map();
+  for (const w of ready) {
+    const label = TASK_LABEL[w.task || ""] || "任务未知";
+    tally.set(label, (tally.get(label) || 0) + 1);
+  }
+  const parts = Array.from(tally, ([label, n]) => `${label} ${n}`).sort();
+  $("model-weight-note").textContent = `已就绪 ${ready.length} 个 · 合计 ${total.toFixed(0)} MB`
+    + (parts.length ? " · " + parts.join(" · ") : "");
+  const chosen = rows.filter((w) => modelState.selected.has(w.name));
   $("model-del-weight").disabled = !chosen.length;
-  $("model-all").checked = modelState.weights.length > 0 && chosen.length === modelState.weights.length;
+  $("model-all").checked = rows.length > 0 && chosen.length === rows.length;
 }
 
 async function downloadWeight(name, force) {
@@ -213,10 +242,11 @@ const TASK_BADGE_CLASS = {
 };
 // 这几个字段只有 /api/models 登记表里有，搜索结果要按文件名把它们并回来
 const REGISTRY_KEYS = ["ready", "status", "status_label", "size_mb", "partial_mb", "default",
-  "note", "last_used", "registered", "compatible", "compatibility_reasons", "map_pose",
+  "last_used", "registered", "compatible", "compatibility_reasons", "map_pose",
   "keypoint_set", "source", "source_label"];
-const MODEL_EMPTY_HINT = "本地目录没有匹配的权重。可以换个说法（分割 / 旋转框 / 骨骼 / 分类 / nano / v8），"
-  + "或打开「联网搜 GitHub」找社区权重；从 GitHub 下下来丢进 models/ 再点下面的「登记本地模型」也能用。";
+const MODEL_EMPTY_HINT = "本地目录没有匹配的权重。可以换个说法（分割 / 旋转框 / 骨骼 / 分类 / nano / v8）；"
+  + "也可以关掉「只看已下载」看官方完整目录，或打开「联网搜 GitHub」找社区权重——"
+  + "从 GitHub 下下来丢进 models/ 再点「登记本地模型」一样能用。";
 
 /** 搜索请求失败时的兜底：拿本机登记表粗筛一遍，列表不至于整块空白。 */
 function fallbackRows(query, task) {
@@ -298,23 +328,11 @@ function catalogStateText(row, isVlm) {
   return row.downloadable ? "未下载" : "需自行获取";
 }
 
-/** 备注框：改过才允许保存，Enter 直接存；取消登记只动登记表不删权重文件。 */
-function bindModelNote(row, noteInput, noteSave, forget) {
-  noteInput.value = row.note || "";
-  const sync = () => { noteSave.disabled = noteInput.value.trim() === String(row.note || "").trim(); };
-  // 启用条件只能绑在输入框上：绑在按钮自身的 change 永远不触发，备注会一直存不了
-  noteInput.oninput = sync;
-  noteInput.onchange = sync;
-  noteInput.onkeydown = (e) => {
-    if (e.key !== "Enter") return;
-    e.preventDefault();
-    if (!noteSave.disabled) saveModelNote(row.id, noteInput.value.trim());
-  };
-  noteSave.onclick = (e) => { e.preventDefault(); saveModelNote(row.id, noteInput.value.trim()); };
-  if (row.registered) {
-    forget.classList.remove("hidden");
-    forget.onclick = (e) => { e.preventDefault(); forgetLocalModel(row.id); };
-  }
+/** 「取消登记」只对本地登记进来的模型出现：内置目录项没有可取消的登记。 */
+function bindForget(row, button) {
+  if (!row.registered) { button.classList.add("hidden"); return; }
+  button.classList.remove("hidden");
+  button.onclick = (e) => { e.preventDefault(); forgetLocalModel(row.id); };
 }
 
 /** 目录卡片：任务标签 + 中文名 + 中文介绍 + 能标哪些类别 + 参数/体积/速度 + 下载/设为默认。 */
@@ -331,6 +349,7 @@ function catalogCard(row) {
         <span class="model-name"></span>
         <span class="chip ok installed-flag hidden">已在本机</span>
         <span class="chip detect-flag hidden">当前检测默认</span>
+        <button class="forget danger hidden">取消登记</button>
         <span class="muted small mono model-file"></span>
         <a class="home hidden" target="_blank" rel="noopener noreferrer">官方文档</a>
       </div>
@@ -338,12 +357,6 @@ function catalogCard(row) {
       <div class="muted small model-class-note hidden"></div>
       <div class="muted small model-meta"></div>
       <div class="progress model-progress hidden"><div class="bar"></div></div>
-      <div class="model-note-row">
-        <input type="text" class="note" spellcheck="false"
-          placeholder="备注说明：例如「只在内网机器下」「显存吃紧别用」">
-        <button class="note-save" disabled>保存备注</button>
-        <button class="forget danger hidden">取消登记</button>
-      </div>
     </div>
     <span class="badge state"></span>
     <button class="dl"></button>
@@ -385,9 +398,7 @@ function catalogCard(row) {
   q(".model-meta").textContent = facts.filter(Boolean).join(" ｜ ");
   q(".state").className = "badge state " + (MODEL_BADGE_CLASS[row.status] || "");
   q(".state").textContent = (row.default ? "默认 · " : "") + catalogStateText(row, isVlm);
-  // 备注只存得进登记表认识的模型（pose / vlm / custom_task），其余直接不显示这行
-  if (row.known) bindModelNote(row, q(".note"), q(".note-save"), q(".forget"));
-  else q(".model-note-row").classList.add("hidden");
+  bindForget(row, q(".forget"));
   const download = modelState.downloads[row.filename] || null;
   const running = Boolean(download && download.stage === "running");
   if (running && download.total) {
@@ -427,6 +438,32 @@ function catalogCard(row) {
   return el;
 }
 
+/** 只看已下载：默认只留本机已有的模型 + 多模态配置（那是配置，不是下载物）。
+ *
+ *  一旦用户开始搜关键词或筛任务，开关就地失效：那是「找一档下载」的动作，
+ *  这时候把没下载的挡掉，等于让用户搜了个寂寞。
+ */
+function visibleCatalogRows(rows) {
+  if (!modelState.installedOnly || String(modelState.query || "").trim() || modelState.filter)
+    return { shown: rows, hidden: 0 };
+  const shown = rows.filter((row) => row.installed || row.ready
+    || ["vlm", "custom_task"].includes(row.task));
+  return { shown, hidden: rows.length - shown.length };
+}
+
+function toggleInstalledOnly() {
+  modelState.installedOnly = !modelState.installedOnly;
+  renderCatalog();
+  syncInstalledOnlySwitch();
+}
+
+function syncInstalledOnlySwitch() {
+  const toggle = $("model-installed-only");
+  if (!toggle) return;
+  toggle.classList.toggle("on", Boolean(modelState.installedOnly));
+  toggle.setAttribute("aria-checked", modelState.installedOnly ? "true" : "false");
+}
+
 /** 「模型目录」区块主体：先渲染本地结果，再叠 GitHub 结果与搜索状态提示。 */
 function renderCatalog() {
   const box = $("model-catalog");
@@ -434,10 +471,12 @@ function renderCatalog() {
   const rows = catalogRows();
   const covered = new Set(rows.map((row) => String(row.id || "").toLowerCase()));
   const all = rows.concat(extraCatalogRows(covered));
+  const view = visibleCatalogRows(all);
+  modelState.hiddenCount = view.hidden;
   box.innerHTML = "";
-  for (const row of all) box.appendChild(catalogCard(row));
-  if (!all.length) box.innerHTML = `<div class="batch-empty muted small">${MODEL_EMPTY_HINT}</div>`;
-  renderCatalogNote(all);
+  for (const row of view.shown) box.appendChild(catalogCard(row));
+  if (!view.shown.length) box.innerHTML = `<div class="batch-empty muted small">${MODEL_EMPTY_HINT}</div>`;
+  renderCatalogNote(view.shown);
   renderGitHub();
   renderSearchNote();
 }
@@ -461,7 +500,10 @@ function renderCatalogNote(rows) {
   const head = String(modelState.query || "").trim() ? `匹配 ${rows.length} 个` : `共 ${rows.length} 个`;
   const detectDefault = String(modelState.detectPrefs.model || "");
   const tail = detectDefault ? ` · 检测默认 ${detectDefault}` : "";
-  note.textContent = head + (parts.length ? " · " + parts.join(" · ") : "") + tail;
+  // 被开关藏掉多少条必须说出来，否则「共 4 个」会被当成官方目录就只有 4 档
+  const hidden = Number(modelState.hiddenCount || 0);
+  const extra = hidden ? ` · 另有 ${hidden} 个未下载没显示（搜关键词或关掉「只看已下载」看全量）` : "";
+  note.textContent = head + (parts.length ? " · " + parts.join(" · ") : "") + tail + extra;
 }
 
 /** GitHub 栏：社区仓库级结果没有可下载地址，所以只给「打开 GitHub」和「复制仓库名」。 */
@@ -648,17 +690,6 @@ function setModelTask(task) {
   hubSearch({ immediate: true });
 }
 
-async function saveModelNote(id, note) {
-  try {
-    await postJson("/api/models/note", { id, note });
-  } catch (err) {
-    toast("备注保存失败：" + err.message, true);
-    return;
-  }
-  toast(note ? "备注已保存" : "备注已清空");
-  await refreshModels();
-}
-
 async function setModelDefault(id, capability) {
   try {
     await postJson("/api/models/default", { id, capability: capability || "" });
@@ -678,7 +709,6 @@ async function registerLocalModel() {
     data = await postJson("/api/models/local/add", {
       path,
       display_name: $("model-reg-name").value.trim(),
-      note: $("model-reg-note").value.trim(),
     });
   } catch (err) {
     toast("登记本地模型失败：" + err.message, true);
@@ -686,18 +716,17 @@ async function registerLocalModel() {
   }
   const saved = data.model || {};
   toast(saved.already_in_catalog
-    ? `${path} 本来就在目录里（${saved.id}），备注已写进去`
+    ? `${path} 本来就在目录里（${saved.id}），不用重复登记`
     : `已登记本地模型 ${saved.id}`);
   $("model-reg-path").value = "";
   $("model-reg-name").value = "";
-  $("model-reg-note").value = "";
   await refreshModels();
 }
 
 async function forgetLocalModel(id) {
   const ok = await confirmBox({
     title: "取消登记本地模型",
-    body: `只把 ${id} 从登记表里去掉，权重文件留在原地不动；要真删文件请到下面「姿态权重」里勾选删除。`,
+    body: `只把 ${id} 从登记表里去掉，权重文件留在原地不动；要真删文件请到下面「本机权重」里勾选删除。`,
     okLabel: "取消登记",
   });
   if (!ok) return;
@@ -971,6 +1000,8 @@ function modelCommands() {
     { label: "回工作台总览", tag: "工作台", run: () => { location.href = "/"; } },
     { label: "在模型目录里搜索", key: "/", tag: "模型目录", run: () => focusModelSearch() },
     { label: "联网搜 GitHub（开 / 关）", tag: "模型目录", run: () => toggleModelRemote() },
+    { label: modelState.installedOnly ? "看官方完整目录（含未下载）" : "只看本机已下载的模型",
+      tag: "模型目录", run: () => toggleInstalledOnly() },
     { label: "清空模型搜索", tag: "模型目录", run: () => clearModelSearch() },
     { label: "只看姿态估计权重", tag: "模型目录", run: () => setModelTask("pose") },
     { label: "只看实例分割权重", tag: "模型目录", run: () => setModelTask("segment") },
@@ -1013,6 +1044,9 @@ async function bootModels() {
   $("model-search-clear").onclick = (e) => { e.preventDefault(); clearModelSearch(); };
   // 联网检索默认关：开着之后每次搜索都要等 GitHub 几秒，本地搜不该被它拖慢
   $("model-remote").onclick = (e) => { e.preventDefault(); toggleModelRemote(); };
+  // 「只看已下载」默认开：一屏全是没下过的档位，真正能用的那几行反而要翻半天
+  $("model-installed-only").onclick = (e) => { e.preventDefault(); toggleInstalledOnly(); };
+  syncInstalledOnlySwitch();
   $("model-register").onclick = registerLocalModel;
   $("model-reg-path").onkeydown = (e) => { if (e.key === "Enter") registerLocalModel(); };
   $("model-download-new").onclick = () => {

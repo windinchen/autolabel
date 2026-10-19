@@ -52,6 +52,9 @@ FAMILY_DOCS: Dict[str, str] = {
     "yolov8": "https://docs.ultralytics.com/models/yolov8/",
     "yolo12": "https://docs.ultralytics.com/models/yolo12/",
     "yolo26": "https://docs.ultralytics.com/models/yolo26/",
+    "yolov10": "https://docs.ultralytics.com/models/yolov10/",
+    "yolov9": "https://docs.ultralytics.com/models/yolov9/",
+    "yolov5": "https://docs.ultralytics.com/models/yolov5/",
 }
 
 #: 类别表来源：界面直接显示，避免用户下完才发现类别表不是自己要的
@@ -75,7 +78,353 @@ OPEN_VOCAB_DOCS: Dict[str, str] = {
 OPEN_VOCAB_CLASS_NOTE = ("开放词表：类别不固定，标注时自己填英文词（想标什么填什么，"
                          "一次最多 80 个；中文不生效）")
 
+#: 分割那几档多补一句：轮廓由模型给，跟着框一起落盘（1.4.8 起界面还能拖点）
+OPEN_VOCAB_SEG_CLASS_NOTE = OPEN_VOCAB_CLASS_NOTE + "；分割权重会连轮廓一起落盘"
+
 SIZE_NAMES: Dict[str, str] = {"n": "nano", "s": "small", "m": "medium", "l": "large", "x": "xlarge"}
+
+# --------------------------------------------------------------------------- #
+# 官方完整清单（宽目录）
+# --------------------------------------------------------------------------- #
+
+#: ultralytics/assets v8.4.0 里本库跑得动的权重：文件名 + release 上的真实字节数。
+#: 精选目录只有几十条，用户自己下的 ``yolo26x.pt``、官方新出的 ``-objv1`` 词表档全都
+#: 搜不到，界面就成了「明明有这一档，搜索却说没有」。这里把官方每一档都收进来，
+#: ``-depth`` / ``-reid`` / ``-sem`` / ``-stereo3ddet`` 这类本库跑不通的分支不算。
+#: 字节数取自 release 的 asset 列表，「下载约多少 MB」直接用它，不必再逐个 HEAD。
+WIDE_MANIFEST: Tuple[Tuple[str, int], ...] = (
+    ("rtdetr-l.pt", 66511432),
+    ("rtdetr-x.pt", 135755662),
+    ("yolo11l-cls.pt", 28553700),
+    ("yolo11l-obb.pt", 53120908),
+    ("yolo11l-pose.pt", 53164402),
+    ("yolo11l-seg.pt", 56096965),
+    ("yolo11l.pt", 51387343),
+    ("yolo11m-cls.pt", 23487128),
+    ("yolo11m-obb.pt", 42415346),
+    ("yolo11m-pose.pt", 42459307),
+    ("yolo11m-seg.pt", 45400152),
+    ("yolo11m.pt", 40684120),
+    ("yolo11n-cls.pt", 5790624),
+    ("yolo11n-obb.pt", 5795654),
+    ("yolo11n-pose.pt", 6255593),
+    ("yolo11n-seg.pt", 6182636),
+    ("yolo11n.pt", 5613764),
+    ("yolo11s-cls.pt", 13630112),
+    ("yolo11s-obb.pt", 19934534),
+    ("yolo11s-pose.pt", 20373161),
+    ("yolo11s-seg.pt", 20669228),
+    ("yolo11s.pt", 19313732),
+    ("yolo11x-cls.pt", 59624868),
+    ("yolo11x-obb.pt", 118438668),
+    ("yolo11x-pose.pt", 118481010),
+    ("yolo11x-seg.pt", 125090821),
+    ("yolo11x.pt", 114636239),
+    ("yolo12l.pt", 53699086),
+    ("yolo12m.pt", 40904955),
+    ("yolo12n.pt", 5595063),
+    ("yolo12s.pt", 19006455),
+    ("yolo12x.pt", 119322638),
+    ("yolo26l-cls.pt", 28535928),
+    ("yolo26l-obb.pt", 57263057),
+    ("yolo26l-objv1-150.pt", 54105317),
+    ("yolo26l-objv1-seg.pt", 64758405),
+    ("yolo26l-pose.pt", 57995961),
+    ("yolo26l-seg.pt", 63700037),
+    ("yolo26l.pt", 53211173),
+    ("yolo26m-cls.pt", 23477398),
+    ("yolo26m-obb.pt", 48363653),
+    ("yolo26m-objv1-150.pt", 45141337),
+    ("yolo26m-objv1-seg.pt", 55804721),
+    ("yolo26m-pose.pt", 49036866),
+    ("yolo26m-seg.pt", 54750385),
+    ("yolo26m.pt", 44255705),
+    ("yolo26n-cls.pt", 5786434),
+    ("yolo26n-obb.pt", 5907357),
+    ("yolo26n-objv1-150.pt", 5975045),
+    ("yolo26n-objv1-seg.pt", 7185309),
+    ("yolo26n-pose.pt", 7878574),
+    ("yolo26n-seg.pt", 6719965),
+    ("yolo26n.pt", 5544453),
+    ("yolo26s-cls.pt", 13622082),
+    ("yolo26s-obb.pt", 21701632),
+    ("yolo26s-objv1-150.pt", 20872197),
+    ("yolo26s-objv1-seg.pt", 24002461),
+    ("yolo26s-pose.pt", 24151790),
+    ("yolo26s-seg.pt", 23467933),
+    ("yolo26s.pt", 20422725),
+    ("yolo26x-cls.pt", 59610168),
+    ("yolo26x-obb.pt", 126937426),
+    ("yolo26x-objv1-150.pt", 120006117),
+    ("yolo26x-objv1-seg.pt", 143707397),
+    ("yolo26x-pose.pt", 126242553),
+    ("yolo26x-seg.pt", 142129861),
+    ("yolo26x.pt", 118667365),
+    ("yolo_nas_l.pt", 344353024),
+    ("yolo_nas_m.pt", 260579692),
+    ("yolo_nas_s.pt", 87382203),
+    ("yoloe-11l-seg-pf.pt", 74264838),
+    ("yoloe-11l-seg.pt", 70982416),
+    ("yoloe-11m-seg-pf.pt", 63552937),
+    ("yoloe-11m-seg.pt", 60276714),
+    ("yoloe-11s-seg-pf.pt", 27948751),
+    ("yoloe-11s-seg.pt", 27803986),
+    ("yoloe-26l-seg-pf.pt", 94606901),
+    ("yoloe-26l-seg.pt", 79417413),
+    ("yoloe-26m-seg-pf.pt", 85631900),
+    ("yoloe-26m-seg.pt", 70443185),
+    ("yoloe-26n-seg-pf.pt", 16271345),
+    ("yoloe-26n-seg.pt", 11710443),
+    ("yoloe-26s-seg-pf.pt", 40003064),
+    ("yoloe-26s-seg.pt", 31072171),
+    ("yoloe-26x-seg-pf.pt", 193087541),
+    ("yoloe-26x-seg.pt", 171640453),
+    ("yoloe-v8l-seg-pf.pt", 110680879),
+    ("yoloe-v8l-seg.pt", 107405586),
+    ("yoloe-v8m-seg-pf.pt", 67509543),
+    ("yoloe-v8m-seg.pt", 65800690),
+    ("yoloe-v8s-seg-pf.pt", 31278303),
+    ("yoloe-v8s-seg.pt", 31135890),
+    ("yolov10b.pt", 41679663),
+    ("yolov10l.pt", 52425230),
+    ("yolov10m.pt", 33643667),
+    ("yolov10n.pt", 5860383),
+    ("yolov10s.pt", 16623111),
+    ("yolov10x.pt", 64395854),
+    ("yolov5l6u.pt", 172900538),
+    ("yolov5lu.pt", 106913919),
+    ("yolov5m6u.pt", 83003066),
+    ("yolov5mu.pt", 50589507),
+    ("yolov5n6u.pt", 9073082),
+    ("yolov5nu.pt", 5562759),
+    ("yolov5s6u.pt", 31053754),
+    ("yolov5su.pt", 18581255),
+    ("yolov5x6u.pt", 311943681),
+    ("yolov5xu.pt", 195132283),
+    ("yolov8l-cls.pt", 75193188),
+    ("yolov8l-human.pt", 90477711),
+    ("yolov8l-obb.pt", 89540998),
+    ("yolov8l-oiv7.pt", 88584203),
+    ("yolov8l-pose.pt", 89396617),
+    ("yolov8l-seg.pt", 92417004),
+    ("yolov8l-world-cc3m.pt", 95670372),
+    ("yolov8l-world.pt", 95667042),
+    ("yolov8l-worldv2-cc3m.pt", 94227937),
+    ("yolov8l-worldv2.pt", 94224632),
+    ("yolov8l.pt", 87792836),
+    ("yolov8m-cls.pt", 34285204),
+    ("yolov8m-human.pt", 54221735),
+    ("yolov8m-obb.pt", 53331094),
+    ("yolov8m-oiv7.pt", 52732835),
+    ("yolov8m-pose.pt", 53266977),
+    ("yolov8m-seg.pt", 54921020),
+    ("yolov8m-world.pt", 58610242),
+    ("yolov8m-worldv2.pt", 57233192),
+    ("yolov8m.pt", 52136884),
+    ("yolov8n-cls.pt", 5563076),
+    ("yolov8n-human.pt", 7059839),
+    ("yolov8n-obb.pt", 6567590),
+    ("yolov8n-oiv7.pt", 7226939),
+    ("yolov8n-pose.pt", 6832633),
+    ("yolov8n-seg.pt", 7071756),
+    ("yolov8n.pt", 6549796),
+    ("yolov8s-cls.pt", 12856196),
+    ("yolov8s-human.pt", 23973951),
+    ("yolov8s-obb.pt", 23267238),
+    ("yolov8s-oiv7.pt", 22986811),
+    ("yolov8s-pose.pt", 23513657),
+    ("yolov8s-seg.pt", 23914764),
+    ("yolov8s-world.pt", 27169314),
+    ("yolov8s-worldv2.pt", 25923032),
+    ("yolov8s.pt", 22588772),
+    ("yolov8x-cls.pt", 115090020),
+    ("yolov8x-obb.pt", 139564678),
+    ("yolov8x-oiv7.pt", 137887307),
+    ("yolov8x-pose-p6.pt", 199031868),
+    ("yolov8x-pose.pt", 139420105),
+    ("yolov8x-seg.pt", 144101612),
+    ("yolov8x-world.pt", 147961954),
+    ("yolov8x-worldv2.pt", 146355704),
+    ("yolov8x.pt", 136890692),
+    ("yolov9c-seg.pt", 56470235),
+    ("yolov9c.pt", 51794840),
+    ("yolov9e-seg.pt", 122212466),
+    ("yolov9e.pt", 117521038),
+    ("yolov9m.pt", 40993492),
+    ("yolov9s.pt", 15389259),
+    ("yolov9t.pt", 4969803),
+)
+
+#: 系列名在界面上的写法（``yolov8`` 要写成 ``YOLOv8``，别让用户看见小写文件名）
+WIDE_FAMILY_LABELS: Dict[str, str] = {
+    "yolo26": "YOLO26", "yolo12": "YOLO12", "yolo11": "YOLO11", "yolov10": "YOLOv10",
+    "yolov9": "YOLOv9", "yolov8": "YOLOv8", "yolov5": "YOLOv5",
+    "yoloe": "YOLOE", "rtdetr": "RT-DETR", "yolo_nas": "YOLO-NAS",
+}
+
+#: 一句话讲清这一代值不值得选。宽目录里一百三十多条，逐条手写不现实，但系列之间
+#: 必须说得不一样，否则整页看过去就是机器糊出来的。
+WIDE_FAMILY_INTRO: Dict[str, str] = {
+    "yolo26": "最新的 26 代：CPU 上比同档 8 代快一截，能导出的格式也更全，日常标注直接拿它当默认最省事。",
+    "yolo12": "12 代换了新的注意力写法，精度比 11 代再抬一点，代价是速度慢一些。",
+    "yolo11": "11 代用更少的参数换到接近上一代的精度，教程和导出工具都认它，是最省心的一代。",
+    "yolov10": "10 代把 NMS 后处理去掉了，模型直接给最终框，批量标注能省一段后处理时间。",
+    "yolov9": "9 代（c 是双重标注、e 是可编程梯度）精度和速度都在 8 代之上，机器扛得住再上。",
+    "yolov8": "8 代用的人最多，坑基本被踩平了，新权重加载不出问题时退回它最稳。",
+    "yolov5": "5 代的官方重构版（文件名末尾的 u），只有老工程要延续才选它，新项目不必回头。",
+    "rtdetr": "RT-DETR 是 Transformer 检测器，不走 NMS：遮挡和小目标比同档 YOLO 稳，"
+              "代价是显存和首帧加载都更重。",
+    "yolo_nas": "YOLO-NAS 的参数效率不错，但它不在 ultralytics 的加载路径里，"
+                "本库要先装 super-gradients 才拉得动，没装就别第一批下它。",
+    "yoloe": "YOLOE 是开放词表系列：类别不用提前训练，标注时现填英文词就行。",
+}
+
+#: 只有系列名不够——RT-DETR 的文件名里根本没有 yolo，``_family()`` 认不出来
+WIDE_DOCS: Dict[str, str] = {"rtdetr": "https://docs.ultralytics.com/models/rtdetr/"}
+
+#: 宽目录里的任务说法（``task_name`` 是官方口径，卡片标题这里用短说法）
+WIDE_TASK_SUFFIX: Dict[str, str] = {"detect": "目标检测", "segment": "实例分割",
+                                    "pose": "姿态", "obb": "旋转框检测", "classify": "图像分类"}
+
+#: 尺寸档：9 代用 c/e、10 代多一个 base、5 代有 tiny，SIZE_NAMES 那五档不够用
+WIDE_SIZE_NAMES: Dict[str, str] = dict(SIZE_NAMES, t="tiny", b="base",
+                                       c="condensed", e="extended")
+
+#: 每档尺寸值不值得选（同时喂给搜索的「快 / 精度 / 小」排序）
+WIDE_SIZE_NOTE: Dict[str, str] = {
+    "n": "这是这一代里最小的一档：几百毫秒一张，先跑通流程和大批量抽帧预筛最合算，"
+         "代价是小目标和重叠目标容易漏。",
+    "s": "第二小的那一档，速度还很快，精度比 nano 稳一些，机器一般就从这里起。",
+    "m": "速度和精度折中的那一档，日常标注从这里开始最省心。",
+    "l": "偏大的那一档，精度明显更好，机器得撑得住才行。",
+    "x": "这一代里最大最准的一档，慢和吃显存都是代价，只有精度优先才选它。",
+    "t": "tiny 档，比 nano 略大一点，是 5 代时代的小体积选择。",
+    "b": "base 档，10 代里为了精度舍得花时间的写法。",
+    "c": "condensed 档：9 代用双重标注压出来的同参数更准的一版。",
+    "e": "extended 档，9 代里最大最准的一版。",
+}
+WIDE_SPEED: Dict[str, str] = {"n": "最快", "t": "最快", "s": "快", "m": "中等", "b": "中等",
+                              "c": "中等", "l": "中等偏慢", "x": "慢（精度优先）", "e": "慢"}
+WIDE_RECOMMENDED: Dict[str, str] = {
+    "n": "先跑通流程 / 大批量预筛", "s": "机器一般、又想快一点", "m": "日常标注（速度精度都够用）",
+    "l": "想要更准、机器扛得住", "x": "精度优先、能等", "t": "老工程里的小体积档",
+    "b": "10 代里想要精度", "c": "9 代里性价比最高", "e": "9 代里精度最好",
+}
+
+#: 这些后缀改的是「类别从哪来」，介绍必须跟着换，否则用户会拿 COCO 的词表去填
+#: Objects365 的类别，白跑一轮。第二个字段是归组名：同一组只说最具体的那一条。
+WIDE_VARIANT_INTROS: Tuple[Tuple[str, str, str], ...] = (
+    ("-worldv2", "world", "文件名里的 v2 是把图文对齐重训过的那一版，同一个英文词比不带 v2 的召回更高。"),
+    ("-world", "world", "YOLO-World 是开放词表系列：类别不用提前训练，标注时自己填英文词。"),
+    ("-cc3m", "corpus", "末尾的 cc3m 表示用 CC3M 图文对训练的那一版，填描述性的英文词更容易召回。"),
+    ("-objv1", "vocab", "词表换成了 Objects365-v1 的 150 类：日常物品比 COCO-80 宽一圈，"
+                        "但这张词表是固定的，自己加词不生效。"),
+    ("-oiv7", "vocab", "词表换成了 Open Images V7 的 601 类：范围比 COCO-80 宽得多，"
+                       "填类别得按它的词表写。"),
+    ("-human", "vocab", "这一档只认「人」：数人流、做占位检测最省事，别的类别它给不出来。"),
+    ("-p6", "input", "p6 档的输入上限到 1152，远处小人的关键点比默认 640 稳，代价是慢一截、更吃显存。"),
+    ("-pf", "finetune", "末尾的 pf 是 part-frozen（只微调检测头），官方定位是拿来在你自己的数据上"
+                        "再练一程；直接拿去标注也能出框，精度按它原样算。"),
+    ("6u", "input", "末尾的 6 表示高分辨率输入那一版：小目标好些，速度慢一档。"),
+)
+WIDE_VARIANT_SUFFIX: Tuple[Tuple[str, str], ...] = (
+    ("-worldv2", "World v2"), ("-world", "World"), ("-objv1-150", "Objects365 词表"),
+    ("-objv1-seg", "Objects365 词表"), ("-oiv7", "Open Images 词表"), ("-human", "只认人"),
+    ("-pf", "再训练版"), ("-p6", "大输入"),
+)
+WIDE_CLASS_NOTES: Tuple[Tuple[str, str], ...] = (
+    ("-objv1", "类别表 Objects365-v1 的 150 类（固定词表，自己加词不生效；比 COCO-80 宽一圈）"),
+    ("-oiv7", "类别表 Open Images V7 的 601 类（固定词表，比 COCO-80 宽得多，填类别按它的词表写）"),
+    ("-human", "只认「人」这一类（模型自带单类：人流计数、占位检测够用，别的类别给不出）"),
+)
+
+
+def _wide_family(stem: str) -> str:
+    """宽目录条目的系列名；``yolo_nas``/``rtdetr`` 走不到 ``_family()`` 的正则，单独认。"""
+    low = str(stem or "").lower()
+    for name in ("rtdetr", "yolo_nas", "yoloe"):
+        if low.startswith(name):
+            return name
+    match = re.match(r"(yolov\d+|yolo\d+)", low)
+    return match.group(1) if match else ""
+
+
+def _wide_size(stem: str) -> str:
+    """宽目录条目的尺寸档：除 n/s/m/l/x，还要认 9 代的 c/e、10 代的 b、5 代的 ``s6u``。"""
+    low = str(stem or "").lower()
+    match = re.match(r"^yolov5([nmlsx])(?:6)?u$", low)
+    if match:
+        return match.group(1)
+    # 尺寸档前面一定跟着数字（``yolo26x``）或分隔符（``rtdetr-l``）：少了这条限制，
+    # ``yoloe-26x-seg`` 里 YOLOE 自己的那个 e 会被当成档位，文件名就编成 extended 了
+    match = re.search(r"\d([nmlsxtbce])(?:$|-)", low) or re.search(r"[-_]([nmlsxtbce])(?:$|-)", low)
+    return match.group(1) if match else ""
+
+
+def _wide_variant_texts(stem: str) -> List[str]:
+    """按文件名后缀取说明，同一归组只留最具体的那条（v2 不再重复讲一遍 World）。"""
+    low = str(stem or "").lower()
+    seen = set()
+    texts: List[str] = []
+    for marker, group, text in WIDE_VARIANT_INTROS:
+        if group in seen or marker not in low:
+            continue
+        seen.add(group)
+        texts.append(text)
+    return texts
+
+
+def _wide_class_note(stem: str, task: str) -> str:
+    """宽目录条目的「能标什么」：开放词表和换词表的几档必须单独说。"""
+    low = str(stem or "").lower()
+    if low.startswith("yoloe") or "-world" in low:
+        return OPEN_VOCAB_SEG_CLASS_NOTE if task == "segment" else OPEN_VOCAB_CLASS_NOTE
+    for marker, note in WIDE_CLASS_NOTES:
+        if marker in low:
+            return note
+    return CLASS_NOTES.get(task, "")
+
+
+def _wide_row(filename: str, expected_bytes: int) -> dict:
+    """官方宽目录里的一条：中文名、一句话介绍、体积/速度/适合谁全是推出来的。
+
+    精度和参数量官方没在 release 里给，一律留 ``None``，界面上就不显示这两项——
+    编一个数出来比不写更容易让人做错决定。
+    """
+    stem = filename[:-3] if filename.endswith(".pt") else filename
+    low = stem.lower()
+    family = _wide_family(stem)
+    size = _wide_size(stem)
+    task = task_of(filename) or "detect"
+    label = WIDE_FAMILY_LABELS.get(family) or stem
+    if family == "yoloe":
+        # 26 代写作 ``yoloe-26x``、8 代写作 ``yoloe-v8s``：版本号原样带进中文名
+        version = re.search(r"yoloe-([a-z]*\d+)", low)
+        if version:
+            label = f"{label}-{version.group(1)}"
+    size_name = WIDE_SIZE_NAMES.get(size, "")
+    base = f"{label}-{size_name}" if size_name else label
+    task_word = WIDE_TASK_SUFFIX.get(task, "检测")
+    if low.startswith("yoloe") or "-world" in low:
+        task_word = "开放词表" + task_word
+    suffix = next((text for marker, text in WIDE_VARIANT_SUFFIX if marker in low), "")
+    if suffix:
+        task_word = f"{task_word}（{suffix}）"
+    mb = max(1, round(int(expected_bytes) / 1048576))
+    notes = [WIDE_FAMILY_INTRO.get(family, ""), WIDE_SIZE_NOTE.get(size, ""),
+             *_wide_variant_texts(stem)]
+    intro = f"{base} {task_word}，下载约 {mb} MB。" + "".join(text for text in notes if text)
+    recommended = WIDE_RECOMMENDED.get(size, "官方完整清单里的一档，换精度时再试")
+    if family == "yolo_nas":
+        recommended = "装过 super-gradients 的机器"
+    row = _row(filename, f"{base} {task_word}", task, None, None, expected_bytes,
+               WIDE_SPEED.get(size, "中等"), intro, recommended,
+               class_note=_wide_class_note(stem, task))
+    row["curated"] = False
+    if WIDE_DOCS.get(family):
+        row["homepage"] = WIDE_DOCS[family]
+    return row
+
 
 # --------------------------------------------------------------------------- #
 # 目录条目
@@ -241,17 +590,17 @@ EXTRA_CATALOG: Tuple[dict, ...] = (
          "YOLOE 的 26 代 large 档，76 MB，开放词表 + 实例分割：既能现填英文词，"
          "也能不管词表当普通分割权重用。本库目前只落检测框，分割轮廓不写进标签文件。",
          "要开放词表又要较高分割质量",
-         class_note=OPEN_VOCAB_CLASS_NOTE + "；本库只落检测框，多边形暂不落盘"),
+         class_note=OPEN_VOCAB_SEG_CLASS_NOTE),
     _row("yoloe-26x-seg.pt", "YOLOE-xlarge 开放词表分割", "segment", 67.4, None, 171640453, "最慢（本目录内）",
          "YOLOE 这一代的顶配，164 MB，本目录里最占地方的一档。开放词表 + 分割 + "
          "提示微调（还有 -pf 的免提示版本）。要求冷门类别又要求质量时才值这个体积。",
          "冷门类别 + 高质量 + 机器很强",
-         class_note=OPEN_VOCAB_CLASS_NOTE + "；本库只落检测框，多边形暂不落盘"),
+         class_note=OPEN_VOCAB_SEG_CLASS_NOTE),
     _row("yoloe-11l-seg.pt", "YOLOE-11 large 开放词表分割", "segment", 33.1, None, 70982416, "中等",
          "YOLOE 的 11 代 large 档，68 MB，比 26 代那档参数少一半而用法完全一致。"
          "机器一般又想试开放词表分割，从这档开始比 26-x 划算。",
          "机器一般、想试开放词表分割",
-         class_note=OPEN_VOCAB_CLASS_NOTE + "；本库只落检测框，多边形暂不落盘"),
+         class_note=OPEN_VOCAB_SEG_CLASS_NOTE),
 )
 
 
@@ -273,8 +622,19 @@ def _pose_rows() -> List[dict]:
 
 
 def _base_rows() -> List[dict]:
-    """完整目录（不含本机安装状态）：姿态在前，其余任务按 EXTRA_CATALOG 的顺序跟在后面。"""
-    return _pose_rows() + [dict(row) for row in EXTRA_CATALOG]
+    """完整目录（不含本机安装状态）：手写说明的精选条目在前，官方宽目录补齐在后。
+
+    同名一律以精选为准：那几十条的中文介绍、参数量、mAP 是逐条核过的，
+    不能让宽目录里推出来的模板文案盖掉。
+    """
+    rows = _pose_rows() + [dict(row) for row in EXTRA_CATALOG]
+    for row in rows:
+        row.setdefault("curated", True)
+    taken = {str(row.get("filename") or "").lower() for row in rows}
+    for filename, expected_bytes in WIDE_MANIFEST:
+        if str(filename).lower() not in taken:
+            rows.append(_wide_row(filename, expected_bytes))
+    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -314,6 +674,15 @@ def _by_filename(filename: str, rows: Optional[Sequence[dict]] = None) -> Option
 # --------------------------------------------------------------------------- #
 # 对外：目录 / 任务判定
 # --------------------------------------------------------------------------- #
+
+
+def lookup(filename: str) -> Optional[dict]:
+    """按文件名查目录里的条目（含宽目录），查不到返回 ``None``。
+
+    磁盘上有个 ``yolo26x-pose.pt`` 时，界面得能说出它叫什么、能标什么，而不是把文件名
+    当中文名摆出来——那些说明已经在目录里写好了，就差一个公开的入口。
+    """
+    return _by_filename(filename)
 
 
 def catalog(task: str = "") -> List[dict]:

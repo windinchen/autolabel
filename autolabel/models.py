@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from .atomic import atomic_write_json
 
@@ -44,7 +44,6 @@ KIND_CLOUD = "cloud"
 MAX_PROFILES = 50
 MODEL_CONFIG_VERSION = 1
 MAX_DOWNLOAD_RECORDS = 50
-MAX_NOTE_CHARS = 500
 # 配置读写与删除并发进行时，保证同一份 JSON 不被后写覆盖
 _LOCK = threading.RLock()
 
@@ -285,10 +284,27 @@ def weight_names(dir_: Optional[str] = None) -> List[str]:
     return presets + [n for n in found if n not in presets]
 
 
+def task_hint(name: str) -> Tuple[str, str]:
+    """按文件名推「这是哪类权重」＋中文名，给界面贴类别标签用；认不出给空串。
+
+    ``modelhub`` 顶部 import 了本模块，所以这里必须延迟导入，不然两个模块互相等。
+    """
+    from .backends import open_vocab_kind
+    from .modelhub import TASK_LABELS, task_of
+
+    task = task_of(name)
+    kind = open_vocab_kind(name)
+    label = str(TASK_LABELS.get(task) or "")
+    if kind:
+        label = f"{label or '目标检测'} · 开放词表（{kind}）"
+    return task, label
+
+
 def weight_info(name: str, dir_: Optional[str] = None, dataset_kps: int = 0) -> dict:
-    """单个权重的状态：是否就绪、体积、来源、半截文件残留，外加目录里的中文说明与备注。"""
+    """单个权重的状态：是否就绪、体积、来源、半截文件残留，外加目录里的中文说明。"""
     dir_ = weights_dir() if dir_ is None else dir_
     info = dict(model_status(name, weights_dir=dir_))
+    info["task"], info["task_name"] = task_hint(name)
     path = str(info["path"])
     info["source"] = "disk" if os.path.isfile(path) else "preset"
     info["custom"] = _registry().get(name) is None
@@ -924,7 +940,7 @@ def _extract_models(body: str) -> List[str]:
 # 统一模型清单：内置目录 + 本地注册 + 多模态配置
 # --------------------------------------------------------------------------- #
 
-# 目录条目里允许被 configs/models.json 覆盖的字段（note/hidden 属于用户自己的标记）
+# 目录条目里允许被 configs/models.json 覆盖的字段（hidden 属于用户自己的标记）
 _OVERRIDABLE_KEYS = ("display_name", "capability", "origin", "filename", "params_m", "map_pose",
                      "expected_mb", "expected_bytes", "size_verified", "sha256", "num_keypoints",
                      "keypoint_set", "speed", "description", "recommended_for", "downloadable",
@@ -941,7 +957,7 @@ def normalize_model_id(value: str) -> str:
 
 def empty_model_config() -> dict:
     return {"version": MODEL_CONFIG_VERSION, "defaults": {}, "catalog": {}, "local": [],
-            "notes": {}, "downloads": [], "last_used": {}, "metadata": {}}
+            "downloads": [], "last_used": {}, "metadata": {}}
 
 
 def load_model_config(path: Optional[str] = None) -> dict:
@@ -957,7 +973,7 @@ def load_model_config(path: Optional[str] = None) -> dict:
         return config
     if not isinstance(data, dict):
         return config
-    for key in ("defaults", "catalog", "notes", "last_used", "metadata"):
+    for key in ("defaults", "catalog", "last_used", "metadata"):
         value = data.get(key)
         if isinstance(value, dict):
             config[key] = {str(k): v for k, v in value.items()}
@@ -1122,7 +1138,6 @@ class ModelRegistry:
     def catalog_downloadable(self) -> List[dict]:
         """「可下载模型目录」：带中文说明、预计体积和下载地址。"""
         config = self.load()
-        notes = config.get("notes") or {}
         last_used = config.get("last_used") or {}
         rows: List[dict] = []
         for row in self.catalog():
@@ -1131,7 +1146,6 @@ class ModelRegistry:
             item = self._file_state(row)
             item["url"] = weights_url(str(row["filename"]))
             item["mirror"] = _mirror_label()
-            item["note"] = str(notes.get(str(row["id"])) or "")
             item["last_used"] = str(last_used.get(str(row["id"])) or "")
             item["capability_label"] = capability_label(item.get("capability"))
             item["source_label"] = source_label(item.get("source"))
@@ -1160,7 +1174,6 @@ class ModelRegistry:
 
     # --- 多模态配置映射成统一行 ---
     def vlm_rows(self) -> List[dict]:
-        notes = self.load().get("notes") or {}
         last_used = self.load().get("last_used") or {}
         rows: List[dict] = []
         for profile in load_vlm()["profiles"]:
@@ -1200,7 +1213,8 @@ class ModelRegistry:
                 "status": STATUS_INCOMPATIBLE if failed else STATUS_AVAILABLE,
                 "checked_at": str(tested.get("checked_at") or ""),
                 "compatibility_reasons": reasons,
-                "note": str(notes.get(pid) or profile.get("remark") or ""),
+                # 多模态配置那句「备注」是 vlm.json 里的 remark，属于配置本身，不是模型备注
+                "note": str(profile.get("remark") or ""),
                 "last_used": str(last_used.get(pid) or ""),
             })
         for row in rows:
@@ -1279,16 +1293,17 @@ class ModelRegistry:
         """统一清单：内置目录 + 本地注册 + 多模态，每行带状态、备注、最后使用与兼容性。"""
         kps, ds_name = dataset_keypoints(dataset_root) if dataset_root else (0, "")
         config = self.load()
-        notes = config.get("notes") or {}
         last_used = config.get("last_used") or {}
         defaults = config.get("defaults") or {}
         metadata = config.get("metadata") or {}
+        listed = [self._file_state(row) for row in self.catalog()] + \
+                 [self._file_state(row) for row in self.local_rows()]
+        known = {normalize_model_id(str(row.get("id") or "")) for row in listed}
+        known |= {normalize_model_id(str(row.get("filename") or "")) for row in listed}
         rows: List[dict] = []
-        for base in [self._file_state(row) for row in self.catalog()] + \
-                    [self._file_state(row) for row in self.local_rows()]:
+        for base in listed + self._disk_rows(known):
             row = dict(base)
             row.setdefault("compatibility_reasons", [])
-            row["note"] = str(notes.get(row["id"]) or "")
             row["last_used"] = str(last_used.get(row["id"]) or "")
             row["metadata"] = dict(metadata.get(row["id"]) or {})
             row["default"] = defaults.get(str(row.get("capability"))) == row["id"]
@@ -1321,6 +1336,48 @@ class ModelRegistry:
             rows = [row for row in rows if row.get("capability") == capability]
         return rows
 
+    def _disk_rows(self, known: set) -> List[dict]:
+        """权重目录里已经有文件、但目录和登记表都不认识的那些。
+
+        症状很具体：用户刚把 ``yolo26x-pose.pt`` 下进 ``models/``，标注页的下拉框里
+        还是没有它——因为清单是按「我们认识哪些模型」列的，不是按磁盘上有什么列的。
+        文件既然在目录里就必须出现在清单里：任务按文件名推，中文名先用文件名顶着，
+        等官方目录补上说明再换。
+        """
+        rows: List[dict] = []
+        for name in weight_names(self.weights_root):
+            ident = normalize_model_id(name)
+            if not ident or ident in known:
+                continue
+            task, label = task_hint(name)
+            row = _blank_row(ident, name)
+            row["capability"] = task or CAPABILITY_POSE
+            row["origin"] = ORIGIN_ULTRALYTICS if task else ORIGIN_CUSTOM
+            row["downloadable"] = bool(task)
+            row["task_label"] = label
+            from .modelhub import lookup        # 延迟导入：modelhub 顶部 import 了本模块
+
+            entry = lookup(name) or {}
+            # 目录里已经写好中文说明的（含官方完整清单）一律沿用，别让文件名顶替说明
+            for key in ("display_name", "description", "recommended_for", "speed",
+                        "num_keypoints", "keypoint_set"):
+                if entry.get(key) not in (None, "", 0):
+                    row[key] = entry[key]
+            if not entry:
+                row["description"] = (
+                    f"权重目录里的{label or '未识别'}权重，官方目录还没写它的中文说明；"
+                    f"参数与精度以文件自带元数据为准。" if task
+                    else _blank_row(ident, name)["description"])
+                row["recommended_for"] = ("本机已有，直接可用" if task
+                                          else "自定义训练/二次微调的权重")
+            state = self._file_state(row)
+            # 文件名候选里混着「目录预置但磁盘上根本没有」的那些，这里必须按文件过滤：
+            # 预置档一旦漏进「本机已有」，标注页会出现一个点开就跑不动的下拉项
+            if not state.get("exists") and not state.get("partial_mb"):
+                continue
+            rows.append(state)
+        return rows
+
     def describe(self, model_id: str, dataset_root: str = "") -> dict:
         """单个模型的中文详情，找不到抛 ``KeyError``。"""
         key = normalize_model_id(model_id)
@@ -1344,7 +1401,7 @@ class ModelRegistry:
                 and any("关键点" in r for r in verdict["compatibility_reasons"]):
             row["status"] = STATUS_INCOMPATIBLE
         keep = ("model_id", "display_name", "capability", "capability_label", "origin",
-                "origin_label", "status", "status_label", "description",
+                "origin_label", "status", "status_label", "description",  # 没有 note：备注说明已取消
                 "recommended_for", "params_m", "map_pose", "expected_mb", "expected_bytes",
                 "num_keypoints", "keypoint_set", "speed", "downloadable", "preset_visible",
                 "compatible", "compatibility_reasons")
@@ -1353,49 +1410,14 @@ class ModelRegistry:
         row["origin_label"] = origin_label(row.get("origin"))
         row["status_label"] = status_label(row.get("status"))
         config = self.load()
-        row["note"] = str((config.get("notes") or {}).get(str(row["id"])) or "")
         row["last_used"] = str((config.get("last_used") or {}).get(str(row["id"])) or "")
         out = {k: row[k] for k in keep if k in row}
         out["source_layer"] = row["source"]
         out["source_label"] = source_label(row["source"])
-        out["note"] = row["note"]
         out["last_used"] = row["last_used"]
         return out
 
     # --- 用户可写的部分 ---
-    def set_note(self, model_id: str, note: str) -> dict:
-        """给任意模型写备注说明（包括多模态配置）；空串等于清空。"""
-        entry = self.get_any(model_id)
-        if entry is None:
-            raise KeyError(f"未知模型: {model_id}（用 models --browse 看完整目录）")
-        note = str(note or "").strip()[:MAX_NOTE_CHARS]
-        with _LOCK:
-            config = self.load()
-            notes = dict(config.get("notes") or {})
-            if note:
-                notes[str(entry["id"])] = note
-            else:
-                notes.pop(str(entry["id"]), None)
-            config["notes"] = notes
-            self.save(config)
-            if entry.get("capability") == CAPABILITY_VLM:
-                # 多模态配置的备注沿用 vlm.json 里的 remark，界面上两处看到的是同一句话
-                self._sync_vlm_remark(str(entry["id"]), note)
-        return {"id": str(entry["id"]), "note": note}
-
-    def _sync_vlm_remark(self, profile_id: str, note: str) -> Optional[dict]:
-        """多模态配置的备注沿用原来的 ``remark`` 字段，避免两处各存一份。"""
-        vlm = load_vlm()
-        changed = False
-        for profile in vlm["profiles"]:
-            if str(profile.get("id")) == profile_id and str(profile.get("remark") or "") != note:
-                profile["remark"] = note[:200]
-                changed = True
-        if not changed:
-            return self.load()
-        save_vlm(vlm)
-        return self.load()
-
     def defaults(self) -> dict:
         """每类能力的默认模型；没显式设置时给一个稳妥的兜底。"""
         config = self.load()
@@ -1427,7 +1449,7 @@ class ModelRegistry:
         return self.defaults()
 
     def register_local(self, path: str, capability: str = CAPABILITY_POSE, display_name: str = "",
-                       note: str = "", origin: str = ORIGIN_CUSTOM, model_id: str = "",
+                       origin: str = ORIGIN_CUSTOM, model_id: str = "",
                        num_keypoints: int = 0) -> dict:
         """登记一个本地权重/模型：只记路径和说明，文件本身不动。"""
         raw = os.path.abspath(os.path.expanduser(str(path or "").strip()))
@@ -1445,10 +1467,9 @@ class ModelRegistry:
                              f"可能还在下载或已经损坏")
         existing_in_catalog = self.get(base)
         if existing_in_catalog is not None and str(existing_in_catalog.get("path", "")) in ("", raw):
-            # 已经在目录里（或直接放进权重目录）就不重复登记，写条备注更合适
-            self.set_note(str(existing_in_catalog["id"]), note)
+            # 本来就在目录里（或已经放进权重目录）就别再登记一遍，多一条只会多一处对不上
             return {"id": str(existing_in_catalog["id"]), "already_in_catalog": True,
-                    "registered": False, "note": note[:MAX_NOTE_CHARS]}
+                    "registered": False}
         ident = normalize_model_id(model_id) or os.path.splitext(base)[0]
         clash = self.get(ident)
         if clash is not None and str(clash.get("path", "")) != raw:
@@ -1465,30 +1486,23 @@ class ModelRegistry:
             rows.append(row)
             config["local"] = rows
             self.save(config)
-        if note:
-            self.set_note(ident, note)
-        return {"id": ident, "registered": True, "already_in_catalog": False, "path": raw,
-                "note": note[:MAX_NOTE_CHARS]}
+        return {"id": ident, "registered": True, "already_in_catalog": False, "path": raw}
 
-    def forget(self, model_id: str, keep_note: bool = False) -> dict:
+    def forget(self, model_id: str) -> dict:
         """取消登记本地模型：只删登记表里的条目，文件留在原地不动。"""
         ident = normalize_model_id(model_id)
         with _LOCK:
             config = self.load()
             rows = [item for item in (config.get("local") or []) if str(item.get("id")) != ident]
             if len(rows) == len(config.get("local") or []):
-                raise KeyError(f"「{ident}」不是登记过的本地模型；内置目录项请改用备注标注，"
-                               f"或在 {self.config_path} 的 catalog.{ident}.hidden 里隐藏")
+                raise KeyError(f"「{ident}」不是登记过的本地模型；内置目录项想不显示，"
+                               f"就在 {self.config_path} 的 catalog.{ident}.hidden 里隐藏")
             config["local"] = rows
             defaults = dict(config.get("defaults") or {})
             for key, value in list(defaults.items()):
                 if str(value) == ident:
                     defaults.pop(key, None)
             config["defaults"] = defaults
-            if not keep_note:
-                notes = dict(config.get("notes") or {})
-                notes.pop(ident, None)
-                config["notes"] = notes
             self.save(config)
         return {"id": ident, "forgotten": True}
 
@@ -1614,10 +1628,6 @@ def model_catalog() -> List[dict]:
 
 def describe_model(model_id: str, dataset_root: str = "") -> dict:
     return _registry().describe(model_id, dataset_root=dataset_root)
-
-
-def set_model_note(model_id: str, note: str) -> dict:
-    return _registry().set_note(model_id, note)
 
 
 def set_model_default(model_id: str, capability: str = "") -> dict:

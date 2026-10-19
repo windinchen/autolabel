@@ -1,4 +1,8 @@
-"""模型目录与登记表：中文说明、备注、默认值、本地登记、下载记录。"""
+"""模型目录与登记表：中文说明、默认值、本地登记、下载记录。
+
+备注说明这个功能在 1.4.9 取消了（目录里的中文说明就是唯一口径），这里留着几条
+断言钉住它别再长回来；多模态配置那句 remark 是配置本身，跟模型备注不是一回事。
+"""
 
 import io
 import json
@@ -137,41 +141,26 @@ def test_custom_weight_gets_a_placeholder_row(workspace):
 
 
 # --------------------------------------------------------------------------- #
-# 备注说明
+# 备注说明已取消
 # --------------------------------------------------------------------------- #
 
-def test_note_can_be_written_read_and_cleared(workspace):
-    saved = models.set_model_note("yolo11m-pose", "显存吃紧的机器别开这档")
-
-    assert saved == {"id": "yolo11m-pose", "note": "显存吃紧的机器别开这档"}
-    assert models.describe_model("yolo11m-pose")["note"] == "显存吃紧的机器别开这档"
-    assert read_json(workspace["model_config"])["notes"]["yolo11m-pose"] == "显存吃紧的机器别开这档"
-
-    assert models.set_model_note("yolo11m-pose", "")["note"] == ""
-    assert models.describe_model("yolo11m-pose")["note"] == ""
-    assert read_json(workspace["model_config"])["notes"] == {}
+def test_model_note_feature_is_gone(workspace):
+    """模型不再有「备注说明」：目录里写好的中文说明就是唯一口径。"""
+    assert not hasattr(models, "set_model_note")
+    assert not hasattr(models, "MAX_NOTE_CHARS")
+    assert "note" not in models.describe_model("yolo11m-pose")
+    assert "notes" not in models.empty_model_config()
 
 
-def test_note_accepts_weight_filename_and_unknown_id(workspace):
-    # 用户在界面里看到的是文件名，敲 ID 还是文件名都要能对上
-    assert models.set_model_note("yolo11n-pose.pt", "内网机器专用")["id"] == "yolo11n-pose"
-    with pytest.raises(KeyError, match="未知模型"):
-        models.set_model_note("does-not-exist", "x")
-
-
-def test_note_is_truncated_to_limit(workspace):
-    assert len(models.set_model_note("yolo11n-pose", "长" * 900)["note"]) == models.MAX_NOTE_CHARS
-
-
-def test_note_on_vlm_profile_also_writes_remark(workspace):
+def test_vlm_profile_keeps_its_own_remark(workspace):
+    """多模态配置那句备注写在 vlm.json 的 remark 里，那是配置的一部分，不受影响。"""
     saved = models.upsert_profile({"name": "本地桩", "provider": "ollama", "kind": "local",
                                   "base_url": "http://127.0.0.1:11434/v1",
-                                  "model": "qwen2.5vl:7b"})
-
-    models.set_model_note(saved["id"], "只在离线机上用")
+                                  "model": "qwen2.5vl:7b", "remark": "只在离线机上用"})
 
     row = next(r for r in models.list_models(capability=models.CAPABILITY_VLM)
                if r["id"] == saved["id"])
+
     assert row["note"] == "只在离线机上用"
     assert read_json(workspace["vlm_config"])["profiles"][0]["remark"] == "只在离线机上用"
 
@@ -216,15 +205,13 @@ def test_register_local_model_records_path_without_moving_file(workspace, tmp_pa
     source.parent.mkdir()
     source.write_bytes(zip_bytes(b"gym"))
 
-    saved = models.register_local_model(path=str(source), display_name="体操自研模型",
-                                        note="只标体操视频，别拿去标街舞")
+    saved = models.register_local_model(path=str(source), display_name="体操自研模型")
 
     assert saved["registered"] is True and saved["already_in_catalog"] is False
     assert saved["id"] == "gym-pose"
     row = models.describe_model("gym-pose")
     assert row["path"] == str(source) and os.path.isfile(row["path"])
     assert row["display_name"] == "体操自研模型"
-    assert row["note"] == "只标体操视频，别拿去标街舞"
     assert row["registered"] is True
     assert row["source"] == models.SOURCE_LOCAL and row["source_label"] == "本地"
 
@@ -235,15 +222,17 @@ def test_register_local_model_records_path_without_moving_file(workspace, tmp_pa
         models.describe_model("gym-pose")
 
 
-def test_register_local_model_on_catalog_weight_only_writes_note(workspace):
+def test_register_local_model_on_catalog_weight_says_it_is_already_listed(workspace):
+    """已经在目录里的权重不重复登记：多一条只会多一处对不上。"""
     path = put_weight(workspace, "yolo11n-pose.pt")
 
-    saved = models.register_local_model(path=path, note="这台机器已经下好了")
+    saved = models.register_local_model(path=path)
 
     assert saved["already_in_catalog"] is True and saved["registered"] is False
     assert saved["id"] == "yolo11n-pose"
-    assert models.describe_model("yolo11n-pose")["note"] == "这台机器已经下好了"
-    assert read_json(workspace["model_config"])["local"] == []
+    # 备注取消后这条路径根本不写盘：没登记成功就不该凭空多出一份配置
+    assert not os.path.exists(workspace["model_config"]) or \
+        read_json(workspace["model_config"])["local"] == []
 
 
 @pytest.mark.parametrize("name,data,match", [
@@ -287,7 +276,6 @@ def test_forget_refuses_catalog_entries_and_clears_default(workspace, tmp_path):
     models.forget_model(saved["id"])
 
     assert read_json(workspace["model_config"])["defaults"] == {}
-    assert read_json(workspace["model_config"])["notes"] == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -418,16 +406,16 @@ def test_cli_browse_prints_catalog_with_download_commands(workspace, capsys):
     assert "YOLO11-nano 姿态" in out
     assert "最小的姿态权重" in out
     assert "models --download-weight yolo11n-pose.pt" in out
+    # 这 13 档只是姿态精选，不写清「其余去哪找」就会被当成目录的全部
+    assert "models --search" in out and "只看已下载" in out
 
 
-def test_cli_info_prints_detail_and_note(workspace, capsys):
-    models.set_model_note("yolo11x-pose", "4060 笔记本装不下")
-
+def test_cli_info_prints_detail(workspace, capsys):
     assert cli.main(["models", "--info", "yolo11x-pose"]) == 0
 
     out = capsys.readouterr().out
     assert "YOLO11-xlarge 姿态" in out
-    assert "备注说明" in out and "4060 笔记本装不下" in out
+    assert "备注" not in out            # 备注说明已经取消，别再打一行空值
     assert "下载地址" in out and "yolo11x-pose.pt" in out
     assert "（无文件）" in out and "不兼容" not in out
 
@@ -436,15 +424,13 @@ def test_cli_info_prints_detail_and_note(workspace, capsys):
     assert "SHA256" in detail and "约 2.9M" in detail and "mAP50-95" in detail
 
 
-def test_cli_note_default_and_register_roundtrip(workspace, tmp_path, capsys):
+def test_cli_default_and_register_roundtrip(workspace, tmp_path, capsys):
     source = tmp_path / "dance.pt"
     source.write_bytes(zip_bytes(b"dance"))
 
-    assert cli.main(["models", "--register", str(source), "--display-name", "街舞权重",
-                     "--note", "dance=只标街舞"]) == 0
+    assert cli.main(["models", "--register", str(source), "--display-name", "街舞权重"]) == 0
     printed = capsys.readouterr().out
     assert "已登记本地模型 dance" in printed
-    assert "已备注 dance：只标街舞" in printed
 
     assert cli.main(["models", "--default", "dance"]) == 0
     assert "默认模型 -> dance" in capsys.readouterr().out
@@ -452,13 +438,16 @@ def test_cli_note_default_and_register_roundtrip(workspace, tmp_path, capsys):
     assert cli.main(["models", "--forget", "dance"]) == 0
     assert "已取消登记 dance" in capsys.readouterr().out
 
-    assert cli.main(["models", "--note", "nope=没人认识它"]) == 2
+
+def test_cli_no_longer_accepts_note(workspace, capsys):
+    """``--note`` 这个参数已经删掉：留着它等于留一个没人读的字段。"""
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["models", "--note", "yolo11n-pose=随便写点什么"])
+    assert exit_info.value.code == 2      # argparse 认不出的参数直接退 2，不会走回 handler
+    assert "unrecognized arguments" in capsys.readouterr().err
 
 
-def test_cli_rejects_bad_note_syntax_and_capability(workspace, capsys):
-    assert cli.main(["models", "--note", "缺少等号"]) == 2
-    assert "要写成 模型ID=备注文字" in capsys.readouterr().out
-
+def test_cli_rejects_bad_capability_and_register(workspace, capsys):
     assert cli.main(["models", "--default", "yolo11n-pose", "--capability", "dance"]) == 2
     assert "能力只能是" in capsys.readouterr().out
 
@@ -480,16 +469,14 @@ def post(base, path, payload):
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
-def test_dataset_payload_ships_model_rows_with_chinese_docs(server, workspace):
-    base, _store = server
+def test_model_rows_ship_with_chinese_docs(server, workspace):
+    base, store = server
 
-    status, body = post(base, "/api/models/note", {"id": "yolo11m-pose", "note": "先别批量用"})
+    row = next(item for item in store.model_rows() if item["id"] == "yolo11m-pose")
 
-    assert status == 200 and body["ok"] is True
-    row = next(item for item in body["models"] if item["id"] == "yolo11m-pose") \
-        if "models" in body else models.describe_model("yolo11m-pose")
-    assert row["note"] == "先别批量用"
     assert len(row["description"]) > 20
+    assert "note" not in row            # 统一清单里不再带备注字段
+    assert base
 
 
 def test_api_note_default_local_add_and_forget(server, workspace, tmp_path):
@@ -498,10 +485,10 @@ def test_api_note_default_local_add_and_forget(server, workspace, tmp_path):
     source.write_bytes(zip_bytes(b"studio"))
 
     status, body = post(base, "/api/models/local/add",
-                        {"path": str(source), "display_name": "棚内权重", "note": "只用于棚拍"})
+                        {"path": str(source), "display_name": "棚内权重"})
     assert status == 200 and body["ok"] is True
     ident = body["model"]["id"]
-    assert any(row["id"] == ident and row["note"] == "只用于棚拍" for row in body["models"])
+    assert any(row["id"] == ident and row["display_name"] == "棚内权重" for row in body["models"])
 
     status, body = post(base, "/api/models/default", {"id": ident})
     assert status == 200 and body["defaults"]["ids"]["pose"] == ident
@@ -513,13 +500,14 @@ def test_api_note_default_local_add_and_forget(server, workspace, tmp_path):
     assert status == 404 and "未知对象" in body["error"]
 
 
-def test_api_rejects_unknown_model_note(server, workspace):
+def test_api_model_note_endpoint_is_gone(server, workspace):
+    """写备注的接口整条删掉了：留 404 而不是悄悄接受一个没人读的字段。"""
     base, _store = server
 
-    status, body = post(base, "/api/models/note", {"id": "ghost-pose", "note": "x"})
+    status, body = post(base, "/api/models/note", {"id": "yolo11m-pose", "note": "x"})
 
     assert status == 404
-    assert "未知对象" in body["error"]
+    assert "/api/models/note" in body["error"]
 
 
 def test_api_reports_dataset_compatibility(server, workspace, dataset):
@@ -529,3 +517,46 @@ def test_api_reports_dataset_compatibility(server, workspace, dataset):
 
     assert rows["yolo11n-pose"]["compatible"] is True
     assert rows["yolo11n-pose"]["status"] == models.STATUS_MISSING
+
+
+# --------------------------------------------------------------------------- #
+# 权重目录里真有的文件必须出现在清单里
+# --------------------------------------------------------------------------- #
+
+def test_unknown_weight_in_models_dir_joins_the_unified_list(workspace):
+    """自己练的权重拷进 models/ 就该被看见，不必先跑一遍「登记本地模型」。"""
+    put_weight(workspace, "studio-finetune.pt")
+
+    rows = {row["id"]: row for row in models.list_models()}
+
+    assert "studio-finetune" in rows, "清单只按「我们认识哪些模型」列，自己放进去的权重会凭空消失"
+    row = rows["studio-finetune"]
+    assert row["ready"] is True and row["status"] == models.STATUS_AVAILABLE
+    assert row["origin"] == models.ORIGIN_CUSTOM
+
+
+def test_catalog_weight_dropped_into_models_dir_is_listed_once(workspace):
+    """官方权重直接拷进目录也只有一条：同一文件出现两行，默认值就会指错。"""
+    put_weight(workspace, "yolo11n-pose.pt")
+
+    rows = [row for row in models.list_models() if row["id"] == "yolo11n-pose"]
+
+    assert len(rows) == 1, rows
+    assert rows[0]["ready"] is True
+
+
+def test_missing_preset_weights_are_never_listed_as_installed(workspace):
+    """预置档可以摆出来给人下载，但不能被当成「本机已有」——那是下载按钮的分界。"""
+    rows = models.list_models()
+
+    assert rows
+    assert not [row for row in rows if row["status"] == models.STATUS_AVAILABLE]
+
+
+def test_weight_rows_carry_the_task_label_the_badge_needs(workspace):
+    """「模型目录」那枚类别标签读的是 task/task_name，开放词表必须在这一步就说清。"""
+    pose = models.weight_info("yolo26x-pose.pt")
+    open_vocab = models.weight_info("yoloe-26x-seg.pt")
+
+    assert pose["task"] == "pose" and "姿态" in pose["task_name"]
+    assert open_vocab["task"] == "segment" and "开放词表" in open_vocab["task_name"]

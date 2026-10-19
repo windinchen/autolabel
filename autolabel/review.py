@@ -58,7 +58,6 @@ from .models import (
     list_models,
     register_local_model,
     set_model_default,
-    set_model_note,
     set_default,
     start_download,
     test_saved_profile,
@@ -772,10 +771,19 @@ class ReviewStore:
         from . import detect
 
         rows = detect.local_models()
-        return {"models": [row for row in rows if row["usable"]],
-                "unusable": [row for row in rows if not row["usable"]],
-                "prefs": detect.load_prefs(self.root),
-                "device": str((self.index.data.get("settings") or {}).get("device") or "auto")}
+        # 下拉框只摆「本机已经下好、且真能用在检测库」的权重。以前把没下载的预置权重
+        # 也列进来（选了会在跑的时候偷偷下载），结果是：几百 MB 的权重在一个不起眼的
+        # 下拉框里，用户点下批量才知道要下东西；刚下的模型反而看不见。现在下载统一走
+        # 「模型管理」页，这里只报已经能用的。
+        models = [row for row in rows if row["usable"] and row["installed"]]
+        unusable = [row for row in rows if not row["usable"] and row["installed"]]
+        payload = {"models": models, "unusable": unusable,
+                   "prefs": detect.load_prefs(self.root),
+                   "device": str((self.index.data.get("settings") or {}).get("device") or "auto")}
+        if not models:
+            payload["empty_note"] = ("本机还没有能用在检测库的权重：先去「模型管理」下载一个"
+                                     "（yolo11n.pt 只有 5 MB，几十秒就好）")
+        return payload
 
     def detect_model_classes(self, model: str, device: str = "") -> dict:
         """这个权重自带哪些类别（含中文名）——界面上「它能标什么」就看这里。"""
@@ -1135,10 +1143,6 @@ class ReviewStore:
         """统一模型清单（含中文说明、备注、兼容性与最后使用时间）。"""
         return list_models(dataset_root=self.root)
 
-    def save_model_note(self, model_id: str, note: str) -> dict:
-        """给某个模型写备注说明，空串表示清空。"""
-        return set_model_note(model_id, note)
-
     def save_model_default(self, model_id: str, capability: str = "") -> dict:
         return set_model_default(model_id, capability)
 
@@ -1149,7 +1153,6 @@ class ReviewStore:
             path=str(payload.get("path") or ""),
             capability=str(payload.get("capability") or "pose"),
             display_name=str(payload.get("display_name") or ""),
-            note=str(payload.get("note") or ""),
             origin=str(payload.get("origin") or "custom"),
             model_id=str(payload.get("id") or ""),
         )
@@ -1731,12 +1734,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     raise ValueError("没有指定要测试的配置")
                 self._send_json({"ok": True, "result": self.store.test_vlm_profile(profile_id),
                                  **self.store.models_payload()["vlm"]})
-            elif parsed.path == "/api/models/note":
-                model_id = str(payload.get("id") or "").strip()
-                if not model_id:
-                    raise ValueError("没有指定要备注的模型")
-                self._send_json({"ok": True, **self.store.save_model_note(
-                    model_id, str(payload.get("note") or ""))})
             elif parsed.path == "/api/models/default":
                 model_id = str(payload.get("id") or "").strip()
                 if not model_id:

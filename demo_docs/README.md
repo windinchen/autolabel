@@ -65,7 +65,7 @@ python3 -m autolabel detect  datasets/myset --export --out datasets/myset/export
 - 空标签文件代表背景图（负样本），导出默认把背景图比例压到 15% 以内（`--max-empty-ratio`）。
 - 上传的临时文件落在 `datasets/<名称>/.autolabel/uploads/`，任务成功后自动清理。
 - 后台标注与人工复核同时发生时，落盘采用"重新读盘 + 按图合并"，不会整体覆盖索引。
-- 权重与多模态大模型都在界面「模型管理」（快捷键 `M`）或 `autolabel models` 里管：`--browse` 浏览 13 档可下载模型的中文说明，`--note ID=说明` 写备注，`--default` 设默认，`--register` 登记仓库外的权重，详见 `08-模型管理.md`。
+- 权重与多模态大模型都在界面「模型管理」（快捷键 `M`）或 `autolabel models` 里管：`--search 关键词` 在官方完整目录（160 档）里搜，`--browse` 看姿态精选 13 档，`--default` 设默认，`--register` 登记仓库外的权重，详见 `08-模型管理.md`。
 - 本机状态分三份：权重在 `models/`，登记表（备注、默认、下载记录）在 `configs/models.json`，API Key 明文在 `~/.autolabel/secrets.json`；`configs/vlm.json` 里只有掩码与引用名，贴给别人看不会泄 Key。
 - 配好的多模态大模型能直接当标注后端：上传弹层的模型下拉框选它，或命令行 `--vlm <配置名>`。约 25~40 秒/张、精度不如 YOLO-pose，结果一律打 `vlm_labeled` 进人工复核清单。
 - 三个库三套产物，互不覆盖：`labels/` + `.autolabel/index.json` + `export`（`yolo pose train`）、`prompt_labels/` + `.autolabel/objects/index.json` + `prompt --export`、`detect_labels/` + `.autolabel/detect/index.json` + `detect --export`（都是 `yolo detect train`）。索引键按库分前缀（`status/objects/flags` 与 `prompt_*` 与 `detect_*`），接受驳回、撤销、删除都互不影响。

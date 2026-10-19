@@ -12,6 +12,7 @@ import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 
 import pytest
 
@@ -69,6 +70,20 @@ def adopt_detect(root, *rels):
     from autolabel.dataset import adopt_from_pool
 
     return adopt_from_pool(root, list(rels), lib="detect")
+
+
+@pytest.fixture()
+def fake_weights(tmp_path, monkeypatch):
+    """假权重目录：列清单和判文件在不在用得上，不需要真的能把模型加载起来。"""
+    folder = tmp_path / "fake-weights"
+    folder.mkdir()
+    for name in ("yolo11n.pt", "yolo11n-pose.pt"):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as handle:
+            handle.writestr("data.txt", b"weights")
+        (folder / name).write_bytes(buf.getvalue())
+    monkeypatch.setenv("AUTOLABEL_WEIGHTS_DIR", str(folder))
+    return str(folder)
 
 
 @pytest.fixture()
@@ -389,6 +404,49 @@ def test_unusable_weight_note_is_rendered_through_the_grouping():
     assert "unusableWeightsNote(modelState.unusable)" in source
     assert "modelState.unusable.map(" not in source, "还有一处逐个拼「名字：原因」"
     assert 'el.title = unusable.title' in source, "完整清单得有地方放"
+
+
+# --------------------------------------------------------------------------- //
+# 下拉框只摆本机已有的权重
+# --------------------------------------------------------------------------- //
+def test_detect_models_endpoint_only_offers_installed_weights(server, fake_weights):
+    """没下载的预置档不再进下拉框：选它等于在批量任务里偷偷下几百 MB。"""
+    base, _ = server
+    status, payload, _ = get(base, "/api/detect/models")
+
+    assert status == 200, payload
+    assert [row["name"] for row in payload["models"]] == ["yolo11n.pt"], payload["models"]
+    assert [row["name"] for row in payload["unusable"]] == ["yolo11n-pose.pt"]
+    for row in payload["models"] + payload["unusable"]:
+        assert row["installed"] is True
+        assert "downloadable" not in row, "未下载的权重不该出现在这份清单里"
+    assert "empty_note" not in payload
+
+
+def test_detect_models_endpoint_explains_an_empty_weights_dir(server, tmp_path, monkeypatch):
+    """一台什么都没下过的机器：空清单得说清去哪儿下，而不是留一个哑巴下拉框。"""
+    empty = tmp_path / "empty-weights"
+    empty.mkdir()
+    monkeypatch.setenv("AUTOLABEL_WEIGHTS_DIR", str(empty))
+    base, _ = server
+
+    status, payload, _ = get(base, "/api/detect/models")
+
+    assert status == 200, payload
+    assert payload["models"] == []
+    assert "模型管理" in payload["empty_note"]
+
+
+def test_both_dropdowns_drop_undownloaded_weights_and_refresh_on_open():
+    """姿态页与检测页同一个口径：没下载的不摆出来，摊开面板就重新取一次清单。"""
+    app = read_static("app.js")
+    objects = read_static("objects.js")
+
+    assert 'const ready = capability === "vlm"' in app, "姿态页下拉框又开始摆未下载的权重了"
+    assert "const group = ready.length ? ready : all.slice(0, 1);" in app
+    # 摊开面板时重画之前必须先取一次新清单（取数据靠 loadModelChoices，render 只是重画）
+    refreshed = re.findall(r"if \(IS_LOCAL\) loadModelChoices\(\);.*\n\s*renderModelChoices\(\);", objects)
+    assert len(refreshed) == 2, "批量面板与上传面板至少有一处只重画不取数：刚下好的权重要等刷新才出现"
 
 
 def test_detect_model_classes_and_import_roundtrip(server, dataset, weights):

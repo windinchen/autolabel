@@ -226,7 +226,7 @@ class_id cx cy w h  x1 y1 v1  x2 y2 v2 ... x17 y17 v17
 - **提示词标注页**（`/objects`，快捷键 `O` 直达，详见 `demo_docs/09-提示词标注.md`）：右上角 **导入素材**（快捷键 `W`）是本库独立上传口，入库后直接出检测框、不跑 YOLO-pose；弹层里的 **从素材池添加** 直接领用姿态库已传过的同一份素材（不重传、不复制文件）；画布上空白处拖动**补画**模型漏掉的目标（字段取「绘制字段」下拉框）、框内拖动移动、拖角点改大小、`X` 删标错的框、框列表里直接**改字段**（画错类不用重画）、`U` 撤销（第一次画完也能撤销回空白，`Z` 是适应窗口）。壳层与姿态标注页同一套：竖排焦点队列、画布 HUD 与 5 秒撤销条、`⋯` 菜单里的筛选与三个导出、`⌘K` 命令面板与 `?` 速查表；数字键在两页含义不同（这页 `0` 删框、`1` 字段管理）。「字段管理」新建字段（英文名 + 中文显示名 + 描述提示词），「批量提示词标注」选字段与多模态配置后走任务队列，可与姿态任务一样「清除任务」。
 - **分割轮廓能手工拖点**（目标检测库）：选中带轮廓的框后，轮廓上的**实心点是顶点**（拖动改形状）、**空心点是边中点**（拖它在那条边上加一个点），`Alt + 点` 删点（最少留 3 个）；松手后方框自动收成轮廓的新外接框，不会出现「框是框、形状是形状」对不上。拖框 / 缩放时轮廓整条仿射跟随；人工新画的方框仍然不带轮廓——硬套一个形状是编数据。
 - **启动对账**：启动时先按库自动 `migrate`（老布局升级；纯姿态数据集这种「没有提示词条目可搬」的老目录也会顺手补一本空的 `.autolabel/objects/index.json`，否则复核服务会因缺索引起不来），再逐库对账——导入/标注中途被打断时（重启服务、Ctrl+C、断电），已落盘但没进索引的图片会补回它自己库的索引并挂到那个批次上，无人认领的"标注中"批次判定为**已中断**，工作台顶部写清补回多少张；某库还在标注时另一个库不会抢走它的孤儿素材，`--keep-files` 保留的文件不会被误当成孤儿。对账时**每个库只解析一次对面库的索引**（不是每扫到一张图就重读一遍），1500 张的数据集启动对账从约 1 秒降到 0.04 秒。
-- **模型管理**（独立页 `/models`，快捷键 `M`，详见 `demo_docs/08-模型管理.md`）：**模型目录**列出 13 档可下载模型（YOLO11 / YOLOv8 / YOLO26 各档的中文说明、参数规模、mAP、预计体积、关键点集、适合场景），带中文备注说明与「设为默认」，行内直接下载并留完整下载记录（URL、镜像、SHA256 是否一致、字节数、耗时）；**权重文件**区块管就绪状态、半截残留与勾选删除（不误删正被任务占用的）；**多模态大模型**区块配置本地（Ollama / LM Studio / vLLM / OpenAI 兼容）或云端（OpenAI、阿里云 DashScope 等）服务，保存前一键连通性验证。API Key 明文单独存 `~/.autolabel/secrets.json`，配置文件里只有引用名、界面永远显示掩码。配好的多模态配置会出现在上传弹层的模型下拉框里，选中即用大模型标骨骼（命令行 `--vlm <配置名>`），结果打 `vlm_labeled` 标记进人工复核清单
+- **模型管理**（独立页 `/models`，快捷键 `M`，详见 `demo_docs/08-模型管理.md`）：**模型目录**按 `ultralytics/assets` 每个 release 的实际文件列出 160 档（五种任务，中文说明、参数规模、mAP、预计体积、关键点集或自带类别表、适合场景），默认「只看已下载」、按任务贴类别徽标，行内直接下载并留完整下载记录（URL、镜像、SHA256 是否一致、字节数、耗时）；**本机权重**区块只管 `models/` 里真有的文件：就绪状态、半截残留与勾选删除（不误删正被任务占用的）；**多模态大模型**区块配置本地（Ollama / LM Studio / vLLM / OpenAI 兼容）或云端（OpenAI、阿里云 DashScope 等）服务，保存前一键连通性验证。API Key 明文单独存 `~/.autolabel/secrets.json`，配置文件里只有引用名、界面永远显示掩码。配好的多模态配置会出现在上传弹层的模型下拉框里，选中即用大模型标骨骼（命令行 `--vlm <配置名>`），结果打 `vlm_labeled` 标记进人工复核清单
 
 上传细节：文件按 1 MB 分块边收边写进 `.autolabel/uploads/`（任务成功后清理，不会整份进内存；上传中途强杀进程留下的残留文件由复核服务启动时清掉，超过 24 小时没动过的都算残留），单文件默认上限 1024 MB，可用 `review --max-upload-mb` 调整——超限时服务端会把请求体读干净再回 413，界面显示体积上限而不是「网络错误」；焦点队列拉的是 `.autolabel/thumbs/` 里的 320px 小图（可随手删的缓存），主图仍是全分辨率；后台同一时刻只跑一个标注任务，任务进行期间接受/驳回按钮会暂时锁住，完成后列表自动刷新；点 **清除任务** 可中途取消。命令行导入用 `--batch-name "十月聚会"` 自定义批次名，方便日后整批管理。
 
@@ -329,7 +329,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 │   ├── settings.py       系统设置：推理设备（CUDA / MPS / CPU）与半精度，存 ~/.autolabel/settings.json
 │   ├── ca.py             本地 HTTPS 证书：签发、装进当前用户钥匙串、状态与卸载
 │   ├── backends.py       YOLO-pose 推理、翻转融合、多模型共识、可见性判定
-│   ├── models.py         模型目录/统一清单/备注/默认值/本地登记/下载记录 + 多模态配置与连通性验证
+│   ├── models.py         统一清单/任务标签/默认值/本地登记/下载记录 + 多模态配置与连通性验证
 │   ├── secrets.py        API Key 集中存放（~/.autolabel/secrets.json），配置里只留引用名
 │   ├── vlm.py            多模态大模型标注后端（提示词、残缺 JSON 解析成骨骼）
 │   ├── pipeline.py       批量标注、断点续跑、人工结果保护、QC 打标
@@ -356,7 +356,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 ├── certs/                本地 HTTPS 证书与私钥（`autolabel ca` 生成，已 gitignore）
 ├── configs/default.yaml  参数模板
 ├── configs/vlm.json      多模态大模型配置（不含明文 Key，建议不入库）
-├── configs/models.json   模型登记表（备注/默认值/本地登记/下载记录，本机状态，不入库）
+├── configs/models.json   模型登记表（默认值/本地登记/下载记录，本机状态，不入库）
 ├── configs/后台实例.conf.example  常驻服务实例清单的模板（真实清单 `configs/后台实例.conf` 是本机偏好，不入库）
 └── models/               权重与测试图
 ```
@@ -391,7 +391,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 | `prompt` | 提示词标注：`--vlm` 选多模态配置、`--fields` 选字段、`--limit` 试跑、`--overwrite` 重标、`--status` 看进度、`--coords` / `--export` 出坐标与训练集 |
 | `batches` | 按批次查看三个库的已标注数据（`--lib all\|pose\|objects\|detect`），`--delete <批次ID>` 整批删除图片与记录，`--delete-images images/a.jpg --mode lib\|purge` 按张删（`--keep-files` 只删记录，`--force` 强删中断遗留的批次） |
 | `detect` | **目标检测**：`--list-models` 本机哪些权重能用在本库、`--model-classes` 看某权重自带哪些类别、`--add-classes 类名\|all` 导入本库类别表（`--no-label` 只登记）、`--classes` 选类别、`--overwrite` 覆盖重标、`--status` 看进度、`--coords` / `--export` 出坐标与训练集 |
-| `models` | 模型管理：`--search 关键词`（`--task`、`--remote` 联网搜 GitHub）、`--browse` 浏览可下载目录与中文说明、`--info` 看详情、`--download-weight` 补下、`--note ID=说明` 写备注、`--default` 设默认、`--register` / `--forget` 登记或注销本地模型、`--dataset` 判兼容性、`--delete-weight --yes` 删除、`--add-vlm` / `--test-vlm` / `--default-vlm` / `--delete-vlm` 管多模态配置 |
+| `models` | 模型管理：`--search 关键词`（`--task`、`--remote` 联网搜 GitHub）、`--browse` 浏览姿态精选目录与中文说明、`--info` 看详情、`--download-weight` 补下、`--default` 设默认、`--register` / `--forget` 登记或注销本地模型、`--dataset` 判兼容性、`--delete-weight --yes` 删除、`--add-vlm` / `--test-vlm` / `--default-vlm` / `--delete-vlm` 管多模态配置 |
 
 ## 打开工作台（HTTPS 与摄像头）
 
@@ -434,7 +434,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 
 **多模态大模型怎么接？** 界面 `M` 打开「模型管理」或 `autolabel models` 配置本地/云端服务（带连通性验证，可按服务算力调「回复上限 / 送图最长边 / 强制 JSON 模式」），然后在导入素材的模型下拉框里选它，或命令行 `--vlm <配置名>`，就改用大模型标骨骼；配置存 `configs/vlm.json`，Key 明文只在本机 `~/.autolabel/secrets.json`、界面只显示掩码。约 25~40 秒/张、精度不如 YOLO-pose，结果一律进人工复核清单，详见 `demo_docs/07-常见问题.md`。
 
-**模型备注、默认值存在哪？** `configs/models.json`（本机状态，没存 Key，删了只丢备注与下载记录）。已下载的模型可以在界面行内输入框或 `models --note ID=说明` 里写备注，比如「只在内网机器下」「显存吃紧别用」。换机器拷 `configs/vlm.json` + `configs/models.json` + `~/.autolabel/secrets.json` 三份即可，详见 `demo_docs/08-模型管理.md`。
+**默认模型、下载记录存在哪？** `configs/models.json`（本机状态，没存 Key，删了只丢默认值与下载记录）。目录里每档的中文说明就是唯一口径，1.4.9 起不再有单独的「模型备注」字段。换机器拷 `configs/vlm.json` + `configs/models.json` + `~/.autolabel/secrets.json` 三份即可，详见 `demo_docs/08-模型管理.md`。
 
 **网页上传和命令行导入怎么选？** 补几段视频、几十张图用网页最省事；几十万张的批量导入或要精细控制去重与参数时用 `import` / `video` / `auto`，两条路走的是同一套流水线。
 
