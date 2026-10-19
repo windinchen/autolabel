@@ -15,7 +15,8 @@ const modelState = {
   query: "", remote: false, searching: false, searchSeq: 0, searchTimer: null,
   // loaded：成功拿到过一次目录结果；没拿到之前只能退回本机登记表粗筛
   hub: { ok: true, loaded: false, query: "", task: "", local: [], results: [], note: "",
-         error: "", remote_state: "skipped" },
+         error: "", remote_state: "skipped", catalog: null },
+  refreshing: false,      // 「更新目录」正在核对官方 release，按钮这期间不重复点
   // installedOnly：目录默认只摆本机已下载的模型。官方一摆就是一百六十档，
   // 全列出来真正能点的下载按钮反而找不到；要看全量随时能关。
   installedOnly: true,
@@ -24,6 +25,15 @@ const modelState = {
 };
 
 const MODEL_HINTS = { "yolo11n-pose.pt": "快", "yolo11s-pose.pt": "更准", "yolo11m-pose.pt": "最准" };
+// 「模型列表」里那排「设为XX默认」按这张表出：哪些权重能喂给哪个标注模块，只在这一处定义。
+// 提示词标注吃的是下面的多模态配置（不是 models/ 里的文件），所以这里没有它。
+const MODULE_DEFAULT_TARGETS = [
+  { key: "pose", label: "姿态标注", tasks: ["pose", "custom_task"],
+    tip: "姿态标注新开任务默认用这档（存 configs/models.json，跟机器走）" },
+  { key: "detect", label: "目标检测标注", tasks: ["detect", "segment", "obb"],
+    tip: "目标检测标注页下次打开就选它，批量标注不选也用它"
+      + "（存当前数据集 .autolabel/detect/prefs.json，跟数据集走）" },
+];
 const VLM_KIND_LABEL = { local: "本地", cloud: "云端" };
 const MODEL_BADGE_CLASS = { available: "done", incomplete: "failed", missing: "", incompatible: "failed" };
 
@@ -82,7 +92,7 @@ async function refreshModels() {
   else stopModelPolling();
 }
 
-/** 目标检测页当前用哪个权重：接口不存在或没选过都算正常，界面就不显示检测默认徽标。 */
+/** 目标检测标注页当前用哪个权重：接口不存在或没选过都算正常，界面就不显示检测默认徽标。 */
 async function loadDetectPrefs() {
   try {
     const data = await getJson("/api/detect/models");
@@ -92,24 +102,54 @@ async function loadDetectPrefs() {
   }
 }
 
-/** 设为检测默认：写的是数据集里的检测偏好，不是这台机器的姿态默认权重。 */
-async function setDetectDefault(filename) {
-  let data;
+/** 当前每个标注模块用的是哪一档：姿态看这台机器的登记表，检测看当前数据集的偏好。 */
+function moduleDefaultFiles() {
+  const ids = (modelState.defaults && modelState.defaults.ids) || {};
+  const rows = Array.isArray(modelState.rows) ? modelState.rows : [];
+  const pose = String(ids.pose || "");
+  const poseRow = rows.find((row) => String(row.id) === pose);
+  return {
+    pose: poseRow ? String(poseRow.filename || "") : "",
+    detect: String(modelState.detectPrefs.model || ""),
+  };
+}
+
+/** 这档权重大小说在明面上：不下载完的人最想知道的就是它占多少地方。 */
+function weightSizeText(info) {
+  if (info.ready) return `大小 ${mb(info.size_mb || 0)} MB`;
+  if ((info.partial_mb || 0) > 0) return `已下 ${mb(info.partial_mb)} MB，还没下完`;
+  if ((info.size_mb || 0) > 0) return `只有 ${mb(info.size_mb)} MB（不是完整权重包）`;
+  return "大小未知";
+}
+
+/** 这档能喂给哪些标注模块。认不出任务的自定义权重两个都给，让后端在真正用时把关。 */
+function modulesForWeight(info) {
+  const task = String(info.task || "");
+  if (!task) return MODULE_DEFAULT_TARGETS;
+  return MODULE_DEFAULT_TARGETS.filter((mod) => mod.tasks.includes(task));
+}
+
+/** 把某档权重设成某个标注模块的默认：两个模块的默认本来就存在两个地方，这里只管分发。 */
+async function setModuleDefault(moduleKey, info) {
+  const target = MODULE_DEFAULT_TARGETS.find((mod) => mod.key === moduleKey);
+  if (!target) return;
   try {
-    data = await postJson("/api/detect/prefs", { model: filename });
+    if (moduleKey === "detect") {
+      const data = await postJson("/api/detect/prefs", { model: info.name });
+      modelState.detectPrefs = (data && data.prefs) || { model: info.name };
+    } else {
+      await postJson("/api/models/default",
+                     { id: String(info.name).replace(/\.pt$/, ""), capability: "pose" });
+    }
   } catch (err) {
-    // 后端已经把话说清楚了（「本机没有 X：先在模型管理页搜到它并下载」「这是「人体姿态」权重…」），照原文显示
-    const msg = String(err.message || "");
+    const msg = String(err && err.message || "");
     toast(msg.includes("not found")
-      ? "设为检测默认失败：这个服务还是旧版本，重启后才有该接口"
-      : msg || "设为检测默认失败", true);
+      ? `设为${target.label}默认失败：这个服务还是旧版本，重启后才有该接口`
+      : msg || `设为${target.label}默认失败`, true);
     return;
   }
-  const model = (data && data.model) || filename;
-  modelState.detectPrefs = (data && data.prefs) || { model };
-  modelState.detectPrefs.model = model;
-  toast(`已设为检测默认：${model}`);
-  renderCatalog();
+  toast(`已设为${target.label}的默认模型：${info.name}`);
+  await refreshModels();
 }
 
 /** 顶栏副标题里报一句「默认模型 / 多模态配置」，省得用户去目录里翻。 */
@@ -129,7 +169,8 @@ function syncWeightRows() {
   for (const [name, task] of Object.entries(modelState.downloads)) {
     if (modelState.weights.some((w) => w.name === name)) continue;
     modelState.weights.push({
-      name, ready: false, size_mb: 0, custom: !MODEL_HINTS[name], mtime: null,
+      // 下载一律来自官方 release，这一行还没落盘，别急着叫它「自定义权重」
+      name, ready: false, size_mb: 0, custom: false, mtime: null,
       partial_mb: Math.round((task.done || 0) / 104857.6) / 10,
     });
   }
@@ -139,6 +180,30 @@ function syncWeightRows() {
 function localWeightRows() {
   return (modelState.weights || []).filter((w) => w.ready || (w.size_mb || 0) > 0
     || (w.partial_mb || 0) > 0 || modelState.downloads[w.name]);
+}
+
+/** 一档权重下面那排「设为XX默认」：只有本机真有文件的能设，认不出归属的任务就直说不吃。 */
+function renderModuleDefaults(box, info) {
+  const slots = modulesForWeight(info);
+  box.innerHTML = "";
+  if (!slots.length) {
+    box.textContent = `这是${TASK_LABEL[info.task] || info.task}权重，三个标注模块都不吃它`
+      + "（图像分类只出一张图一个标签，没有框）";
+    return;
+  }
+  const current = moduleDefaultFiles();
+  for (const mod of slots) {
+    const button = document.createElement("button");
+    const active = current[mod.key]
+      && String(current[mod.key]).toLowerCase() === String(info.name).toLowerCase();
+    button.className = active ? "mod-default on" : "mod-default";
+    button.textContent = active ? `默认用于${mod.label}` : `设为${mod.label}默认`;
+    button.disabled = active || !info.ready;
+    button.title = !info.ready ? "等这档下完才能设默认"
+      : active ? "现在就是这个模块在用它；要换别的档，去那档上点" : mod.tip;
+    button.onclick = (e) => { e.preventDefault(); setModuleDefault(mod.key, info); };
+    box.appendChild(button);
+  }
 }
 
 function renderWeights() {
@@ -156,7 +221,7 @@ function renderWeights() {
     const state = running
       ? { cls: "running", text: task.message }
       : info.ready
-        ? { cls: "done", text: "已就绪 " + mb(info.size_mb) + " MB" }
+        ? { cls: "done", text: "已就绪" }
         : task && task.stage === "failed"
           ? { cls: "failed", text: "下载失败" }
           : info.size_mb > 0
@@ -176,17 +241,21 @@ function renderWeights() {
           <span class="chip ${openVocab ? "" : "hidden"}">开放词表·填词</span>
         </div>
         <div class="muted small model-meta"></div>
+        <div class="module-defaults"></div>
       </div>
       <span class="badge ${state.cls}">${state.text}</span>
       <button class="dl">${running ? "下载中…" : info.ready ? "重新下载" : "下载"}</button>`;
     row.querySelector(".task-badge").textContent = TASK_LABEL[weightTask] || "任务未知";
     row.querySelector(".model-name").textContent = info.name;
-    const lead = info.custom ? "自定义权重 · "
-      : MODEL_HINTS[info.name] ? MODEL_HINTS[info.name] + " · " : "";
-    row.querySelector(".model-meta").textContent = lead
-      + (info.mtime ? "更新于 " + info.mtime : "首次标注时自动经镜像下载")
-      + (info.partial_mb ? ` · 残留半截 ${mb(info.partial_mb)} MB` : "")
-      + (task && task.error ? " · " + task.error : "");
+    const lead = info.custom ? "自定义权重"
+      : MODEL_HINTS[info.name] ? "推荐档 · " + MODEL_HINTS[info.name] : "";
+    row.querySelector(".model-meta").textContent = [
+      weightSizeText(info),
+      info.mtime ? "更新于 " + info.mtime : "首次用到时自动经镜像下载",
+      lead,
+      task && task.error ? task.error : "",
+    ].filter(Boolean).join(" ｜ ");
+    renderModuleDefaults(row.querySelector(".module-defaults"), info);
     row.querySelector("input").onchange = (e) => {
       if (e.target.checked) modelState.selected.add(info.name);
       else modelState.selected.delete(info.name);
@@ -221,7 +290,7 @@ async function downloadWeight(name, force) {
     return;
   }
   modelState.downloads[name] = data.task;
-  toast(force ? `重新下载 ${name}` : `开始下载 ${name}（进度在本页「姿态权重」里）`);
+  toast(force ? `重新下载 ${name}` : `开始下载 ${name}（进度在本页「模型列表」里）`);
   renderWeights();
   renderCatalog();
   startModelPolling();
@@ -335,7 +404,8 @@ function bindForget(row, button) {
   button.onclick = (e) => { e.preventDefault(); forgetLocalModel(row.id); };
 }
 
-/** 目录卡片：任务标签 + 中文名 + 中文介绍 + 能标哪些类别 + 参数/体积/速度 + 下载/设为默认。 */
+/** 目录卡片：任务标签 + 中文名 + 中文介绍 + 能标哪些类别 + 参数/体积/速度 + 下载。
+ *  卡片上**没有**「设为默认」：设默认统一在下面的「模型列表」，两个入口迟早对不上。 */
 function catalogCard(row) {
   const task = row.task || row.capability || "pose";
   const isVlm = task === "vlm";
@@ -359,8 +429,7 @@ function catalogCard(row) {
       <div class="progress model-progress hidden"><div class="bar"></div></div>
     </div>
     <span class="badge state"></span>
-    <button class="dl"></button>
-    <button class="def"></button>`;
+    <button class="dl"></button>`;
   const q = (sel) => el.querySelector(sel);
   q(".task-badge").textContent = row.task_label || TASK_LABEL[task] || task;
   q(".model-name").textContent = row.display_name || row.filename || row.id;
@@ -413,28 +482,12 @@ function catalogCard(row) {
     dl.disabled = running;
     dl.onclick = (e) => { e.preventDefault(); downloadWeight(row.filename, Boolean(row.installed)); };
   }
-  const def = q(".def");
-  const detectTask = ["detect", "segment", "obb", "classify"].includes(task);
-  if (detectTask) {
-    // 检测库的默认权重存在数据集里，和这台机器的姿态默认不是同一个概念，文案分开写
-    const active = detectDefault === String(row.filename || "").toLowerCase();
-    if (active) q(".detect-flag").classList.remove("hidden");
-    if (!row.installed) def.classList.add("hidden");   // 没下进本机之前只能先点「下载」
-    else {
-      def.textContent = active ? "当前检测默认" : "设为检测默认";
-      def.disabled = active;
-      def.title = "目标检测页下次打开就选它；不选也用它跑批量标注";
-      def.onclick = (e) => { e.preventDefault(); setDetectDefault(row.filename); };
-    }
-  } else {
-    const canDefault = row.known && Boolean(row.registry_capability);
-    def.textContent = row.default ? "默认中" : "设为默认";
-    def.disabled = !canDefault || Boolean(row.default);
-    def.title = canDefault
-      ? `设为这台机器${TASK_LABEL[task] || "该任务"}的默认权重（存 configs/models.json）`
-      : "这个权重不在登记表里，暂时设不了默认";
-    def.onclick = (e) => { e.preventDefault(); setModelDefault(row.id, row.registry_capability || ""); };
+  // 目录只管「下不下载」，默认在哪一档归下面的「模型列表」管：同一件事两个入口，
+  // 迟早有一个忘了同步（检测默认还额外存在数据集里，更容易对不上）
+  if (detectDefault === String(row.filename || "").toLowerCase()) {
+    q(".detect-flag").classList.remove("hidden");
   }
+  if (row.default && task === "pose") q(".installed-flag").classList.remove("hidden");
   return el;
 }
 
@@ -477,8 +530,53 @@ function renderCatalog() {
   for (const row of view.shown) box.appendChild(catalogCard(row));
   if (!view.shown.length) box.innerHTML = `<div class="batch-empty muted small">${MODEL_EMPTY_HINT}</div>`;
   renderCatalogNote(view.shown);
+  renderCatalogSource();
   renderGitHub();
   renderSearchNote();
+}
+
+/** 目录是从哪一版官方清单来的、多久没核对过了：这句话决定用户要不要点「更新目录」。 */
+function renderCatalogSource() {
+  const line = $("model-catalog-source");
+  if (!line) return;
+  const info = modelState.hub.catalog;
+  if (!info) { line.textContent = ""; return; }
+  const usable = info.usable_total || info.builtin_total || 0;
+  if (!info.refreshed) {
+    line.textContent = `目录来自随本工具发布的那一版官方清单（${info.builtin_release}，`
+      + `本库能标注的 ${usable} 档都在）。官方出新档位时点右上「更新目录」，不用等本工具升级。`;
+    return;
+  }
+  const fetched = String(info.fetched_at || "").slice(0, 16);
+  line.textContent = `目录已在 ${fetched} 核对过官方 ${info.release}`
+    + (info.published_at ? `（${info.published_at} 发布）` : "")
+    + `：官方 ${info.official_total} 档权重里，本库能标注的 ${usable} 档都在`
+    + (info.added ? `，其中 ${info.added} 档是刷新时补进来的` : "") + "。";
+}
+
+/** 「更新目录」：让后端去官方 release 取最新档位与体积，回来把目录和权重列表一起重画。 */
+async function refreshCatalog() {
+  if (modelState.refreshing) return;
+  modelState.refreshing = true;
+  const button = $("model-catalog-refresh");
+  if (button) { button.disabled = true; button.textContent = "核对中…"; }
+  let data = null;
+  let failure = "";
+  try {
+    data = await postJson("/api/modelhub/refresh", {});
+  } catch (err) {
+    failure = String(err && err.message || "");
+  }
+  if (button) { button.disabled = false; button.textContent = "更新目录"; }
+  modelState.refreshing = false;
+  if (!data) {
+    toast(failure.includes("not found")
+      ? "更新目录失败：这个服务还是旧版本，重启后才有该接口"
+      : failure || "更新目录失败", true);
+    return;
+  }
+  toast(data.note || (data.ok ? "目录已核对完毕" : "没连上 GitHub，目录还是之前那份"), !data.ok);
+  await refreshModels();        // 末尾会重画目录，来源那行跟着更新
 }
 
 /** 计数按任务分开报：把「分割 0/5」和「姿态 3/13」揉成一个数会让人以为权重下好了。 */
@@ -646,17 +744,19 @@ function hubSearch(options) {
         ok: Boolean(data.ok), loaded: true, query: data.query || "", task: data.task || "",
         local: data.local || [], results: data.results || [], note: data.note || "",
         error: data.error || "", remote_state: data.remote_state || (data.ok ? "ok" : "failed"),
+        catalog: data.catalog || modelState.hub.catalog || null,
       };
     } else {
       // 接口挂了不清空列表：沿用上次的目录按新关键词本地粗筛，只把提示换成红色
       const keep = refilterLocal(modelState.hub.local, modelState.query, modelState.filter);
       modelState.hub = { ok: false, loaded: modelState.hub.loaded, query: modelState.query,
         task: modelState.filter, local: keep, results: [], error: failure,
-        remote_state: "failed", note: `模型搜索接口没响应（${failure}）` };
+        remote_state: "failed", note: `模型搜索接口没响应（${failure}）`,
+        catalog: modelState.hub.catalog || null };
     }
     renderCatalog();
   };
-  if (opts.immediate) { run(); return; }
+  if (opts.immediate) return run();
   renderSearchNote();
   modelState.searchTimer = setTimeout(run, 400);
 }
@@ -688,17 +788,6 @@ function setModelTask(task) {
   if (select) select.value = task || "";
   modelState.filter = select ? select.value : (task || "");
   hubSearch({ immediate: true });
-}
-
-async function setModelDefault(id, capability) {
-  try {
-    await postJson("/api/models/default", { id, capability: capability || "" });
-  } catch (err) {
-    toast("设为默认失败：" + err.message, true);
-    return;
-  }
-  toast(`默认${capability === "vlm" ? "多模态配置" : "模型"}已设为 ${id}`);
-  await refreshModels();
 }
 
 async function registerLocalModel() {
@@ -1002,6 +1091,7 @@ function modelCommands() {
     { label: "联网搜 GitHub（开 / 关）", tag: "模型目录", run: () => toggleModelRemote() },
     { label: modelState.installedOnly ? "看官方完整目录（含未下载）" : "只看本机已下载的模型",
       tag: "模型目录", run: () => toggleInstalledOnly() },
+    { label: "更新模型目录（核对官方最新档位）", tag: "模型目录", run: () => refreshCatalog() },
     { label: "清空模型搜索", tag: "模型目录", run: () => clearModelSearch() },
     { label: "只看姿态估计权重", tag: "模型目录", run: () => setModelTask("pose") },
     { label: "只看实例分割权重", tag: "模型目录", run: () => setModelTask("segment") },
@@ -1046,6 +1136,7 @@ async function bootModels() {
   $("model-remote").onclick = (e) => { e.preventDefault(); toggleModelRemote(); };
   // 「只看已下载」默认开：一屏全是没下过的档位，真正能用的那几行反而要翻半天
   $("model-installed-only").onclick = (e) => { e.preventDefault(); toggleInstalledOnly(); };
+  $("model-catalog-refresh").onclick = (e) => { e.preventDefault(); refreshCatalog(); };
   syncInstalledOnlySwitch();
   $("model-register").onclick = registerLocalModel;
   $("model-reg-path").onkeydown = (e) => { if (e.key === "Enter") registerLocalModel(); };

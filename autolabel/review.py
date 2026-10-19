@@ -166,7 +166,7 @@ def module_summary(rows: List[dict]) -> dict:
             "label": label, "batches": len(group),
             "items": sum(int(row.get("items") or 0) for row in group),
             # labeled 取本模块自己的小计：顶层那个 labeled 是姿态库的无前缀键，
-            # 照抄会让目标检测页显示"标注 0 张 · 5 个框"（实测门户就这样）
+            # 照抄会让目标检测标注页显示"标注 0 张 · 5 个框"（实测门户就这样）
             "labeled": sum(int(row.get("labeled") or 0) for row in mine),
             unit: sum(int(row.get(unit) or 0) for row in mine),
             "reviewed": sum(int(row.get("reviewed") or 0) for row in mine),
@@ -763,7 +763,7 @@ class ReviewStore:
 
     # --- 目标检测：本机权重清单 + 模型自带类别 + 批量标注 ---
     def detect_models_payload(self) -> dict:
-        """目标检测页的模型下拉框：本机能用的检测类权重，以及上次选的那一个。
+        """目标检测标注页的模型下拉框：本机能用的检测类权重，以及上次选的那一个。
 
         用不了的权重（姿态 / 分类）也一并回，附一句为什么不能用——用户在同一个
         ``models/`` 目录里塞了 ``yolo11n-pose.pt``，界面只给他一个空下拉框最容易被当成 bug。
@@ -853,7 +853,7 @@ class ReviewStore:
                                         list(names) or None, str(payload.get("device") or ""))
 
     def run_detect_job(self, payload: dict) -> dict:
-        """提交一次批量目标检测：本库已有的图 → 本地权重 → ``detect_labels/``。"""
+        """提交一次批量检测：本库已有的图 → 本地权重 → ``detect_labels/``。"""
         payload = payload or {}
         # 索引必须先看盘再取：命令行刚 import 完就点"开始标注"时，内存里
         # 还是旧的那份，会冒出一句"目标检测库里还没有图片"（实测踩过）
@@ -879,7 +879,7 @@ class ReviewStore:
         if limit > 0:
             images = images[:limit]
         if not images:
-            raise ValueError("目标检测库里还没有图片，先在「目标检测」页上传或从素材池添加")
+            raise ValueError("目标检测库里还没有图片，先在「目标检测标注」页上传或从素材池添加")
         params = {"detect_classes": list(classes), "overwrite": bool(payload.get("overwrite")),
                   "model": str(payload.get("model") or ""),
                   "batch_name": str(payload.get("batch_name") or "")[:80]}
@@ -893,7 +893,7 @@ class ReviewStore:
         return job.payload()
 
     def run_detect_upload_job(self, payload: dict) -> dict:
-        """目标检测模块自己上传素材：入库后直接跑 YOLO 检测，登记成目标检测模块的批次。"""
+        """目标检测标注模块自己上传素材：入库后直接跑 YOLO 检测，登记成目标检测标注模块的批次。"""
         payload = payload or {}
         files = [str(name) for name in (payload.get("files") or []) if str(name).strip()]
         if not files:
@@ -1145,6 +1145,12 @@ class ReviewStore:
 
     def save_model_default(self, model_id: str, capability: str = "") -> dict:
         return set_model_default(model_id, capability)
+
+    def refresh_model_catalog(self) -> dict:
+        """「更新目录」：去官方 release 取最新权重清单再缓存下来；断网也只回原因不抛异常。"""
+        from . import modelhub
+
+        return modelhub.refresh_catalog()
 
     def add_local_model(self, payload: dict) -> dict:
         """登记一个本地权重：只记路径和说明，不动文件。"""
@@ -1471,7 +1477,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
             elif path in ("/objects", "/objects/"):
                 self._send_page("objects.html")
             elif path in ("/detect", "/detect/"):
-                # 目标检测页与提示词页共用同一套检测框编辑器，差别只在吃哪一库
+                # 目标检测标注页与提示词页共用同一套检测框编辑器，差别只在吃哪一库
                 self._send_page("detect.html")
             elif path in ("/models", "/models/"):
                 self._send_page("models.html")
@@ -1740,6 +1746,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     raise ValueError("没有指定要设为默认的模型")
                 self._send_json({"ok": True, "defaults": self.store.save_model_default(
                     model_id, str(payload.get("capability") or ""))})
+            elif parsed.path == "/api/modelhub/refresh":
+                self._send_json(self.store.refresh_model_catalog())
             elif parsed.path == "/api/models/local/add":
                 self._send_json({"ok": True, "model": self.store.add_local_model(payload),
                                  "models": self.store.model_rows()})
@@ -2052,7 +2060,7 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bo
     print(f"[info] 数据集 {store.index.name}：姿态库 {total} 张 · 提示词库 {objects_total} 张 · "
           f"检测库 {detect_total} 张，等你复核 {counts['pending']} 张（其中 {counts['flagged']} 张"
           f"机器自己报了问题，进页面按 F 逐张跳）")
-    print("[info] 二级模块：/pose 姿态标注 · /objects 提示词标注 · /detect 目标检测 · /models 模型管理")
+    print("[info] 二级模块：/pose 姿态标注 · /objects 提示词标注 · /detect 目标检测标注 · /models 模型管理")
     print(f"[info] 右上角可上传视频/图片目录（单文件上限 {max_upload_mb} MB），上传后自动标注并生成坐标文件")
     if store.recovery["recovered"] or store.recovery["interrupted"] or store.recovery["missing_files"]:
         print(f"[warn] 启动对账：补回 {store.recovery['recovered']} 张未入库图片，"

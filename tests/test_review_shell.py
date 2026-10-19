@@ -235,10 +235,12 @@ def test_portal_leads_with_next_actions_and_drops_internalese():
 # --------------------------------------------------------------------------- //
 # 模型管理：目录只看已下载、备注说明已取消
 # --------------------------------------------------------------------------- #
-def run_models_function(name, state, argument):
+def run_models_function(name, state, argument, extra=()):
     """把 models.js 里依赖 modelState 的纯函数抠出来交给 node 求值。
 
     过滤规则用正则猜是猜不准的：一个 `||` 写错，「搜到了却看不见」就得靠肉眼逛十遍。
+    ``extra`` 是这条函数还要用的顶层常量名（如 MODULE_DEFAULT_TARGETS）：原文里把那段
+    字面量抠出来交给 node 求值，测试断的就是界面真正会用的那份映射，不是测试自己抄的副本。
     """
     node = shutil.which("node")
     if not node:
@@ -246,13 +248,21 @@ def run_models_function(name, state, argument):
     source = read("models.js")
     params, body = source.split("function %s(" % name, 1)[1].split(") {", 1)
     body = body.split("\n}", 1)[0]
-    script = ("const rows = JSON.parse(process.argv[1]);"
-              "const state = JSON.parse(process.argv[2]);"
-              "const fn = Function(...JSON.parse(process.argv[3]), process.argv[4]);"
-              "process.stdout.write(JSON.stringify(fn(state, rows)));")
-    done = subprocess.run([node, "-e", script, json.dumps(argument), json.dumps(state),
-                           json.dumps(["modelState"] + [p.strip() for p in params.split(",")]),
-                           body], capture_output=True, text=True, timeout=60)
+    literals = []
+    for const_name in extra:
+        block = re.search(r"const %s = (\[.*?\n\]);" % const_name, source, re.S)
+        assert block, f"models.js 里找不到常量 {const_name}"
+        literals.append(block.group(1))
+    names = ["modelState"] + [p.strip() for p in params.split(",")] + list(extra)
+    # 函数体与中文文案走环境变量，别在 shell 引号里被折腾一遍
+    script = ("const names = JSON.parse(process.argv[1]);"
+              "const values = JSON.parse(process.argv[2]);"
+              "const held = process.argv.slice(3).map((text) => Function(`return (${text})`)());"
+              "const fn = Function(...names, process.env.FN_BODY);"
+              "process.stdout.write(JSON.stringify(fn(...values, ...held)));")
+    done = subprocess.run([node, "-e", script, json.dumps(names), json.dumps([state, argument]),
+                           *literals], capture_output=True, text=True, timeout=60,
+                          env=dict(os.environ, FN_BODY=body))
     assert done.returncode == 0, done.stderr
     return json.loads(done.stdout)
 
@@ -307,3 +317,85 @@ def test_local_weight_list_only_lists_real_files():
     assert "function localWeightRows()" in source
     assert "for (const info of localWeightRows())" in source or \
         "const rows = localWeightRows();" in source
+
+
+# --------------------------------------------------------------------------- //
+# 1.4.10：模块改名、模型列表接管「默认」、目录可更新
+# --------------------------------------------------------------------------- #
+
+def read_repo_file(*parts):
+    root = os.path.dirname(STATIC)
+    with open(os.path.join(root, *parts), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def test_third_module_is_named_detection_labeling_everywhere():
+    """模块对外一律叫「目标检测标注」，数据库名照旧是「目标检测库」：库名会进文件名和导出。"""
+    common = read("common.js")
+    portal = read("portal.js")
+    objects = read("objects.js")
+    detect_html = read("detect.html")
+    library = read_repo_file("library.py")
+
+    assert 'name: "目标检测标注"' in common, "左侧导航与顶栏用的就是 MODULES 里这个名字"
+    assert 'name: "目标检测标注"' in objects and 'runLabel: "批量检测"' in objects
+    assert "<title>目标检测标注</title>" in detect_html
+    assert '"批量目标检测"' not in objects + detect_html + portal
+    assert 'LIB_NAMES = {' in library and 'LIB_DETECT: "目标检测标注"' in library
+    assert "目标检测库" in read_repo_file("static", "portal.html") or "目标检测库" in portal
+
+
+def test_weight_section_is_the_single_place_that_sets_defaults():
+    """「本机权重」改名「模型列表」，并把设默认这个动作整个接过来：一件事不许有两个入口。"""
+    html = read("models.html")
+    source = read("models.js")
+
+    assert ">模型列表<" in html and "本机权重" not in html, "区块标题和说明得一起改过来"
+    assert "设为XX默认" in html or "设为" in html
+    assert "function renderModuleDefaults(" in source and "setModuleDefault(" in source
+    # 目录卡片只剩下载按钮：以前目录和权重列表都能设默认，两处早晚对不上
+    assert '<button class="def"></button>' not in source
+    assert "setDetectDefault(" not in source and "setModelDefault(" not in source
+    assert "function setModuleDefault(" in source
+    css = read("app.css")
+    assert ".module-defaults" in css and ".mod-default.on" in css, "默认状态要有描边，不能只靠文字"
+
+
+def test_each_module_offers_only_the_weight_kinds_it_can_run():
+    """哪档权重能被哪个标注模块设为默认，读的是 models.js 里那份真映射。"""
+    def labels(task):
+        got = run_models_function("modulesForWeight", {}, {"task": task},
+                                 extra=("MODULE_DEFAULT_TARGETS",))
+        return [item["label"] for item in got]
+
+    assert labels("pose") == ["姿态标注"]
+    assert labels("detect") == labels("segment") == labels("obb") == ["目标检测标注"]
+    assert labels("classify") == [], "图像分类只出一张图一个标签，两个模块都不吃它"
+    # 认不出任务的自定义权重两边都给，真正能不能跑交给后端把关
+    assert labels("") == ["姿态标注", "目标检测标注"]
+
+
+def test_catalog_refresh_is_wired_end_to_end():
+    """「更新目录」从按钮到接口到那句来源说明，一条链都得在。"""
+    html = read("models.html")
+    source = read("models.js")
+    review = read_repo_file("review.py")
+
+    assert 'id="model-catalog-refresh"' in html and 'id="model-catalog-source"' in html
+    assert "async function refreshCatalog()" in source
+    assert 'postJson("/api/modelhub/refresh"' in source
+    assert 'renderCatalogSource();' in source
+    assert '"/api/modelhub/refresh"' in review and "refresh_model_catalog" in review
+    assert "更新模型目录" in source, "命令面板也得找得到这件事"
+
+
+def test_pose_dropdown_only_offers_pose_weights():
+    """姿态标注的模型下拉框只摆姿态与自定义权重，而且只摆本机已有的：
+    混一个检测权重进来，跑起来只会回一句「这个权重没有关键点」。"""
+    source = read("app.js")
+    body = source.split("function renderModelOptions", 1)[1].split("\n}", 1)[0]
+
+    assert 'for (const capability of ["pose", "vlm", "custom_task"])' in body
+    assert "all.filter((r) => r.ready && r.compatible !== false)" in body
+    for other in ("detect", "segment", "obb", "classify"):
+        assert other not in body, f"姿态页的下拉框不该认识「{other}」权重"

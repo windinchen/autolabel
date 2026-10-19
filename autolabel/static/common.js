@@ -1,8 +1,8 @@
 "use strict";
 
-// 五个页面（门户 / 姿态标注 / 提示词标注 / 目标检测 / 模型管理）共用的极小工具集。
+// 五个页面（门户 / 姿态标注 / 提示词标注 / 目标检测标注 / 模型管理）共用的极小工具集。
 // 页面自己的逻辑在 portal.js / app.js / objects.js / models.js 里，各页只加载自己那份；
-// 「目标检测」与「提示词标注」共用同一份 objects.js，靠 <body data-lib> 决定吃哪一库，
+// 「目标检测标注」与「提示词标注」共用同一份 objects.js，靠 <body data-lib> 决定吃哪一库，
 // 绝不再复制一份：同一件事有两个入口，改天就只有一个跟着改。
 
 const $ = (id) => document.getElementById(id);
@@ -90,7 +90,7 @@ const isImage = (f) => IMAGE_EXTS.includes(extOf(f.name)) || /^image\//.test(f.t
 const MODULES = [
   { id: "pose", href: "/pose", name: "姿态标注", desc: "人体骨骼关键点复核" },
   { id: "objects", href: "/objects", name: "提示词标注", desc: "大模型按你写的描述找物品" },
-  { id: "detect", href: "/detect", name: "目标检测", desc: "本地 YOLO 权重按自带类别出框" },
+  { id: "detect", href: "/detect", name: "目标检测标注", desc: "本地 YOLO 权重按自带类别出框" },
   { id: "models", href: "/models", name: "模型管理", desc: "搜模型、下载权重、多模态配置" },
 ];
 
@@ -904,7 +904,7 @@ const dash = (v) => (v === null || v === undefined || v === "" ? "—" : v);
 // --------------------------------------------------------------------------- //
 // 素材池：三个库共用 images/ 下的素材，这里提供"把池里已有的图添加进本库"的选择器
 // --------------------------------------------------------------------------- //
-const LIB_LABELS = { pose: "姿态标注", objects: "提示词标注", detect: "目标检测" };
+const LIB_LABELS = { pose: "姿态标注", objects: "提示词标注", detect: "目标检测标注" };
 const libLabel = (lib) => LIB_LABELS[lib] || String(lib || "本库");
 
 // 素材池里每张图被哪些库引用：后端按下发 in_<lib>，界面按这张表念名字。

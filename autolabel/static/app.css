@@ -606,6 +606,18 @@ footer #hint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; whi
 .model-catalog-row { align-items: flex-start; }
 .model-desc { margin: 2px 0; line-height: 1.45; overflow-wrap: anywhere; }
 .model-desc:empty { display: none; }
+/* 目录来源那行是「要不要点更新目录」的依据，允许折行但别把行高撑开 */
+.model-catalog-source { margin: -1px 0 6px; line-height: 1.45; overflow-wrap: anywhere; }
+/* 「模型列表」里那排「设为XX默认」：默认归哪个标注模块用，一行看清，且只有这一个入口 */
+.module-defaults { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 5px;
+  color: var(--ink-3); font-size:  calc(11.5px * var(--fs)); }
+.module-defaults button.mod-default { padding: 2px 9px; border-radius: 999px; color: var(--ink-2);
+  background: color-mix(in srgb, var(--ink) 4%, transparent); border: 1px solid var(--hairline); }
+.module-defaults button.mod-default:hover:not(:disabled) { color: var(--jade);
+  border-color: color-mix(in srgb, var(--jade) 45%, transparent); }
+.module-defaults button.mod-default.on { color: var(--jade); cursor: default;
+  background: color-mix(in srgb, var(--jade) 12%, transparent);
+  border-color: color-mix(in srgb, var(--jade) 40%, transparent); }
 .model-note-row { display: flex; gap: 6px; margin-top: 5px; }
 .model-note-row input.note { flex: 1; min-width: 0; font-size:  calc(12px * var(--fs)); }
 .model-note-row button { flex: 0 0 auto; }

@@ -1,7 +1,8 @@
 """YOLO 模型目录与离线搜索：给「模型管理」页的搜索框当数据层。
 
 ``models.PRESET_CATALOG`` 只有姿态一档（13 条），界面要按任务搜模型（检测 / 分割 /
-旋转框 / 分类）时没有数据可用。这里在不改 ``models.py`` 的前提下补一份更全的目录：
+旋转框 / 分类）时没有数据可用。这里补一份更全的目录（往登记表里只加一个缓存键
+``hub_catalog``，不动 ``models.py`` 的既有逻辑）：
 
 - 姿态那 13 条从 ``models.PRESET_CATALOG`` 原样带过来，字段一个不减
   （``map_pose``/``preset_visible`` 这些现有代码还在读）；
@@ -27,8 +28,8 @@ import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from . import models
-from .backends import weights_url
+from . import backends, models
+from .backends import use_assets_release, weights_url
 
 # --------------------------------------------------------------------------- #
 # 任务口径
@@ -634,6 +635,7 @@ def _base_rows() -> List[dict]:
     for filename, expected_bytes in WIDE_MANIFEST:
         if str(filename).lower() not in taken:
             rows.append(_wide_row(filename, expected_bytes))
+    _merge_release(rows)
     return rows
 
 
@@ -1078,7 +1080,7 @@ def search_payload(q: str = "", task: str = "", remote: bool = False,
     query = str(q or "").strip()
     local = search(query, task)
     shared = {"query": query, "task": str(task or "").strip().lower(), "local": local,
-              "dataset_root": str(dataset_root or "")}
+              "dataset_root": str(dataset_root or ""), "catalog": catalog_info()}
     if not remote:
         return dict(shared, ok=True, results=[], note=LOCAL_ONLY_NOTE, error="",
                     remote_state="skipped")
@@ -1086,6 +1088,225 @@ def search_payload(q: str = "", task: str = "", remote: bool = False,
     return dict(shared, ok=state != "failed",
                 results=results if state == "ok" else [],
                 note=_remote_note(error, state), error=error, remote_state=state)
+
+
+# --------------------------------------------------------------------------- #
+# 目录刷新：官方 release 的最新档位与体积
+# --------------------------------------------------------------------------- #
+
+#: 官方发布页的资源列表接口：「更新目录」按钮打的是它，比手写的清单更新
+RELEASE_API_URL = "https://api.github.com/repos/ultralytics/assets/releases/latest"
+
+#: release 里本库喂不进标注流水线的分支：SAM 系吃的是提示词分割，深度 / 蒸馏 /
+#: 行人检索 / 语义分割 / 立体匹配交出来的是特征图和视差，既不是框也不是骨骼。
+#: 塞进目录只会让人白下几十 MB，所以和新档位一起过掉，只在提示里报个数。
+REFRESH_SKIP_SUFFIXES: Tuple[str, ...] = (
+    "-depth", "-distill", "-reid", "-market", "-s3d", "-sem", "-ade20k",
+    "-siamese", "-stereo3ddet", "-grayscale",
+)
+REFRESH_SKIP_PREFIXES: Tuple[str, ...] = ("sam", "fastsam", "mobile_sam", "yolov3")
+
+#: 刷一次目录最多等多久：release 接口偶尔要三五秒，但不值得让人对着转圈
+REFRESH_TIMEOUT = 10.0
+
+
+def refresh_supported(filename: str) -> bool:
+    """这一档官方权重能不能拿去标注——决定它有没有资格进目录。"""
+    base = os.path.basename(str(filename or "")).strip().lower()
+    if not base.endswith(".pt") or base.startswith(REFRESH_SKIP_PREFIXES):
+        return False
+    stem = base[:-3]
+    return not any(stem.endswith(suffix) for suffix in REFRESH_SKIP_SUFFIXES)
+
+
+def release_overlay() -> dict:
+    """上次「更新目录」缓存下来的官方清单；顺带把下载地址对齐到那一版。"""
+    snapshot = models.hub_catalog()
+    if str(snapshot.get("release") or ""):
+        use_assets_release(str(snapshot.get("release")))
+    return snapshot
+
+
+def _snapshot_assets(snapshot: dict) -> Dict[str, int]:
+    """清单里的 ``文件名 -> 字节数``，键统一小写、值统一成整数。"""
+    raw = snapshot.get("assets") if isinstance(snapshot.get("assets"), dict) else {}
+    assets: Dict[str, int] = {}
+    for name, size in raw.items():
+        try:
+            assets[str(name).lower()] = int(size or 0)
+        except (TypeError, ValueError):
+            assets[str(name).lower()] = 0
+    return assets
+
+
+def _known_sizes() -> Dict[str, int]:
+    """内置目录本来就认得的档位与体积：刷新时靠它判断哪些是新增、哪些体积变了。"""
+    sizes: Dict[str, int] = {}
+    for row in _pose_rows() + [dict(row) for row in EXTRA_CATALOG]:
+        name = str(row.get("filename") or "").lower()
+        if name:
+            sizes[name] = int(row.get("expected_bytes") or 0)
+    for filename, expected_bytes in WIDE_MANIFEST:
+        sizes.setdefault(str(filename).lower(), int(expected_bytes))
+    return sizes
+
+
+def _merge_release(rows: List[dict]) -> None:
+    """把缓存的官方清单并进目录（就地改）：体积以官方为准，新档位补中文说明。
+
+    新档位走 ``_wide_row`` 现推中文名与介绍。参数量和精度官方没写在 release 里，
+    一律留空不显示——编一个数出来比不写更容易让人做错决定。
+    """
+    snapshot = release_overlay()
+    assets = _snapshot_assets(snapshot)
+    if not assets:
+        return
+    release = str(snapshot.get("release") or "")
+    index = {str(row.get("filename") or "").lower(): row for row in rows}
+    for filename in sorted(assets):
+        size = assets[filename]
+        row = index.get(filename)
+        if row is not None:
+            if size and int(row.get("expected_bytes") or 0) != size:
+                row["expected_bytes"] = size
+                row["expected_mb"] = round(size / 1048576, 1)
+                row["size_verified"] = True
+                row["release"] = release
+            continue
+        fresh = _wide_row(filename, size)
+        fresh["release"] = release
+        rows.append(fresh)
+        index[filename] = fresh
+
+
+def is_official(filename: str) -> bool:
+    """这一档是不是官方发布过的权重（内置清单或刷新下来的 release 认得都算）。
+
+    ``models.weight_info`` 拿它区分官方档位和用户自己塞进 ``models/`` 的权重：精选目录
+    只有姿态那一列，检测 / 分割 / 旋转框的官方档全在宽目录里，只查精选就会把
+    ``yolo11n.pt`` 说成「自定义权重」。
+    """
+    base = os.path.basename(str(filename or "")).strip().lower()
+    if not base:
+        return False
+    return base in _known_sizes() or base in _snapshot_assets(models.hub_catalog())
+
+
+def catalog_info() -> dict:
+    """这份目录的来头：哪一版 release、什么时候刷的、内置有多少档。界面照着说人话。"""
+    snapshot = release_overlay()
+    release = str(snapshot.get("release") or "")
+    return {
+        "release": release,
+        "release_url": str(snapshot.get("release_url") or RELEASE_URL),
+        "fetched_at": str(snapshot.get("fetched_at") or ""),
+        "published_at": str(snapshot.get("published_at") or ""),
+        "official_total": int(snapshot.get("total") or 0),
+        "usable_total": len(_snapshot_assets(snapshot)) or len(WIDE_MANIFEST),
+        "added": len([name for name in (snapshot.get("added") or []) if refresh_supported(name)]),
+        "builtin_release": backends.ASSETS_RELEASE,
+        "builtin_total": len(WIDE_MANIFEST),
+        "refreshed": bool(release),
+    }
+
+
+def _release_fetch(timeout: float) -> Tuple[dict, str]:
+    """取官方最新 release 的权重清单，返回（清单，错误原因）。
+
+    清单形如 ``{"release", "release_url", "published_at", "assets", "official_total"}``。
+    断网、超时、限流、返回看不懂都只填错误原因，绝不往外抛异常。
+    """
+    request = urllib.request.Request(RELEASE_API_URL, headers=dict(REMOTE_HEADERS))
+    try:
+        with urllib.request.urlopen(request, timeout=max(0.5, float(timeout))) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace") or "{}")
+    except Exception as exc:  # noqa: BLE001 断网/超时/限流/返回不是 JSON 都得安静降级
+        return {}, f"{type(exc).__name__}: {exc}"
+    release = str(payload.get("tag_name") or "").strip() if isinstance(payload, dict) else ""
+    items = payload.get("assets") if isinstance(payload, dict) else None
+    if not release or not isinstance(items, list):
+        return {}, "GitHub 返回的内容看不懂（可能被限流或需要登录）"
+    assets: Dict[str, int] = {}
+    official_total = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip().lower()
+        if not name.endswith(".pt"):
+            continue
+        official_total += 1
+        if not refresh_supported(name):
+            continue
+        try:
+            assets[name] = int(item.get("size") or 0)
+        except (TypeError, ValueError):
+            assets[name] = 0
+    # 新档位只存在于最新那一版里：地址还按老 release 拼，下载必然 404
+    use_assets_release(release)
+    return {"release": release,
+            "release_url": str(payload.get("html_url") or RELEASE_URL),
+            "published_at": str(payload.get("published_at") or "")[:10],
+            "assets": assets, "official_total": official_total}, ""
+
+
+def refresh_catalog(timeout: float = REFRESH_TIMEOUT) -> dict:
+    """「更新目录」：取官方最新权重清单，和现在的目录比一比，再缓存下来。
+
+    只做三件事——认出新增档位、核对体积有没有变、记下这一版和刷新时间。断网 /
+    超时 / 限流一律 ``ok=False`` 加一句中文原因，目录保持原样继续用，不抛异常。
+    """
+    previous = release_overlay()
+    previous_assets = _snapshot_assets(previous)
+    # 上次刷新补进来的档位已经在目录里了：算进「已认识」，第二次刷同样的 release
+    # 就该老实说「没有新档位」，而不是每次都报一遍新增
+    known = {**_known_sizes(), **previous_assets}
+    fetched, error = _release_fetch(timeout)
+    if error:
+        return {"ok": False, "changed": False, "error": error,
+                "release": str(previous.get("release") or ""),
+                "fetched_at": str(previous.get("fetched_at") or ""),
+                "added": [], "resized": [], "missing": [], "skipped": 0,
+                "official_total": 0, "catalog": catalog_info(),
+                "note": f"没连上 GitHub（{error}）：目录还是之前那份，标注照常能用"}
+    assets = fetched["assets"]
+    added = sorted(name for name in assets if name not in known)
+    resized = [{"filename": name, "old": known[name], "new": assets[name]}
+               for name in sorted(known)
+               if name in assets and assets[name] and known[name] != assets[name]]
+    missing = sorted(name for name in known
+                     if name not in assets and name not in previous_assets)
+    # 清单整份换掉，不跟上次那份掺着用：官方删了哪一档，缓存里就该跟着没有
+    snapshot = models.save_hub_catalog({
+        "release": fetched["release"], "release_url": fetched["release_url"],
+        "published_at": fetched["published_at"], "total": fetched["official_total"],
+        "fetched_at": models.now_str(), "assets": assets, "added": added,
+    })
+    skipped = max(0, int(fetched["official_total"]) - len(assets))
+    note = _refresh_note(snapshot["release"], snapshot["published_at"], added, resized,
+                         skipped, missing)
+    return {"ok": True, "changed": bool(added or resized), "error": "",
+            "release": snapshot["release"], "release_url": snapshot["release_url"],
+            "published_at": snapshot["published_at"], "fetched_at": snapshot["fetched_at"],
+            "official_total": snapshot["total"], "added": added, "resized": resized,
+            "missing": missing, "skipped": skipped, "catalog": catalog_info(), "note": note}
+
+
+def _refresh_note(release: str, published: str, added: Sequence[str], resized: Sequence[dict],
+                  skipped: int, missing: Sequence[str]) -> str:
+    """刷新结果那句话：有新档说新档，只改了体积说体积，什么都没变就别假装有事发生。"""
+    bits = []
+    if added:
+        bits.append(f"官方 {release} 新增 {len(added)} 档，中文介绍已一并补好，搜得到就能直接下")
+    if resized:
+        bits.append(f"{len(resized)} 档的体积按 {release} 改正了")
+    if not bits:
+        bits.append(f"目录已经是官方 {release} 那一版"
+                    + (f"（{published} 发布）" if published else "") + "，没有新档位，体积也没变")
+    if missing:
+        bits.append(f"另有 {len(missing)} 档官方这一版里已经找不到了，多半是换了名字")
+    if skipped:
+        bits.append(f"{skipped} 档本库用不上（SAM 分割、深度、检索这些），没往目录里加")
+    return "；".join(bits)
 
 
 # --------------------------------------------------------------------------- #
@@ -1115,4 +1336,5 @@ def download_state(name: str) -> Optional[dict]:
 
 __all__ = ["TASK_VALUES", "TASK_LABELS", "catalog", "search", "search_payload",
            "search_remote", "task_of", "installed_names", "download", "download_state",
-           "download_url"]
+           "download_url", "refresh_catalog", "catalog_info", "release_overlay",
+           "refresh_supported"]

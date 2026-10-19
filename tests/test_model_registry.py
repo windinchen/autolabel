@@ -560,3 +560,39 @@ def test_weight_rows_carry_the_task_label_the_badge_needs(workspace):
 
     assert pose["task"] == "pose" and "姿态" in pose["task_name"]
     assert open_vocab["task"] == "segment" and "开放词表" in open_vocab["task_name"]
+
+
+# --------------------------------------------------------------------------- #
+# 官方清单缓存（hub_catalog）：「更新目录」往登记表里写的就这一个键
+# --------------------------------------------------------------------------- #
+
+def test_hub_catalog_starts_empty(workspace):
+    """没刷过目录时这份缓存就该是空的，界面据此说「目录来自随本工具发布的那一版」。"""
+    assert models.hub_catalog() == {}
+    assert models.load_model_config()["hub_catalog"] == {}
+
+
+def test_hub_catalog_round_trip_keeps_only_weight_sizes(workspace):
+    """只留「哪一版 + 文件名 → 字节数」：非权重文件与乱七八糟的类型统统清掉。"""
+    saved = models.save_hub_catalog({
+        "release": "v9.1.0", "release_url": "https://example.invalid/tag/v9.1.0",
+        "published_at": "2026-11-02", "total": 3, "added": ["YOLO99N-SEG.PT"],
+        "assets": {"YOLO99N-SEG.pt": 41943040, "yolo11n.torchscript": 1, "junk.pt": "不是数"},
+    })
+
+    assert saved["assets"] == {"yolo99n-seg.pt": 41943040, "junk.pt": 0}
+    assert saved["added"] == ["yolo99n-seg.pt"]
+    assert models.hub_catalog()["release"] == "v9.1.0"
+    assert models.hub_catalog()["fetched_at"] == "", "刷新时间由调用方给，这里不替它编"
+
+
+def test_hub_catalog_update_leaves_the_rest_of_the_registry_alone(workspace):
+    """刷新目录只许动 hub_catalog：默认模型、下载记录被冲掉过一次，就再没人敢点更新。"""
+    models.set_model_default("yolo11s-pose", "pose")
+    before = models.load_model_config()
+
+    models.save_hub_catalog({"release": "v9.1.0", "assets": {"yolo99n.pt": 1}})
+
+    after = models.load_model_config()
+    assert after["defaults"] == before["defaults"]
+    assert after["downloads"] == before["downloads"] and after["local"] == before["local"]

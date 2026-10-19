@@ -130,8 +130,8 @@ def test_detect_page_reuses_objects_script_without_a_fork(server):
     assert 'src="/objects.js"' in objects
     assert "detect.js" not in read_review_py()
     assert not os.path.exists(os.path.join(STATIC, "detect.js"))
-    # 运行按钮与类别面板在检测页换了名字
-    assert "批量目标检测" in detect
+    # 运行按钮与类别面板在检测页换了名字（1.4.10 起模块叫「目标检测标注」，按钮收短成「批量检测」）
+    assert "批量检测" in detect and "批量目标检测" not in detect
     assert "类别管理" in detect
     assert 'id="cls-import"' in detect
 
@@ -218,7 +218,7 @@ def test_navigation_offers_the_third_module_everywhere():
     assert '"export-yolo-detect"' in portal and '"yolo_detect"' in portal
     assert 'key: "detect_items"' in portal
     html = read_static("portal.html")
-    assert '<option value="detect">目标检测</option>' in html
+    assert '<option value="detect">目标检测标注</option>' in html
     assert "三个标注库" in html
 
 

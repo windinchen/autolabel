@@ -300,6 +300,15 @@ def task_hint(name: str) -> Tuple[str, str]:
     return task, label
 
 
+def _is_official_tier(name: str) -> bool:
+    """这一档官方发布过没有。只有模型目录层知道全量清单，而它不能反过来引本模块，就地懒导。"""
+    try:
+        from . import modelhub
+    except ImportError:      # noqa: BLE001 目录层没起来就少说一句，别把官方档位说成自定义
+        return False
+    return modelhub.is_official(name)
+
+
 def weight_info(name: str, dir_: Optional[str] = None, dataset_kps: int = 0) -> dict:
     """单个权重的状态：是否就绪、体积、来源、半截文件残留，外加目录里的中文说明。"""
     dir_ = weights_dir() if dir_ is None else dir_
@@ -307,7 +316,7 @@ def weight_info(name: str, dir_: Optional[str] = None, dataset_kps: int = 0) -> 
     info["task"], info["task_name"] = task_hint(name)
     path = str(info["path"])
     info["source"] = "disk" if os.path.isfile(path) else "preset"
-    info["custom"] = _registry().get(name) is None
+    info["custom"] = _registry().get(name) is None and not _is_official_tier(name)
     info["mtime"] = (time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(path)))
                      if os.path.isfile(path) else None)
     leftover = 0
@@ -957,7 +966,7 @@ def normalize_model_id(value: str) -> str:
 
 def empty_model_config() -> dict:
     return {"version": MODEL_CONFIG_VERSION, "defaults": {}, "catalog": {}, "local": [],
-            "downloads": [], "last_used": {}, "metadata": {}}
+            "downloads": [], "last_used": {}, "metadata": {}, "hub_catalog": {}}
 
 
 def load_model_config(path: Optional[str] = None) -> dict:
@@ -973,7 +982,7 @@ def load_model_config(path: Optional[str] = None) -> dict:
         return config
     if not isinstance(data, dict):
         return config
-    for key in ("defaults", "catalog", "last_used", "metadata"):
+    for key in ("defaults", "catalog", "last_used", "metadata", "hub_catalog"):
         value = data.get(key)
         if isinstance(value, dict):
             config[key] = {str(k): v for k, v in value.items()}
@@ -995,6 +1004,41 @@ def save_model_config(config: dict, path: Optional[str] = None) -> None:
     merged["version"] = MODEL_CONFIG_VERSION
     merged["updated_at"] = now_str()
     atomic_write_json(path, merged, newline=True)
+
+
+def hub_catalog() -> dict:
+    """上次「更新目录」缓存下来的官方 release 快照；没刷过就是空表。"""
+    with _LOCK:
+        overlay = load_model_config().get("hub_catalog")
+    return dict(overlay) if isinstance(overlay, dict) else {}
+
+
+def save_hub_catalog(overlay: dict) -> dict:
+    """缓存官方权重清单：只存版本号、时间与「文件名 -> 字节数」，不碰任何权重文件。"""
+    raw = overlay or {}
+    assets = raw.get("assets") if isinstance(raw.get("assets"), dict) else {}
+
+    def size_of(value) -> int:
+        """字节数只认非负整数：读到脏值按 0 收，别让缓存把整个刷新搞崩。"""
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    clean = {"release": str(raw.get("release") or ""),
+             "release_url": str(raw.get("release_url") or ""),
+             "fetched_at": str(raw.get("fetched_at") or ""),
+             "published_at": str(raw.get("published_at") or ""),
+             "total": int(raw.get("total") or 0),
+             "added": sorted({str(name).lower() for name in (raw.get("added") or [])}),
+             "assets": {str(name).lower(): size_of(size)
+                        for name, size in assets.items()
+                        if str(name).lower().endswith(".pt")}}
+    with _LOCK:
+        config = load_model_config()
+        config["hub_catalog"] = clean
+        save_model_config(config)
+    return clean
 
 
 def dataset_keypoints(root: str) -> "tuple[int, str]":

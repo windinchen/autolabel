@@ -564,7 +564,7 @@ def run_detect_labeling(
     should_stop: Optional[Callable[[], bool]] = None,
     verbose: bool = True,
 ) -> dict:
-    """批量目标检测：逐张跑本地权重、写 ``detect_labels/``、更新索引 ``detect_*``。
+    """批量检测：逐张跑本地权重、写 ``detect_labels/``、更新索引 ``detect_*``。
 
     :param model: 权重文件名或路径，留空用系统设置里的默认权重
     :param classes: 要标的类别（类名/显示名/ID），留空 = 登记表里全部
@@ -577,7 +577,7 @@ def run_detect_labeling(
         raise ValueError(
             f"{os.path.basename(matched['model'])} 认不出这些类别：{'、'.join(matched['missing'])}"
             f"（它是「{matched['task_name']}」模型，共 {matched['class_count']} 类）。"
-            "去「目标检测」页重新勾选，或换一个包含这些类别的权重")
+            "去「目标检测标注」页重新勾选，或换一个包含这些类别的权重")
     if len(pairs) > MAX_RUN_CLASSES:
         raise ValueError(f"一次最多标 {MAX_RUN_CLASSES} 个类别，当前勾了 {len(pairs)} 个")
 

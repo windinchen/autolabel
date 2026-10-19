@@ -205,8 +205,24 @@ def resolve_model_path(model: str, weights_dir: Optional[str] = None) -> str:
 
 # ultralytics 权重发布地址与默认镜像：直连 GitHub 常掉到 10 KB/s 甚至连不上，
 # 镜像前缀可用环境变量 AUTOLABEL_WEIGHTS_MIRROR 覆盖（设成空串即回到直连）。
-ASSETS_BASE = "https://github.com/ultralytics/assets/releases/download/v8.4.0"
+ASSETS_REPO = "https://github.com/ultralytics/assets/releases/download"
+#: 内置目录逐条核对过的那一版；「更新目录」取到更新的 release 后由 ``use_assets_release`` 改写
+ASSETS_RELEASE = "v8.4.0"
+ASSETS_BASE = f"{ASSETS_REPO}/{ASSETS_RELEASE}"
 DEFAULT_MIRROR = os.environ.get("AUTOLABEL_WEIGHTS_MIRROR", "https://gh-proxy.com/")
+
+
+def use_assets_release(tag: str) -> str:
+    """把下载地址切到官方最新 release：新档位只在新版本里，还按老地址下载会 404。
+
+    只认 ``v8.4.1`` 这种形状的版本号，其余一律保持原样——地址写坏了比不切更糟。
+    """
+    global ASSETS_BASE, ASSETS_RELEASE
+    cleaned = str(tag or "").strip()
+    if re.fullmatch(r"v?\d[\w.\-]{0,31}", cleaned):
+        ASSETS_RELEASE = cleaned
+        ASSETS_BASE = f"{ASSETS_REPO}/{cleaned}"
+    return ASSETS_BASE
 
 
 def weights_url(model: str, mirror: Optional[str] = None) -> str:

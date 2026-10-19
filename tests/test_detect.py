@@ -470,7 +470,7 @@ def test_detect_classes_add_and_item_roundtrip_use_the_detect_library(server, mo
 
     status, unknown, _ = post(base, "/api/prompt/item", {
         "image": rels[0], "lib": "detect", "objects": [{"cls": 77, "cx": .5, "cy": .5, "w": .2, "h": .2}]})
-    assert status == 400 and "不在目标检测的类别表里" in unknown["error"]
+    assert status == 400 and "不在目标检测标注的类别表里" in unknown["error"]
 
 
 def test_detect_prefs_set_the_default_weight_and_refuse_pose_weights(server, monkeypatch):

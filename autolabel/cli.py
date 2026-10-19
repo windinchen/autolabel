@@ -766,11 +766,32 @@ def _print_probe(args: argparse.Namespace, detector, images: Sequence[str]) -> i
     return 0
 
 
+def _refresh_model_catalog() -> bool:
+    """``models --refresh-catalog``：拉官方最新权重清单，把新增档位和体积变更说清楚。"""
+    from . import modelhub
+
+    result = modelhub.refresh_catalog()
+    mark = "[ok]" if result.get("ok") else "[warn]"
+    print(f"{mark} {result.get('note')}")
+    added = result.get("added") or []
+    for name in added[:12]:
+        print(f"     + {name}")
+    if len(added) > 12:
+        print(f"     + 其余 {len(added) - 12} 档就不一一列了，界面上搜得到")
+    for item in (result.get("resized") or [])[:8]:
+        print(f"     ~ {item['filename']}：{int(item['old']) / 1048576:.1f} MB → "
+              f"{int(item['new']) / 1048576:.1f} MB")
+    return bool(result.get("ok"))
+
+
 def cmd_models(args: argparse.Namespace) -> int:
     """列出并管理姿态权重与多模态大模型配置；不带参数就是清单。"""
     from . import models as model_admin
 
     failed = 0
+    if args.refresh_catalog:
+        failed += 0 if _refresh_model_catalog() else 1
+
     for name in args.download_weight:
         print(f"[info] 下载权重 {name}（优先走镜像，已有半截文件会续传）…")
         task = model_admin.start_download(name, force=args.force, background=False)
@@ -978,7 +999,7 @@ def _print_model_search(args: argparse.Namespace) -> int:
     if not local and not remote:
         print("\n  没搜到。换个关键词（yolo11 / 姿态 / 分割 / 旋转框），"
               "或者去掉 --task 限制再看一次")
-    print("\n下载完就能在「目标检测」「姿态标注」的模型下拉框里选到。")
+    print("\n下载完就能在「目标检测标注」「姿态标注」的模型下拉框里选到。")
     return 0
 
 
@@ -1525,7 +1546,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     detect = detect_summary(args.dataset)
     if not detect["images"]:
         print("  检测库还没有素材：autolabel import <数据集> --lib detect，"
-              "或界面「目标检测」页上传（类别来自权重：autolabel detect <数据集> --model-classes yolo11n.pt）")
+              "或界面「目标检测标注」页上传（类别来自权重：autolabel detect <数据集> --model-classes yolo11n.pt）")
     else:
         print(f"  目标检测 已标 {detect['labeled']}/{detect['images']} 张 · 框 {detect['boxes']} · "
               f"已确认 {detect['reviewed']} · 未标 {detect['unreviewed']} · "
@@ -1757,7 +1778,7 @@ def build_parser() -> argparse.ArgumentParser:
     def add_lib(parser: argparse.ArgumentParser, default: str = "pose") -> None:
         parser.add_argument("--lib", choices=list(LIBRARIES), default=default,
                             help="入库到哪个标注库：pose=姿态标注（默认）、objects=提示词标注、"
-                                 "detect=目标检测；素材文件三个库共用，images/ 里已有的直接引用，不重复落盘")
+                                 "detect=目标检测标注；素材文件三个库共用，images/ 里已有的直接引用，不重复落盘")
 
     p = sub.add_parser("import", help="导入图片（自动规范化 RGB/EXIF/尺寸并去重）")
     add_dataset(p)
@@ -1954,7 +1975,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--num-keypoints", type=_non_negative_int, default=0)
     p.add_argument("--lib", choices=["all", *LIBRARIES], default="all",
                    help="只查某个库的标签：all=三个库都查（默认）、pose=姿态标注、"
-                        "objects=提示词标注、detect=目标检测")
+                        "objects=提示词标注、detect=目标检测标注")
     p.set_defaults(func=cmd_validate)
 
     p = sub.add_parser("status", help="数据集概览")
@@ -2004,7 +2025,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="配合 --delete：连带删掉这个字段已经标出的框")
     p.add_argument("--lib", choices=[LIB_OBJECTS, LIB_DETECT], default=LIB_OBJECTS,
                    help="哪张类别表：objects=提示词标注（默认，字段名+描述提示词）、"
-                        "detect=目标检测（类别来自 YOLO 权重自带，一般用 autolabel detect --add-classes 导入）")
+                        "detect=目标检测标注（类别来自 YOLO 权重自带，一般用 autolabel detect --add-classes 导入）")
     p.add_argument("--json", action="store_true", help="以 JSON 输出字段表")
     p.set_defaults(func=cmd_fields)
 
@@ -2073,6 +2094,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--browse", action="store_true",
                    help="浏览可下载模型目录：中文说明、参数规模、预计体积、适合场景")
     p.add_argument("--catalog", action="store_true", help="同 --browse")
+    p.add_argument("--refresh-catalog", action="store_true",
+                   help="联网取官方最新权重清单：新增档位、体积变更一并并进来"
+                        "（界面上「模型目录 → 更新目录」是同一件事）")
     p.add_argument("--info", metavar="模型ID", help="看单个模型的完整中文说明、下载地址与下载记录")
     p.add_argument("--capability", default="", help="只看一类能力：pose | vlm | custom_task")
     p.add_argument("--search", metavar="关键词",

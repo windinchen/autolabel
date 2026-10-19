@@ -42,7 +42,7 @@ LIB_POSE = "pose"
 LIB_OBJECTS = "objects"
 LIB_DETECT = "detect"
 LIBRARIES: Tuple[str, ...] = (LIB_POSE, LIB_OBJECTS, LIB_DETECT)
-LIB_NAMES = {LIB_POSE: "姿态标注", LIB_OBJECTS: "提示词标注", LIB_DETECT: "目标检测"}
+LIB_NAMES = {LIB_POSE: "姿态标注", LIB_OBJECTS: "提示词标注", LIB_DETECT: "目标检测标注"}
 
 #: 每个库一份的路径与字段名。加库只改这张表——以前到处写 ``if lib == objects else pose``，
 #: 第三个库进来就得改成三层嵌套，迟早有一处漏掉，漏掉的表现是"标签写进了别人的目录"。

@@ -648,3 +648,132 @@ def test_absurdly_long_query_does_not_explode(weights, huge):
 def test_github_query_trims_a_pasted_paragraph(weights):
     """粘一整段话去 GitHub 搜只会回来一坨无关仓库，取前半句就够。"""
     assert len(modelhub.github_query("安全帽 " + "模型" * 500)) <= 130
+
+
+# --------------------------------------------------------------------------- #
+# 「更新目录」：官方 release 的最新档位与体积
+# --------------------------------------------------------------------------- #
+
+#: 假 release：一档改体积、一档全新、SAM 与深度分支各占一档、再来一个非 .pt 资源
+RELEASE_V9 = {
+    "tag_name": "v9.1.0",
+    "html_url": "https://github.com/ultralytics/assets/releases/tag/v9.1.0",
+    "published_at": "2026-11-02T04:05:06Z",
+    "assets": [
+        {"name": "yolo11n.pt", "size": 6_000_000},
+        {"name": "yolo99n-seg.pt", "size": 41_943_040},
+        {"name": "sam3_b.pt", "size": 90_000_000},
+        {"name": "yolo26l-depth.pt", "size": 70_000_000},
+        {"name": "yolo11n-pose.tar.gz", "size": 1},
+    ],
+}
+
+
+def fake_release(monkeypatch, payload):
+    """把 release 接口换成假数据：这几条测试一次真实网络都不碰。
+
+    刷新会把下载地址改到假 release 那一版，登记下来让 monkeypatch 测试后还原，
+    否则下一个断言 ``.../v8.4.0/xxx.pt`` 的测试会莫名其妙地红。
+    """
+    def respond(request, timeout=0, **_kwargs):
+        return FakeResponse(payload)
+
+    monkeypatch.setattr(modelhub.backends, "ASSETS_BASE", modelhub.backends.ASSETS_BASE)
+    monkeypatch.setattr(modelhub.backends, "ASSETS_RELEASE", modelhub.backends.ASSETS_RELEASE)
+    monkeypatch.setattr(modelhub.urllib.request, "urlopen", respond)
+
+
+def fake_offline(monkeypatch, reason="名字解释不了"):
+    def boom(request, timeout=0, **_kwargs):
+        raise urllib.error.URLError(reason)
+
+    monkeypatch.setattr(modelhub.urllib.request, "urlopen", boom)
+
+
+def test_release_branches_this_library_cannot_run_stay_out(weights):
+    """官方 release 里一半资源本库标不了东西：收进目录就是让人白下几十 MB。"""
+    for name, want in (("yolo11n.pt", True), ("yolo11n-seg.pt", True), ("yolov8x-worldv2.pt", True),
+                       ("yolo26x-pose.pt", True), ("yolo26l-depth.pt", False),
+                       ("yolo26m-reid-market.pt", False), ("yolo26s-sem-ade20k.pt", False),
+                       ("yolo11n-grayscale.pt", False), ("sam3_b.pt", False),
+                       ("FastSAM-x.pt", False), ("mobile_sam.pt", False), ("yolov3u.pt", False),
+                       ("yolo11n.torchscript", False), ("", False)):
+        assert modelhub.refresh_supported(name) is want, name
+
+
+def test_refresh_adds_new_tier_and_fixes_sizes(weights, monkeypatch):
+    """新档位要带中文名和介绍，体积按官方改正，下载地址跟着换到那一版。"""
+    fake_release(monkeypatch, RELEASE_V9)
+
+    result = modelhub.refresh_catalog()
+    assert result["ok"] and result["changed"], result
+    assert result["added"] == ["yolo99n-seg.pt"]
+    assert {"filename": "yolo11n.pt", "old": 5_613_764, "new": 6_000_000} in result["resized"]
+    assert result["skipped"] == 2
+
+    rows = {row["filename"]: row for row in modelhub.catalog()}
+    fresh = rows["yolo99n-seg.pt"]
+    assert not fresh["display_name"].endswith(".pt"), "不许拿文件名当中文名"
+    assert fresh["intro"] and fresh["class_note"] and fresh["task"] == "segment"
+    assert fresh["expected_mb"] == 40.0
+    assert rows["yolo11n.pt"]["expected_bytes"] == 6_000_000
+    # 新档位只存在于最新那一版：地址还按 v8.4.0 拼就是 404
+    assert modelhub.download_url("yolo99n-seg.pt").endswith("/v9.1.0/yolo99n-seg.pt")
+
+
+def test_refresh_note_says_what_actually_changed(weights, monkeypatch):
+    """那句提示得是真话：新增多少、改了几档体积、多少档用不上，各说各的。"""
+    fake_release(monkeypatch, RELEASE_V9)
+
+    note = modelhub.refresh_catalog()["note"]
+
+    assert "新增 1 档" in note and "体积按 v9.1.0 改正" in note
+    assert "2 档本库用不上" in note and "已经找不到了" in note
+
+    again = modelhub.refresh_catalog()["note"]
+    assert "没有新档位，体积也没变" in again, "刷第二次不该再报一遍新增"
+
+
+def test_refresh_survives_a_second_identical_run(weights, monkeypatch):
+    """连点两次「更新目录」不许把目录刷成两行一档。"""
+    fake_release(monkeypatch, RELEASE_V9)
+    modelhub.refresh_catalog()
+    first = [row["filename"] for row in modelhub.catalog()]
+
+    second = modelhub.refresh_catalog()
+    assert second["changed"] is False and second["added"] == []
+    assert [row["filename"] for row in modelhub.catalog()] == first
+
+
+def test_offline_refresh_keeps_the_catalog_it_has(weights, monkeypatch):
+    """断网不许把目录刷没：说清原因、缓存保持原样，搜索照旧有结果。"""
+    before = modelhub.catalog_info()
+    fake_offline(monkeypatch)
+
+    result = modelhub.refresh_catalog()
+
+    assert result["ok"] is False and result["changed"] is False
+    assert "没连上 GitHub" in result["note"] and "标注照常能用" in result["note"]
+    assert modelhub.catalog_info() == before, "刷新失败不该改动目录来源"
+    assert modelhub.search("yolo11n"), "目录还是得能用"
+
+
+def test_refresh_is_remembered_across_requests(weights, monkeypatch):
+    """界面那句「已核对到哪一版、什么时候刷的」靠这份缓存，重启服务也得说得出。"""
+    fake_release(monkeypatch, RELEASE_V9)
+    modelhub.refresh_catalog()
+
+    info = modelhub.catalog_info()
+    assert info["refreshed"] is True and info["release"] == "v9.1.0"
+    assert info["published_at"] == "2026-11-02" and info["official_total"] == 4
+    assert info["usable_total"] == 2 and info["added"] == 1
+    assert info["fetched_at"], "得留下刷新时间，否则用户不知道该不该再点"
+    assert modelhub.search_payload("分割")["catalog"]["release"] == "v9.1.0"
+
+
+def test_catalog_info_names_the_bundled_list_before_any_refresh(weights):
+    """没刷过的时候也得说清目录是哪来的，别让人以为界面坏了一半。"""
+    info = modelhub.catalog_info()
+
+    assert info["refreshed"] is False and info["release"] == ""
+    assert info["builtin_release"] and info["builtin_total"] == len(modelhub.WIDE_MANIFEST)

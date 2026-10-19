@@ -721,7 +721,7 @@ class JobStore:
         finish_batch(self.root, job.batch_id, "done", job.message)
 
     def _run_detect_upload(self, job: Job) -> None:
-        """目标检测模块的上传：入库 →（可选）本地权重出框 → 写检测框坐标。"""
+        """目标检测标注模块的上传：入库 →（可选）本地权重出框 → 写检测框坐标。"""
         job.set_stage("importing", f"导入 {len(job.files)} 个文件")
         ingested = self._ingest(job)
         rels = list(job.ingested)

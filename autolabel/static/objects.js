@@ -1,6 +1,6 @@
 "use strict";
 
-// 二级模块「提示词标注」与「目标检测」共用这一份脚本，绝不再复制一份：
+// 二级模块「提示词标注」与「目标检测标注」共用这一份脚本，绝不再复制一份：
 // 两个模块都是「检测框 + 人工复核」，界面骨架一模一样，差别只在**谁出框**——
 //   提示词标注：多模态大模型按你写的字段描述在画面里找物品（可联网、每张一次请求、类别随便定）；
 //   目标检测：本地 YOLO 权重按它自带的类别表出框（不联网、单张几十毫秒、类别由权重决定）。
@@ -20,16 +20,16 @@ const LIB_CONFIG = {
     runLabel: "批量提示词标注", manageLabel: "字段管理",
     exportKind: "detect", emptyImage: "提示词库还没有图片",
     note: "提示词标注 = 多模态大模型按你写的字段描述找物品：类别随你定、可联网、慢；"
-      + "要快就换「目标检测」——本机 YOLO 权重按它自带的类别表出框，不联网、单张几十毫秒。",
+      + "要快就换「目标检测标注」——本机 YOLO 权重按它自带的类别表出框，不联网、单张几十毫秒。",
   },
   detect: {
     lib: "detect", prefix: "detect", local: true, page: "/detect", peer: "objects",
-    name: "目标检测", fieldWord: "类别", classTable: "本库类别表",
+    name: "目标检测标注", fieldWord: "类别", classTable: "本库类别表",
     items: "detect_items", classes: "detect_classes", labelDir: "detect_labels/",
     runUrl: "/api/detect/run", uploadUrl: "/api/detect/upload",
-    runLabel: "批量目标检测", manageLabel: "类别管理",
+    runLabel: "批量检测", manageLabel: "类别管理",
     exportKind: "yolo_detect", emptyImage: "目标检测库还没有图片",
-    note: "目标检测 = 本机 YOLO 权重按它自带的类别表（COCO-80 等）出框：不联网、单张几十毫秒，"
+    note: "目标检测标注 = 本机 YOLO 权重按它自带的类别表（COCO-80 等）出框：不联网、单张几十毫秒，"
       + "类别由权重决定；要标权重不认识的东西，去「提示词标注」让多模态大模型按你写的描述找。",
   },
 };
@@ -53,7 +53,7 @@ const run = { poll: null, busy: false, logEl: "run-log", seen: {}, warm: false, 
 // 本模块独立上传：文件先落到 uploads/，再由 <lib>_upload 任务入库并直接出检测框
 const up = { files: [] };
 const fieldState = { editing: null };
-// 目标检测页的权重状态：下拉框选项、权重自带类别、上次选的那一档（后端 prefs 记的）
+// 目标检测标注页的权重状态：下拉框选项、权重自带类别、上次选的那一档（后端 prefs 记的）
 const modelState = {
   loading: false, models: [], unusable: [], device: "auto", emptyNote: "",
   model: "", conf: 0.25, prefsClasses: [],
@@ -1174,7 +1174,7 @@ function fieldLog(msg, isErr) {
 
 // --------------------------------------------------------------------------- //
 // 目标检测专属：本机权重 → 它自带的类别表 → 导进本库类别表
-// 界面顺序就是这里的调用顺序：先挑权重，再勾它认识的类别，「批量目标检测」只吃本库这张表。
+// 界面顺序就是这里的调用顺序：先挑权重，再勾它认识的类别，「批量检测」只吃本库这张表。
 // 这一节在提示词标注页是彻底的空操作（页面上没有 #cls-* / #*-model 这些元素）。
 // --------------------------------------------------------------------------- //
 
@@ -1679,7 +1679,7 @@ async function importModelClasses() {
   }
   const lost = data.not_in_model || [];
   modelState.result = `新增 ${data.added || 0} / 复用 ${data.updated || 0}`
-    + (data.open_vocab ? ` · 词表已备好（${data.vocab.length} 个词），去「批量目标检测」开跑`
+    + (data.open_vocab ? ` · 词表已备好（${data.vocab.length} 个词），去「批量检测」开跑`
       : ` / 该权重认不出 ${lost.length}` + (lost.length ? `（${lost.join("、")}）` : ""))
     + ((data.skipped || []).length ? ` · 还有 ${data.skipped.length} 个没进表：${data.skipped.join("、")}` : "")
     + ` · 本库类别表现有 ${data.fields.length} 个，下一个类别号 ${data.next_class_id}`;
@@ -1692,7 +1692,7 @@ async function importModelClasses() {
 }
 
 // --------------------------------------------------------------------------- //
-// 批量提示词标注 / 批量目标检测（走任务队列，可清除）
+// 批量提示词标注 / 批量检测（走任务队列，可清除）
 // --------------------------------------------------------------------------- //
 function openRun(open) {
   openModal("run-modal", open);

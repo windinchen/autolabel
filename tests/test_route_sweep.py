@@ -146,6 +146,26 @@ def test_write_apis_survive_garbage_and_unknown_names(server, dataset):
             assert any("\u4e00" <= ch <= "\u9fff" for ch in text), (path, payload, body)
 
 
+def test_catalog_refresh_reports_in_chinese_when_github_is_unreachable(server, monkeypatch):
+    """「更新目录」打的是 GitHub：连不上要回中文原因，更不许把 5xx 甩给界面。"""
+    from autolabel import modelhub
+
+    real = urllib.request.urlopen
+
+    def only_github_is_down(request, timeout=0, **kwargs):
+        """只让 GitHub 连不上：测试自己发的那个 POST 还得照常出去。"""
+        if "api.github.com" in getattr(request, "full_url", str(request)):
+            raise urllib.error.URLError("连不上")
+        return real(request, timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(modelhub.urllib.request, "urlopen", only_github_is_down)
+    status, body, _headers = post(server[0], "/api/modelhub/refresh", {})
+
+    assert status == 200, body
+    assert body["ok"] is False and "没连上 GitHub" in body["note"]
+    assert get(server[0], "/api/modelhub/search?q=pose")[1]["catalog"]["refreshed"] is False
+
+
 def test_unknown_paths_are_404_on_both_verbs(server):
     base, _store = server
     assert get(base, "/api/does-not-exist")[0] == 404

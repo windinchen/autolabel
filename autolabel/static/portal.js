@@ -15,7 +15,7 @@ const MODULE_CARDS = [
     upload: true, lib: "objects",
   },
   {
-    id: "detect", href: "/detect", name: "目标检测", tag: "标注库",
+    id: "detect", href: "/detect", name: "目标检测标注", tag: "标注库",
     desc: "本机 YOLO 权重按它自带的类别表（COCO-80 等）出检测框：不联网、单张几十毫秒，"
       + "类别由权重决定，复核时删错框、补漏框。",
     upload: true, lib: "detect",
@@ -148,8 +148,8 @@ function nextActions(ds, values) {
       href: "/objects", go: "去复核" });
   }
   if (values.detect_unreviewed) {
-    acts.push({ icon: "ic-boxes", chip: "目标检测", title: "有 " + values.detect_unreviewed + " 帧本机权重出的框没复核",
-      sub: "本地图已入库的，点批量目标检测几十秒就出一轮",
+    acts.push({ icon: "ic-boxes", chip: "检测标注", title: "有 " + values.detect_unreviewed + " 帧本机权重出的框没复核",
+      sub: "本地图已入库的，点批量检测几十秒就出一轮",
       href: "/detect", go: "去复核" });
   }
   if (!acts.length) {
@@ -264,7 +264,7 @@ function renderExports(ds) {
       count: (ds.prompt && ds.prompt.boxes) || 0, unit: "框",
     },
     {
-      name: "检测框（目标检测）",
+      name: "检测框（目标检测标注）",
       desc: "坐标：一行一个框（class_id + 权重自带英文类名 + 中文显示名 + 两套坐标）。"
         + "训练集：train/val 切分 + data.yaml（类别名取本库类别表），与提示词库那份互不覆盖。",
       links: [["CSV", "/api/prompt/coords?format=csv&lib=detect"],
@@ -376,7 +376,7 @@ function renderBatches(ds) {
   const box = $("portal-batches");
   box.innerHTML = "";
   if (!all.length) {
-    box.innerHTML = '<div class="batch-empty muted small">还没有批次：去「姿态标注」「提示词标注」或「目标检测」点「导入素材」上传图片和视频。</div>';
+    box.innerHTML = '<div class="batch-empty muted small">还没有批次：去「姿态标注」「提示词标注」或「目标检测标注」点「导入素材」上传图片和视频。</div>';
   } else if (!rows.length) {
     box.innerHTML = '<div class="batch-empty muted small">这个模块还没有批次记录。</div>';
   }
@@ -633,7 +633,7 @@ function portalCommands() {
     { label: "导入图片 / 视频 / 目录", tag: "姿态标注", run: () => { location.href = "/pose?upload=1"; } },
     { label: "去姿态标注复核", tag: "姿态标注", run: () => { location.href = "/pose"; } },
     { label: "去提示词标注", tag: "提示词标注", run: () => { location.href = "/objects"; } },
-    { label: "去目标检测", tag: "目标检测", run: () => { location.href = "/detect"; } },
+    { label: "去目标检测标注", tag: "目标检测标注", run: () => { location.href = "/detect"; } },
     { label: "去模型管理", tag: "模型管理", run: () => { location.href = "/models"; } },
     { label: "跳到「导出训练用文件」", run: () => scrollToSection("sec-export") },
     { label: "跳到「批次管理」", run: () => scrollToSection("sec-batches") },
