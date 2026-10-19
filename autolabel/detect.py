@@ -344,7 +344,7 @@ def label_image(root: str, image_rel: str, backend: DetectionBackend,
         if cls < 0:
             continue
         detections.append(Detection(cls=cls, cx=item.cx, cy=item.cy, w=item.w, h=item.h,
-                                    score=item.score,
+                                    score=item.score, poly=list(item.poly),
                                     flags=["masked"] if item.has_mask else []))
     detections = dedupe(detections)
     return {"detections": detections, "model": os.path.basename(backend.model_name),

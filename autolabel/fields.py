@@ -286,7 +286,11 @@ def class_id_usage(root: str, lib: str = LIB_OBJECTS) -> Dict[int, int]:
 
 
 def _iter_box_labels(root: str, lib: str = LIB_OBJECTS):
-    """遍历本库标签目录 ``(相对路径, [(class_id, cx, cy, w, h), ...])``，跳过坏行。"""
+    """遍历本库标签目录 ``(相对路径, [(class_id, cx, cy, w, h, 轮廓), ...])``，跳过坏行。
+
+    轮廓是 ``[x1, y1, ...]`` 归一化点列，没有轮廓时为空表；只用前 5 列的调用方
+    （框数、类别占用）照旧成立。
+    """
     base = labels_dir(root, lib)
     if not os.path.isdir(base):
         return
@@ -297,31 +301,62 @@ def _iter_box_labels(root: str, lib: str = LIB_OBJECTS):
                 continue
             path = os.path.join(dirpath, fn)
             rel = os.path.relpath(path, base).replace("\\", "/")
-            yield rel, read_label_rows(path)
+            yield rel, read_label_entries(path)
 
 
-def read_label_rows(path: str) -> List[Tuple[int, float, float, float, float]]:
-    """读 detection 标签，返回 ``(class_id, cx, cy, w, h)`` 列表；坏行直接跳过。"""
-    rows: List[Tuple[int, float, float, float, float]] = []
+#: 轮廓尾列的最少列数：3 个点 × (x, y)
+POLY_MIN_COLUMNS = 6
+
+
+def parse_polygon(tokens: Sequence[str]) -> List[float]:
+    """把标签尾列解析成归一化多边形 ``[x1, y1, x2, y2, ...]``；不合规就返回空表。
+
+    读的时候**不报错**：尾列写坏了宁可当没轮廓（框还要留着），坏列由
+    :func:`validate_box_label_file` 负责报出来。
+    """
+    if len(tokens) < POLY_MIN_COLUMNS or len(tokens) % 2:
+        return []
+    try:
+        values = [float(token) for token in tokens]
+    except ValueError:
+        return []
+    return [max(0.0, min(1.0, value)) for value in values]
+
+
+def read_label_entries(path: str) -> List[Tuple[int, float, float, float, float, List[float]]]:
+    """读 detection 标签，含可选的轮廓尾列；坏行直接跳过。
+
+    前 5 列含义不变（``class cx cy w h``），轮廓接在后面：只认 5 列的老逻辑
+    读到的是同一个框，``-seg`` 权重的轮廓也不再被压成方框丢掉。
+    """
+    entries: List[Tuple[int, float, float, float, float, List[float]]] = []
     try:
         with open(path, "r", encoding="utf-8") as fh:
             lines = fh.read().splitlines()
     except OSError:
-        return rows
+        return entries
     for line in lines:
         parts = line.split()
         if len(parts) < 5:
             continue
         try:
-            rows.append((int(float(parts[0])), float(parts[1]), float(parts[2]),
-                         float(parts[3]), float(parts[4])))
+            entries.append((int(float(parts[0])), float(parts[1]), float(parts[2]),
+                            float(parts[3]), float(parts[4]), parse_polygon(parts[5:])))
         except ValueError:
             continue
-    return rows
+    return entries
+
+
+def read_label_rows(path: str) -> List[Tuple[int, float, float, float, float]]:
+    """读 detection 标签的 ``(class_id, cx, cy, w, h)``；轮廓在这里被抹掉。
+
+    只要方框的调用方用它，要轮廓用 :func:`read_label_entries`。
+    """
+    return [row[:5] for row in read_label_entries(path)]
 
 
 def validate_box_label_file(path: str, class_ids: Optional[set] = None) -> List:
-    """校验 YOLO detection 标签（``class cx cy w h`` 五列）。
+    """校验 YOLO detection 标签（``class cx cy w h``，可再接归一化轮廓点列）。
 
     ``read_label_rows`` 为了不让一行脏数据毁掉整批，坏行是**静默跳过**的——
     标注时这样对，校验时正相反：被跳过的行必须报出来，否则用户永远不知道自己
@@ -342,9 +377,9 @@ def validate_box_label_file(path: str, class_ids: Optional[set] = None) -> List:
                                          f"只有 {len(parts)} 列，detection 标签要 5 列"
                                          f"（class cx cy w h）", lineno))
                 continue
-            if len(parts) > 5:
-                issues.append(LabelIssue(path, "extra_columns",
-                                         f"多出 {len(parts) - 5} 列，训练时会被忽略", lineno))
+            tail = parts[5:]
+            if tail:
+                issues += _polygon_issues(path, lineno, tail)
             try:
                 class_id = int(float(parts[0]))
                 cx, cy, width, height = (float(value) for value in parts[1:5])
@@ -365,6 +400,29 @@ def validate_box_label_file(path: str, class_ids: Optional[set] = None) -> List:
     return issues
 
 
+def _polygon_issues(path: str, lineno: int, tail: Sequence[str]) -> List:
+    """轮廓尾列的格式检查：点数、成对、取值范围。"""
+    from .yolo_pose import LabelIssue
+
+    issues: List = []
+    if len(tail) % 2:
+        return [LabelIssue(path, "bad_polygon",
+                           f"轮廓多出 {len(tail)} 列，点的坐标要成对写（x y）", lineno)]
+    if len(tail) < POLY_MIN_COLUMNS:
+        return [LabelIssue(path, "bad_polygon",
+                           f"轮廓只有 {len(tail) // 2} 个点，多边形至少要 3 个点", lineno)]
+    try:
+        points = [float(value) for value in tail]
+    except ValueError as exc:
+        return [LabelIssue(path, "parse_error", f"轮廓坐标不是数字：{exc}", lineno)]
+    outside = [value for value in points if not (0.0 <= value <= 1.0)]
+    if outside:
+        issues.append(LabelIssue(path, "poly_range",
+                                f"轮廓有 {len(outside)} 个坐标越界（要在 0~1 之间，"
+                                f"例如 {outside[0]:.4f}）", lineno))
+    return issues
+
+
 def write_label_rows(path: str, rows: Sequence[Sequence[float]]) -> str:
     """写 detection 标签文件（空列表落一个空文件，表示「这张看过了，确实没有目标」）。"""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -375,10 +433,31 @@ def write_label_rows(path: str, rows: Sequence[Sequence[float]]) -> str:
 
 
 def format_label_row(row: Sequence[float]) -> str:
-    """``class cx cy w h``，与 YOLO detection 完全一致（不带多余列，可直接喂训练）。"""
+    """``class cx cy w h``；带轮廓时再接归一化点列 ``x1 y1 ...``。
+
+    不带轮廓时与 YOLO detection 完全一致，可直接喂 ``yolo detect train``；
+    带轮廓时前 5 列一个字符都不变，老的读取逻辑照样拿到同一个框。
+    """
     cls = int(round(float(row[0])))
     values = [max(0.0, min(1.0, float(v))) for v in row[1:5]]
-    return " ".join([str(cls)] + [f"{v:.6f}" for v in values])
+    cells = [str(cls)] + [f"{v:.6f}" for v in values]
+    tail = [max(0.0, min(1.0, float(v))) for v in row[5:]]
+    if len(tail) >= POLY_MIN_COLUMNS and len(tail) % 2 == 0:
+        cells += [f"{v:.6f}" for v in tail]
+    return " ".join(cells)
+
+
+def format_segment_row(row: Sequence[float]) -> str:
+    """标准 YOLO **segment** 行：``class x1 y1 x2 y2 ...``（不带方框列）。
+
+    导出的训练集用这个格式，轮廓才真的进得去分割训练；本库自己的标签文件用
+    :func:`format_label_row`（方框优先，轮廓是附加信息）。
+    """
+    cls = int(round(float(row[0])))
+    points = [max(0.0, min(1.0, float(v))) for v in row[1:]]
+    if len(points) < POLY_MIN_COLUMNS or len(points) % 2:
+        raise ValueError(f"分割标签要至少 3 个点（{POLY_MIN_COLUMNS} 列坐标），现在只有 {len(points)} 列")
+    return " ".join([str(cls)] + [f"{v:.6f}" for v in points])
 
 
 def delete_field(root: str, wanted: str, *, drop_boxes: bool = False,
@@ -409,6 +488,12 @@ def delete_field(root: str, wanted: str, *, drop_boxes: bool = False,
             "class_id": class_id, "boxes_removed": boxes, "labels_touched": touched}
 
 
+def flatten_label_row(entry: Sequence[object]) -> List[float]:
+    """``(class_id, cx, cy, w, h, [轮廓点])`` → 一行标签要的扁平数字列表。"""
+    tail = entry[5] if len(entry) > 5 else []
+    return [float(entry[0])] + [float(v) for v in entry[1:5]] + [float(v) for v in (tail or [])]
+
+
 def _strip_class(root: str, class_id: int, lib: str = LIB_OBJECTS) -> int:
     """从本库所有 detection 标签里去掉某个类别号的行，返回改动过的文件数。
 
@@ -424,7 +509,7 @@ def _strip_class(root: str, class_id: int, lib: str = LIB_OBJECTS) -> int:
     count_key = field_key(lib, "objects")
     touched = 0
     for rel, rows in _iter_box_labels(root, lib):
-        kept = [row for row in rows if row[0] != class_id]
+        kept = [flatten_label_row(row) for row in rows if row[0] != class_id]
         if len(kept) == len(rows):
             continue
         write_label_rows(os.path.join(base, rel), kept)

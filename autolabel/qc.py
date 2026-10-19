@@ -50,8 +50,9 @@ FLAG_HINTS = {
     "vlm_labeled": "由多模态大模型标注，骨骼坐标精度弱于 YOLO-pose，建议逐张核对",
 }
 
-# 正向标记不构成"待复核"理由
-POSITIVE_FLAGS = {"multi_model_confirmed"}
+# 正向标记不构成"待复核"理由：它们是"这件事进展得更好"，不是"这里有问题"
+# （masked 从 v1.4.6 起只代表轮廓已落盘，轮廓不再被压成方框，也就不是缺陷了）
+POSITIVE_FLAGS = {"multi_model_confirmed", "masked"}
 
 # 平均置信度低于这条线，机器自己都没把握，也算"该让人看一眼"
 LOW_SCORE = 0.4

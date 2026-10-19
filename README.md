@@ -62,11 +62,11 @@ yolo detect train
 
 （并行链路 B）同一批 images
    │  detect（本机 YOLO 权重按自带类别出框 → detect_labels/*.txt，5 列 detection）
-   │  类别号由本库登记表决定，同名类别永不换号
+   │  类别号由本库登记表决定，同名类别永不换号；分割权重还会把轮廓一起落盘
    ▼
 目标检测页删错框 / 补画漏框 → detect --export
    ▼
-yolo detect train
+yolo detect / segment train
 ```
 
 ## 和别的标注工具比

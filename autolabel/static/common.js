@@ -125,7 +125,7 @@ const FLAG_LABEL = {
   vlm_failed: "大模型没答上",
   model_stale: "标注用的模型或设置已变更",
   model_failed: "这次推理失败",
-  masked: "分割轮廓只记了外框",
+  masked: "分割轮廓已随框保存",
   manual: "人工画的框",
 };
 const flagLabel = (f) => FLAG_LABEL[f] || f;
@@ -1311,6 +1311,7 @@ function exportSummary(info, kind) {
     const boxes = info.boxes || {};
     bits.push(`${(boxes.train || 0) + (boxes.val || 0)} 框`);
   }
+  if (info.segment_note) bits.push(info.segment_note);
   if (info.skipped_note) bits.push(`没收进来的 ${info.skipped_note}`);
   if (info.mode_note) bits.push(info.mode_note);
   const dropped = info.empty_dropped !== undefined ? info.empty_dropped : counts.empty_dropped;

@@ -501,6 +501,26 @@ EXPORT_META_NAMES = {"detect": "prompt_meta.json", "yolo_detect": "yolo_meta.jso
                      "pose": "manifest.json"}
 
 
+def segment_note(counts: dict) -> str:
+    """导出口径用一句中文说清：轮廓进了几个框，剩下的按方框算。"""
+    shaped = int((counts or {}).get("segment_boxes") or 0)
+    plain = int((counts or {}).get("box_only") or 0)
+    if not shaped:
+        return ""
+    if not plain:
+        return f"全部 {shaped} 个框带轮廓，按 segment 格式导出，可直接分割训练"
+    return (f"{shaped} 个框带轮廓按 segment 行导出，另 {plain} 个只有方框"
+            "（YOLO 分割训练两种都能吃）")
+
+
+def export_task(counts: dict, stored: object = "") -> str:
+    """这批产物到底是 detection 还是 segment：老 meta 没写 task 时按框数倒推。"""
+    task = str(stored or "")
+    if task in ("detect", "segment"):
+        return task
+    return "segment" if int((counts or {}).get("segment_boxes") or 0) else "detect"
+
+
 def find_reusable_export(root: str, fingerprint: str, kind: str = "pose") -> Optional[dict]:
     """`exports/` 里最近一份指纹完全相同的导出目录，命中就直接复用，字段与真实导出保持一致。"""
     if not fingerprint:
@@ -526,9 +546,13 @@ def find_reusable_export(root: str, fingerprint: str, kind: str = "pose") -> Opt
             classes = [{"class_id": int(cid), "export_id": int(value),
                         "name": (fields.get(int(cid)) or {}).get("name") or f"class_{cid}"}
                        for cid, value in sorted(remap.items(), key=lambda kv: int(kv[1]))]
+            task = export_task(counts, meta.get("task"))
             return {"out": row["path"], "reused": True, "images": counts.get("train", 0) + counts.get("val", 0),
                     "train": counts.get("train", 0), "val": counts.get("val", 0),
                     "boxes": counts.get("boxes") or {}, "classes": classes, "counts": counts,
+                    # 复用旧目录时口径也得说对：分割训练集被叫成检测训练集，
+                    # 用户就会对着 task: segment 的 data.yaml 怀疑自己看错了
+                    "task": task, "segment_note": segment_note(counts),
                     "data_yaml": row["data_yaml"]}
         return {"out": row["path"], "reused": True,
                 "train": counts.get("train", 0), "val": counts.get("val", 0),

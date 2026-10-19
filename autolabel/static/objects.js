@@ -373,6 +373,24 @@ window.addEventListener("appearancechange", () => { draw(); });
  */
 const boxScore = (v) => (v === null || v === undefined || v === "" ? "—" : Number(v).toFixed(2));
 
+/** 分割轮廓（像素点列）：少于 3 个点就不画，残缺轮廓画出来是幽灵多边形。 */
+const polyPoints = (box) => (Array.isArray(box.poly) && box.poly.length > 2 ? box.poly : []);
+
+/** 有轮廓时方框改成虚线细描边：轮廓才是主角，但框还得看得见、拖得动。 */
+function drawPolygon(points, color, selected) {
+  ctx.beginPath();
+  points.forEach(([px, py], i) => {
+    const [sx, sy] = toScreen(px, py);
+    if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+  });
+  ctx.closePath();
+  ctx.fillStyle = color + (selected ? "3a" : "1a");
+  ctx.fill();
+  ctx.lineWidth = selected ? 2.4 : 1.6;
+  ctx.strokeStyle = color;
+  ctx.stroke();
+}
+
 async function draw() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (!state.img) return;
@@ -385,11 +403,20 @@ async function draw() {
     const [x2, y2] = toScreen(box.xyxy[2], box.xyxy[3]);
     const color = fieldColor(box.cls);
     const selected = index === state.sel;
+    const poly = polyPoints(box);
     ctx.lineWidth = selected ? 2.5 : 1.6;
     ctx.strokeStyle = color;
-    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-    ctx.fillStyle = color + (selected ? "44" : "1f");
-    ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+    if (poly.length) {
+      drawPolygon(poly, color, selected);
+      ctx.setLineDash([4, 3]);
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.setLineDash([]);
+    } else {
+      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.fillStyle = color + (selected ? "44" : "1f");
+      ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+    }
     if (selected) {
       ctx.fillStyle = color;
       for (const [hx, hy] of [[x1, y1], [x2, y1], [x1, y2], [x2, y2]]) {
@@ -399,7 +426,8 @@ async function draw() {
     if (!showLabels) return;
     const small = (box.flags || []).includes("small_box") ? " ⚠" : "";
     const edge = (box.flags || []).includes("edge_box") ? " ✂" : "";
-    const label = `${fieldName(box.cls)} · ${boxScore(box.score)}${small}${edge}`;
+    const shape = poly.length ? " ◇" : "";
+    const label = `${fieldName(box.cls)} · ${boxScore(box.score)}${small}${edge}${shape}`;
     ctx.font = cfont(12);
     const w = ctx.measureText(label).width + 8;
     const top = Math.max(0, y1 - 16);
@@ -822,7 +850,8 @@ function renderBoxes() {
     chips.textContent = ` ${boxScore(boxItem.score)} `;
     for (const flag of boxItem.flags || []) {
       const chip = document.createElement("span");
-      chip.className = "chip" + (flag === "manual" ? "" : " warn");
+      // 正向标记（人工画的框、轮廓已落盘）不染红：它们是说明，不是问题
+      chip.className = "chip" + (flagPolicy.positive.has(flag) || flag === "manual" ? "" : " warn");
       chip.textContent = flagLabel(flag);
       chip.title = flag + " · " + (flagHint(flag) || "人工确认");
       chips.append(chip);

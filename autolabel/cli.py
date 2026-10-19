@@ -1109,8 +1109,10 @@ def cmd_prompt(args: argparse.Namespace) -> int:
     if args.export:
         exported = export_detection_dataset(args.dataset, out=args.out or None)
         result["export"] = str(exported["out"])
-        print(f"[ok] detection 训练集：{result['export']}（train {exported['train']} / "
-              f"val {exported['val']}，{exported['data_yaml']}）")
+        print(f"[ok] {export_task_name(exported)}训练集：{result['export']}"
+              f"（train {exported['train']} / val {exported['val']}，{exported['data_yaml']}）")
+        if exported.get("segment_note"):
+            print(f"     {exported['segment_note']}")
     finish_batch(args.dataset, batch["id"], "done",
                  f"标注 {stats['labeled']} 张，产出 {stats['boxes']} 个框")
     print(f"[ok] 批次 {batch['id']}：标注 {stats['labeled']} 张 · 框 {stats['boxes']} · "
@@ -1125,6 +1127,11 @@ def cmd_prompt(args: argparse.Namespace) -> int:
     if not args.coords:
         print("     要导出坐标文件加 --coords，直接出训练集加 --export")
     return 0
+
+
+def export_task_name(exported: dict) -> str:
+    """导出行前的中文名按实际口径写：分割训练集不该被叫成 detection 训练集。"""
+    return "分割（segment）" if str(exported.get("task") or "") == "segment" else "检测（detection）"
 
 
 def _split_multi(values: Sequence[str]) -> List[str]:
@@ -1286,8 +1293,10 @@ def cmd_detect(args: argparse.Namespace) -> int:
         from .detect import export_detect_dataset
 
         exported = export_detect_dataset(args.dataset, out=args.out or None)
-        print(f"[ok] detection 训练集：{exported['out']}（train {exported['train']} / "
-              f"val {exported['val']}，{exported['data_yaml']}）")
+        print(f"[ok] {export_task_name(exported)}训练集：{exported['out']}"
+              f"（train {exported['train']} / val {exported['val']}，{exported['data_yaml']}）")
+        if exported.get("segment_note"):
+            print(f"     {exported['segment_note']}")
     finish_batch(args.dataset, batch["id"], "done",
                  f"用 {os.path.basename(model)} 标注 {stats['labeled']} 张，产出 {stats['boxes']} 个框")
     print(f"[ok] 批次 {batch['id']}：标注 {stats['labeled']} 张 · 框 {stats['boxes']} · "
@@ -1979,7 +1988,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--overwrite", action="store_true",
                    help="已经标过的也重标（默认跳过同参数已标的、人工接受过的、人工画过框的图）")
     p.add_argument("--coords", action="store_true", help="顺带导出坐标文件（CSV + JSONL）")
-    p.add_argument("--export", action="store_true", help="顺带导出 YOLO detection 训练集")
+    p.add_argument("--export", action="store_true",
+                   help="顺带导出 YOLO 训练集（标签里有轮廓时出 segment 格式）")
     p.add_argument("--out", default="", help="配合 --export：导出目录")
     p.add_argument("--max-print", type=_positive_int, default=40,
                    help="配合 --model-classes：最多打印多少类，默认 40")

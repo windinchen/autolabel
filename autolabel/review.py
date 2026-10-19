@@ -95,6 +95,7 @@ from .prompt import (
     apply_manual_marks,
     apply_scores,
     box_flags,
+    carry_polygons,
     image_flags,
     prompt_priority,
     prompt_summary,
@@ -686,6 +687,9 @@ class ReviewStore:
                 detections.append(detection)
             # 前端没带分数的框（手画的、或它自己也是从磁盘读来的）按几何签名认回来
             apply_scores(detections, item.get(key("scores")) or {})
+            # 复核页只回传方框，轮廓得从磁盘上的老标签认领回来，否则点一次「接受」
+            # 分割权重落的轮廓就没了（框被动过，轮廓跟着仿射拉伸到新框）
+            carry_polygons(detections, read_detections(self.root, image_rel, lib))
             per_box = box_flags(detections, width, height, list(registry))
             manual_indices = [index for index, raw in enumerate(objects or [])
                               if "manual" in (raw.get("flags") or [])]

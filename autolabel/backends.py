@@ -6,7 +6,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -671,13 +671,106 @@ class Detection:
     w: float
     h: float
     has_mask: bool = False
+    #: 分割权重的轮廓，归一化 ``[x1, y1, x2, y2, ...]``；普通检测框为空
+    poly: List[float] = field(default_factory=list)
 
     def as_row(self) -> List[float]:
         return [float(self.class_id), self.cx, self.cy, self.w, self.h]
 
 
+#: 单个轮廓最多留多少个点：再多标签文件会涨得比图还快，训练也用不上
+MAX_POLY_POINTS = 80
+#: 轮廓外接框与模型方框的 IoU 下限：低于它说明轮廓和框根本不是一个东西
+#: （上游哪天把 mask 留在带灰边的推理尺寸上，轮廓会整体缩在一块，宁可不要）
+POLY_BOX_IOU = 0.25
+
+
+def _polygon_to_flat(contour, width: int, height: int) -> List[float]:
+    """一圈轮廓点（像素）→ 归一化点列。"""
+    points: List[float] = []
+    for x, y in contour.reshape(-1, 2):
+        points.append(round(min(1.0, max(0.0, float(x) / max(1, width))), 6))
+        points.append(round(min(1.0, max(0.0, float(y) / max(1, height))), 6))
+    return points
+
+
+def _polygon_bbox(points: Sequence[float]) -> Tuple[float, float, float, float]:
+    xs = [points[i] for i in range(0, len(points), 2)]
+    ys = [points[i] for i in range(1, len(points), 2)]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _polygon_agrees(points: Sequence[float], box: Sequence[float]) -> bool:
+    """轮廓外接框和模型给的方框对不对得上（都是归一化，框为 ``cx cy w h``）。"""
+    if len(points) < 6 or len(box) < 4:
+        return False
+    px1, py1, px2, py2 = _polygon_bbox(points)
+    cx, cy, w, h = (float(v) for v in box[:4])
+    bx1, by1, bx2, by2 = cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0
+    inter = max(0.0, min(px2, bx2) - max(px1, bx1)) * max(0.0, min(py2, by2) - max(py1, by1))
+    union = max(0.0, (px2 - px1) * (py2 - py1)) + max(0.0, w * h) - inter
+    return union <= 0 or inter / union >= POLY_BOX_IOU
+
+
+def mask_polygons(result, want: Sequence[int], boxes: Sequence[Sequence[float]]) -> List[List[float]]:
+    """把分割结果的 mask 收成归一化多边形，返回值与 ``want`` 一一对齐。
+
+    ``want[k]`` 是第 k 个要轮廓的 mask 行号，``boxes[k]`` 是它的归一化方框。
+    拿不到轮廓就回空表——**分割轮廓是加分项，不能因为解析失败把整张图的框带走**。
+
+    为什么不直接用 ultralytics 的 ``ops.masks_to_polygons``：它在 8.x 里换过名字与
+    签名，一升级就整片轮廓静默消失。这里只依赖 ``masks.data`` 是 (N, H, W) 数组，
+    找轮廓交给 OpenCV（``predict`` 本来就要 import 它做色彩转换）。
+    """
+    out: List[List[float]] = [[] for _ in want]
+    data = getattr(getattr(result, "masks", None), "data", None)
+    if data is None or not want:
+        return out
+    try:
+        import cv2
+        import numpy as np
+
+        raw = data.detach().cpu().numpy() if hasattr(data, "detach") else np.asarray(data)
+        raw = np.asarray(raw)
+        if raw.ndim != 3:
+            return out
+    except Exception:  # noqa: BLE001 缺 cv2 / 张量搬不动都只影响轮廓
+        return out
+    for slot, index in enumerate(want):
+        if index < 0 or index >= raw.shape[0]:
+            continue
+        try:
+            binary = (np.asarray(raw[index], dtype="float32") > 0.5).astype("uint8")
+            if int(binary.sum()) < 4:
+                continue
+            found = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            # OpenCV 4 返回 (轮廓, 层级)，3.x 多返回一个旧图像：倒数第二个才是轮廓列表
+            contours = found[-2]
+            if not contours:
+                continue
+            contour = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(contour) < 4:
+                continue
+            height, width = binary.shape[:2]
+            epsilon = 0.01 * cv2.arcLength(contour, True)
+            approx = contour
+            for _ in range(6):
+                approx = cv2.approxPolyDP(contour, epsilon, True)
+                if 3 <= len(approx) <= MAX_POLY_POINTS:
+                    break
+                epsilon *= 1.6 if len(approx) > MAX_POLY_POINTS else 0.6
+            if len(approx) < 3:
+                continue
+            points = _polygon_to_flat(approx, width, height)
+        except Exception:  # noqa: BLE001 单个轮廓失败只丢这一个轮廓
+            continue
+        if _polygon_agrees(points, boxes[slot] if slot < len(boxes) else ()):
+            out[slot] = points
+    return out
+
+
 class DetectionBackend:
-    """目标检测 / 实例分割后端：出框，不出关键点。
+    """目标检测 / 实例分割后端：出框，分割权重还出轮廓。
 
     与 ``PoseBackend`` 分开是有意的：检测库关心的是「这是什么、在哪」，
     类别表由模型给；姿态库的类别永远是 person，多出来的东西全是关键点。
@@ -811,17 +904,26 @@ class DetectionBackend:
         out: List[Detection] = []
         if boxes is None:
             return out
+        rows: List[Tuple[float, float, float, float]] = []
+        slots: List[int] = []
         for i in range(len(boxes)):
             class_id = int(boxes.cls[i])
             name = self.names.get(class_id, str(class_id))
             if wanted is not None and class_id not in wanted:
                 continue                              # 个别版本不认 classes，兜底再滤一次
             x1, y1, x2, y2 = (float(v) for v in boxes.xyxy[i].tolist())
+            box = (((x1 + x2) / 2.0) / max(1.0, width), ((y1 + y2) / 2.0) / max(1.0, height),
+                   max(0.0, x2 - x1) / max(1.0, width), max(0.0, y2 - y1) / max(1.0, height))
+            rows.append(box)
+            slots.append(i)
             out.append(Detection(
                 class_id=class_id, class_name=name, score=float(boxes.conf[i]),
-                cx=((x1 + x2) / 2.0) / max(1.0, width), cy=((y1 + y2) / 2.0) / max(1.0, height),
-                w=max(0.0, x2 - x1) / max(1.0, width), h=max(0.0, y2 - y1) / max(1.0, height),
-                has_mask=has_mask))
+                cx=box[0], cy=box[1], w=box[2], h=box[3], has_mask=has_mask))
+        if has_mask:
+            # 逐框贴轮廓：mask_polygons 的返回值与框一一对齐，对不上框的那几个留空
+            for position, points in enumerate(mask_polygons(result, slots, rows)):
+                if position < len(out):
+                    out[position].poly = points
         return out
 
     def describe(self) -> dict:

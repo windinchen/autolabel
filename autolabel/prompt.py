@@ -79,7 +79,7 @@ DETECT_FLAG_HINTS = {
     "unknown_class": "标签里有登记表里不存在的类别号（类别被删过或手工改过盘）",
     "model_stale": "标注用的权重/类别/阈值与当前设置不一致，建议重新标注",
     "model_failed": "这次推理失败（权重缺失/显存不足/读图失败），框是旧的或缺失",
-    "masked": "这一轮出自分割权重：多边形轮廓只按外接水平框记录，想要轮廓得换标注方式",
+    "masked": "这一轮出自分割权重：轮廓已随框落盘，导出时可按 segment 格式训练",
     "manual": "人工补画或重画的框（不是模型给的），导出时置信度按 1 计",
 }
 
@@ -87,7 +87,7 @@ OBJECT_COLUMNS = [
     "image", "status", "box_index", "class_id", "class_name", "display_name",
     "image_width", "image_height",
     "bbox_x1", "bbox_y1", "bbox_x2", "bbox_y2",
-    "bbox_cx", "bbox_cy", "bbox_w", "bbox_h",
+    "bbox_cx", "bbox_cy", "bbox_w", "bbox_h", "poly_points",
     "box_flags", "image_flags", "image_score", "time_sec", "video", "source",
 ]
 
@@ -100,6 +100,7 @@ OBJECT_COLUMN_DOC = {
     "display_name": "字段中文显示名",
     "bbox_x1..y2": "边界框，像素坐标 xyxy",
     "bbox_cx..h": "边界框，归一化 cxcywh（与标签文件一致）",
+    "poly_points": "轮廓点数，0 = 这一框只有方框没有轮廓",
     "box_flags": "这个框的质量标记（small_box/edge_box/dup_box/unknown_class）",
     "image_flags": "整图标记（none_found/prompt_stale/vlm_failed）",
     "image_score": "该图所有框的平均置信度，人工补画的框按 1 计",
@@ -138,6 +139,8 @@ class Detection:
     h: float
     score: float = 0.0
     flags: List[str] = field(default_factory=list)
+    #: 归一化多边形轮廓 ``[x1, y1, x2, y2, ...]``；只有方框时为空表
+    poly: List[float] = field(default_factory=list)
 
     @property
     def xyxy_norm(self) -> Tuple[float, float, float, float]:
@@ -147,8 +150,17 @@ class Detection:
         x1, y1, x2, y2 = self.xyxy_norm
         return (x1 * width, y1 * height, x2 * width, y2 * height)
 
+    @property
+    def points(self) -> List[Tuple[float, float]]:
+        """轮廓点（归一化）。少于 3 点时是空表：残缺轮廓不值得当轮廓用。"""
+        flat = [float(v) for v in self.poly]
+        if len(flat) < 6 or len(flat) % 2:
+            return []
+        return [(flat[i], flat[i + 1]) for i in range(0, len(flat) - 1, 2)]
+
     def row(self) -> List[float]:
-        return [float(self.cls), self.cx, self.cy, self.w, self.h]
+        """标签行：5 列方框 + 轮廓尾列（没有轮廓就只有 5 列，与老格式完全一致）。"""
+        return [float(self.cls), self.cx, self.cy, self.w, self.h] + [float(v) for v in self.poly]
 
     def payload(self, width: int, height: int) -> dict:
         x1, y1, x2, y2 = self.xyxy(width, height)
@@ -157,13 +169,16 @@ class Detection:
                 # 0 分是"没拿到分数"，不是"模型很有把握地给了 0 分"：交给界面显示 —
                 "score": round(self.score, 4) if self.score > 0 else None,
                 "flags": list(self.flags),
-                "xyxy": [round(v, 2) for v in (x1, y1, x2, y2)]}
+                "xyxy": [round(v, 2) for v in (x1, y1, x2, y2)],
+                # 轮廓给界面画的是像素点；没有轮廓就是空表，前端不会画出幽灵多边形
+                "poly": [[round(px * width, 2), round(py * height, 2)]
+                         for px, py in self.points]}
 
 
 def read_detections(root: str, image_rel: str, lib: str = LIB_OBJECTS) -> List[Detection]:
     path = label_path_for(root, image_rel, lib)
-    return [Detection(cls=cls, cx=cx, cy=cy, w=w, h=h)
-            for cls, cx, cy, w, h in field_store.read_label_rows(path)]
+    return [Detection(cls=cls, cx=cx, cy=cy, w=w, h=h, poly=list(poly))
+            for cls, cx, cy, w, h, poly in field_store.read_label_entries(path)]
 
 
 def apply_manual_marks(detections: List[Detection], indices: Sequence[int]) -> List[Detection]:
@@ -183,6 +198,57 @@ def apply_manual_marks(detections: List[Detection], indices: Sequence[int]) -> L
             if detection.score <= 0:
                 detection.score = 1.0
     return detections
+
+
+def carry_polygons(detections: List[Detection], previous: Sequence[Detection],
+                   threshold: float = 0.3) -> List[Detection]:
+    """把磁盘上老轮廓认领回新框，并按新框把轮廓拉伸过去。
+
+    复核页保存时只回传方框（画框的 UI 不编辑轮廓），不认领就等于「点了接受，
+    轮廓没了」。认领按同类别 IoU 从高到低一对一匹配：
+      * 框没动 → 轮廓原样保留；
+      * 框被拖动/缩放 → 轮廓按方框仿射拉伸，跟着框一起走；
+      * 人工新画的框（``manual``）不认领——那是用户画的方框，硬套一个轮廓是编数据。
+    """
+    pool = [item for item in previous if item.points]
+    if not pool:
+        return detections
+    pairs = []
+    for position, item in enumerate(detections):
+        if item.poly or "manual" in (item.flags or []):
+            continue
+        for old_index, old in enumerate(pool):
+            if old.cls != item.cls:
+                continue
+            overlap = iou(old, item)
+            if overlap >= threshold:
+                pairs.append((overlap, position, old_index))
+    pairs.sort(key=lambda row: -row[0])
+    # 一对一：新框和老轮廓各记各的已配对，混在一个集合里会互相顶掉
+    # （两个框交换位置是常事，顶掉之后总有一个框莫名其妙丢了轮廓）
+    matched_new: set = set()
+    matched_old: set = set()
+    for overlap, position, old_index in pairs:
+        if position in matched_new or old_index in matched_old:
+            continue
+        matched_new.add(position)
+        matched_old.add(old_index)
+        detections[position].poly = _rescale_polygon(pool[old_index], detections[position])
+    return detections
+
+
+def _rescale_polygon(old: Detection, new: Detection) -> List[float]:
+    """把 ``old`` 的轮廓仿射映射到 ``new`` 的方框里；框没动时等于原样返回。"""
+    points = old.points
+    if not points or old.w <= 0 or old.h <= 0:
+        return []
+    ox1, oy1 = old.cx - old.w / 2.0, old.cy - old.h / 2.0
+    nx1, ny1 = new.cx - new.w / 2.0, new.cy - new.h / 2.0
+    out: List[float] = []
+    for px, py in points:
+        out.append(round(min(1.0, max(0.0, nx1 + (px - ox1) / old.w * new.w)), 6))
+        out.append(round(min(1.0, max(0.0, ny1 + (py - oy1) / old.h * new.h)), 6))
+    return out
 
 
 def signature_from_row(row: Sequence[float]) -> str:
@@ -476,6 +542,10 @@ def box_flags(detections: Sequence[Detection], width: int, height: int,
     out: List[List[str]] = []
     for index, item in enumerate(detections):
         flags = list(item.flags)
+        if item.poly:
+            # 有轮廓就是分割权重出的框：标签文件不落 flags，这个记号按轮廓本身认，
+            # 比"标注那会儿记得、重读磁盘就忘"可靠（复核页点一次接受就不再查无此人）
+            flags.append("masked")
         if width and height:
             x1, y1, x2, y2 = item.xyxy(width, height)
             if min(x2 - x1, y2 - y1) < MIN_BOX_PIXEL:
@@ -787,6 +857,7 @@ def collect_object_records(root: str, exclude_status: Sequence[str] = ("rejected
                 "display_name": field_row.get("label") or field_row.get("name") or "",
                 "bbox_xyxy": payload["xyxy"],
                 "bbox_cxcywh_norm": [detection.cx, detection.cy, detection.w, detection.h],
+                "polygon": list(detection.poly),
                 "flags": per_box[index],
             })
         records.append({
@@ -828,6 +899,7 @@ def _write_object_wide(path: str, records: Sequence[dict]) -> int:
                     "bbox_x2": obj["bbox_xyxy"][2], "bbox_y2": obj["bbox_xyxy"][3],
                     "bbox_cx": obj["bbox_cxcywh_norm"][0], "bbox_cy": obj["bbox_cxcywh_norm"][1],
                     "bbox_w": obj["bbox_cxcywh_norm"][2], "bbox_h": obj["bbox_cxcywh_norm"][3],
+                    "poly_points": len(obj.get("polygon") or []) // 2,
                     "box_flags": "|".join(obj["flags"]), "image_flags": "|".join(rec["image_flags"]),
                     "image_score": rec["image_score"] if rec["image_score"] is not None else "",
                     "time_sec": rec["time_sec"] if rec["time_sec"] is not None else "",
@@ -916,13 +988,17 @@ def export_detection_dataset(
 ) -> dict:
     """导出可直接喂 ``yolo detect train`` 的目录（train/val + data.yaml）。
 
+    标签里带轮廓（分割权重落的）时改出 **segment** 格式：有轮廓的框写成
+    ``class x1 y1 ...``，只有方框的框仍是 5 列，``data.yaml`` 标 ``task: segment``——
+    YOLO 的分割训练允许这两种行混在一个数据集里。没有轮廓时输出与以前逐字节相同。
+
     类别号会被重映射成连续的 0..N-1：登记表里删过字段时，标签里的 ``class_id``
     可能不连续，而 YOLO 要求 ``names`` 的键从 0 连续递增。
     """
     from .export import (MISSING_SOURCE_REASON, _place, content_fingerprint,
                          find_reusable_export, place_note, prune_stale, rank_for_split,
-                         skipped_summary, split_val_set, unique_export_dir, unique_stem,
-                         yaml_comment, yaml_scalar)
+                         segment_note, skipped_summary, split_val_set, unique_export_dir,
+                         unique_stem, yaml_comment, yaml_scalar)
 
     lib = normalize_lib(lib)
     records, meta = collect_object_records(root, exclude_status=exclude_status, lib=lib)
@@ -956,8 +1032,11 @@ def export_detection_dataset(
     val_set = split_val_set([rec["image"] for rec in selected], val_ratio, seed)
     fingerprint = content_fingerprint(
         [(rec["image"], "\n".join(
-            "{}:{:.6f},{:.6f},{:.6f},{:.6f}".format(
-                obj["cls"], *obj["bbox_cxcywh_norm"]) for obj in rec["objects"]).encode("utf-8"))
+            "{}:{:.6f},{:.6f},{:.6f},{:.6f}{}".format(
+                obj["cls"], *obj["bbox_cxcywh_norm"],
+                "|" + ",".join("%.6f" % float(v) for v in (obj.get("polygon") or []))
+                if obj.get("polygon") else "")
+            for obj in rec["objects"]).encode("utf-8"))
          for rec in selected],
         params=json.dumps({"val_ratio": val_ratio, "max_empty_ratio": max_empty_ratio,
                            "mode": mode, "seed": seed, "exclude": sorted(exclude_status),
@@ -981,7 +1060,9 @@ def export_detection_dataset(
         os.makedirs(os.path.join(out_root, "labels", split), exist_ok=True)
 
     counts = {"train": 0, "val": 0, "boxes": {"train": 0, "val": 0}, "empty": len(empty),
-              "empty_dropped": len(empty_dropped), "dropped": 0, "missing_source": len(missing)}
+              "empty_dropped": len(empty_dropped), "dropped": 0, "missing_source": len(missing),
+              # 轮廓是分割训练的门槛，导出的时候必须说清有多少框真的带轮廓
+              "segment_boxes": 0, "box_only": 0}
     written: Dict[str, set] = {"train": set(), "val": set()}
     taken: Dict[str, str] = {}
     placed: set = set()
@@ -999,8 +1080,14 @@ def export_detection_dataset(
                 counts["dropped"] += 1
                 continue
             cx, cy, w, h = obj["bbox_cxcywh_norm"]
-            lines.append(field_store.format_label_row([remap[obj["cls"]], cx, cy, w, h]))
-        with open(dst_lbl, "w", encoding="utf-8") as fh:  # 永远写 5 列，删掉的类别不留尾巴
+            polygon = [float(v) for v in (obj.get("polygon") or [])]
+            if len(polygon) >= 6 and len(polygon) % 2 == 0:
+                lines.append(field_store.format_segment_row([remap[obj["cls"]], *polygon]))
+                counts["segment_boxes"] += 1
+            else:
+                lines.append(field_store.format_label_row([remap[obj["cls"]], cx, cy, w, h]))
+                counts["box_only"] += 1
+        with open(dst_lbl, "w", encoding="utf-8") as fh:  # 删掉的类别不留尾巴
             fh.write("".join(line + "\n" for line in lines))
         counts[split] += 1
         counts["boxes"][split] += len(lines)
@@ -1008,8 +1095,11 @@ def export_detection_dataset(
     # 与姿态库一致：重复导到同一个目录时，这一版不要的帧得从磁盘上清掉
     counts["pruned"] = prune_stale(out_root, written)
 
-    lines = [f"# 由自动标注系统生成 on {now_str()}（{lib_name(lib)} / YOLO detection）",
-             f"path: {out_root}", "train: images/train", "val: images/val"]
+    segmented = counts["segment_boxes"] > 0
+    task_line = f"task: {'segment' if segmented else 'detect'}"
+    lines = [f"# 由自动标注系统生成 on {now_str()}"
+             f"（{lib_name(lib)} / YOLO {'segment' if segmented else 'detection'}）",
+             f"path: {out_root}", "train: images/train", "val: images/val", task_line]
     labels = []
     for cls in used:
         field_row = names.get(cls) or {}
@@ -1031,6 +1121,7 @@ def export_detection_dataset(
                    "lib": lib, "lib_name": lib_name(lib),
                    "fields": meta["fields"], "class_remap": {str(k): v for k, v in remap.items()},
                    "counts": counts, "filter": meta["filter"],
+                   "task": "segment" if segmented else "detect",
                    "max_empty_ratio": max_empty_ratio,
                    # 被比例上限压掉的空帧只在这里留痕，不然用户只看到张数变少
                    "empty_dropped_images": [rec["image"] for rec in empty_dropped][:200],
@@ -1046,6 +1137,8 @@ def export_detection_dataset(
                 {"class_id": cls, "export_id": remap[cls],
                  "name": (names.get(cls) or {}).get("name") or f"class_{cls}"} for cls in used],
             "counts": counts, "data_yaml": os.path.join(out_root, "data.yaml"),
+            "task": "segment" if segmented else "detect",
+            "segment_note": segment_note(counts),
             "mode_note": place_note(mode, sorted(placed))}
 
 
