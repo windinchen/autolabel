@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>自动标注 · 素材池</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230E1113'/%3E%3Cg fill='none' stroke='%23F5A524' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M16 12v8M16 14l-5 3M16 14l5 3M16 20l-4 6M16 20l4 6'/%3E%3C/g%3E%3Ccircle cx='16' cy='8' r='3.2' fill='%23F5A524'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+<script>
+/* 首屏先把主题与字号定好，免得先黑后白闪一下；选择存在这台浏览器，六个页面共用 */
+(function () {
+  try {
+    var a = JSON.parse(localStorage.getItem("autolabel.appearance") || "{}") || {};
+    var pref = ["light", "dark"].indexOf(a.theme) >= 0 ? a.theme : "auto";
+    var light = pref === "light" ||
+      (pref === "auto" && window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
+    var r = document.documentElement;
+    r.dataset.theme = light ? "light" : "dark";
+    r.dataset.themePref = pref;
+    r.dataset.fs = ["0", "2", "3"].indexOf(String(a.fs)) >= 0 ? String(a.fs) : "1";
+  } catch (e) { /* 读不到就用默认：跟随系统 + 标准字号 */ }
+})();
+</script>
+</head>
+<body data-page="pool">
+
+<svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
+  <symbol id="ic-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></symbol>
+  <symbol id="ic-dots" viewBox="0 0 16 16"><circle cx="3.4" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="8" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="12.6" cy="8" r=".9" fill="currentColor" stroke="none"/></symbol>
+  <symbol id="ic-upload" viewBox="0 0 16 16"><path d="M8 11V2.6M8 2.6 4.8 5.8M8 2.6l3.2 3.2M2.6 10v2.4a1 1 0 0 0 1 1h8.8a1 1 0 0 0 1-1V10"/></symbol>
+  <symbol id="ic-pool" viewBox="0 0 16 16"><path d="M1.8 5.4 8 2.2l6.2 3.2L8 8.6 1.8 5.4Z"/><path d="M1.8 8.6 8 11.8l6.2-3.2M1.8 11.6 8 14.8l6.2-3.2"/></symbol>
+  <symbol id="ic-layers" viewBox="0 0 16 16"><path d="M8 1.8 1.6 5 8 8.2 14.4 5 8 1.8ZM1.6 8.4 8 11.6l6.4-3.2M1.6 11.4 8 14.6l6.4-3.2"/></symbol>
+  <symbol id="ic-boxes" viewBox="0 0 16 16"><rect x="2" y="3.2" width="12" height="9.6" rx="1.4"/><path d="M5.6 10.4 7.4 7.6l1.8 2.2 1.4-2 1.4 2.6"/></symbol>
+  <symbol id="ic-cube" viewBox="0 0 16 16"><path d="M8 1.8 14 5v6l-6 3.2L2 11V5l6-3.2ZM2 5l6 3.2L14 5M8 8.2v6"/></symbol>
+  <symbol id="ic-key" viewBox="0 0 16 16"><rect x="1.6" y="4" width="12.8" height="8" rx="1.4"/><path d="M4.2 6.6h.01M6.6 6.6h.01M9 6.6h.01M11.4 6.6h.01M4.2 9.4h7.6"/></symbol>
+  <symbol id="ic-target" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2.4M8 12.8v2.4M.8 8h2.4M12.8 8h2.4"/></symbol>
+  <symbol id="ic-export" viewBox="0 0 16 16"><path d="M8 10.4V2M8 2 5 4.8M8 2l3 2.8M2.6 9.4v3a1.2 1.2 0 0 0 1.2 1.2h8.4a1.2 1.2 0 0 0 1.2-1.2v-3"/></symbol>
+  <symbol id="ic-run" viewBox="0 0 16 16"><path d="M4.6 2.4 13 8l-8.4 5.6V2.4Z"/></symbol>
+  <symbol id="ic-check" viewBox="0 0 16 16"><path d="m3.2 8.4 3.2 3.2 6.4-7.2"/></symbol>
+  <symbol id="ic-cross" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+  <symbol id="ic-undo" viewBox="0 0 16 16"><path d="M3 6.6h6.4a3 3 0 0 1 0 6H6"/><path d="M5.6 4 3 6.6 5.6 9.2"/></symbol>
+  <symbol id="ic-refresh" viewBox="0 0 16 16"><path d="M13.4 8a5.4 5.4 0 1 1-1.6-3.8"/><path d="M12.2 1.4v2.9H9.3"/></symbol>
+  <symbol id="ic-gear" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.3"/><path d="M8 1.3v2.1M8 12.6v2.1M1.3 8h2.1M12.6 8h2.1M3.3 3.3l1.5 1.5M11.2 11.2l1.5 1.5M12.7 3.3l-1.5 1.5M4.8 11.1l-1.5 1.5"/></symbol>
+  <symbol id="ic-pose" viewBox="0 0 16 16"><circle cx="8" cy="3" r="1.7"/><path d="M8 4.7v4.2M4.6 6.6h6.8M8 8.9 5.6 13.8M8 8.9l2.4 4.9"/></symbol>
+  <symbol id="ic-prompt" viewBox="0 0 16 16"><path d="M2.1 2.1h5.6l6.2 6.2a1.3 1.3 0 0 1 0 1.85l-3.95 3.95a1.3 1.3 0 0 1-1.85 0L2.1 7.7V2.1Z"/><path d="M5.2 5.2h.01"/></symbol>
+  <symbol id="ic-home" viewBox="0 0 16 16"><path d="M2.3 7.1 8 2.4l5.7 4.7v6.1a1 1 0 0 1-1 1H3.3a1 1 0 0 1-1-1V7.1Z"/><path d="M6.3 13.9V9.4h3.4v4.5"/></symbol>
+  <symbol id="ic-list" viewBox="0 0 16 16"><path d="M6.4 4.1h7.4M6.4 8h7.4M6.4 11.9h7.4M2.6 4.1h.01M2.6 8h.01M2.6 11.9h.01"/></symbol>
+  <symbol id="ic-tag" viewBox="0 0 16 16"><path d="M7.4 1.9H2.1v5.3l6.5 6.5a1.2 1.2 0 0 0 1.7 0l3.6-3.6a1.2 1.2 0 0 0 0-1.7L7.4 1.9Z"/><path d="M4.6 4.6h.01"/></symbol>
+  <symbol id="ic-person" viewBox="0 0 16 16"><circle cx="8" cy="4.4" r="2.4"/><path d="M2.9 14.1a5.1 5.1 0 0 1 10.2 0"/></symbol>
+  <symbol id="ic-object" viewBox="0 0 16 16"><rect x="2.6" y="2.6" width="10.8" height="10.8" rx="1.6"/><path d="M2.6 6.2h10.8"/></symbol>
+  <symbol id="ic-scene" viewBox="0 0 16 16"><rect x="1.8" y="3.4" width="12.4" height="9.2" rx="1.5"/><path d="m4.6 10.6 2.6-3 2 2.2 1.6-1.8 2.4 2.6"/><circle cx="5.4" cy="6" r=".9"/></symbol>
+  <symbol id="ic-video" viewBox="0 0 16 16"><rect x="1.9" y="4" width="8.6" height="8" rx="1.4"/><path d="m10.5 8.4 3.6-2.3v4.6l-3.6-2.3Z"/></symbol>
+  <symbol id="ic-trash" viewBox="0 0 16 16"><path d="M2.8 4.4h10.4M6.2 4.4V2.9h3.6v1.5M4.2 4.4l.6 8.3a1 1 0 0 0 1 .9h4.4a1 1 0 0 0 1-.9l.6-8.3"/></symbol>
+</svg>
+
+<header>
+  <a class="brand" id="nav-portal" href="/">自动标注<span id="ds-name" class="muted"></span></a>
+  <nav id="nav-modules"></nav>
+  <div class="controls">
+    <a class="vchip" id="version-chip" href="https://github.com/windinchen/autolabel"
+       target="_blank" rel="noopener noreferrer" title="当前版本 · 点开看 GitHub 仓库">v—</a>
+    <div class="wrap-rel">
+      <button class="searchbtn" id="btn-palette" title="命令面板">
+        <svg class="ic" style="width:13px;height:13px"><use href="#ic-search"/></svg>
+        搜素材或命令<span class="kbd">⌘K</span>
+      </button>
+    </div>
+    <button class="btn primary" id="btn-upload" title="上传图片 / 目录 / 视频，先进素材池，哪个模块要用再由你点头（U）">
+      <svg class="ic"><use href="#ic-upload"/></svg>导入素材
+    </button>
+    <div class="wrap-rel">
+      <button class="iconbtn" id="btn-more" title="筛选、分类与删除" aria-haspopup="true" aria-expanded="false">
+        <svg class="ic"><use href="#ic-dots"/></svg>
+      </button>
+      <div class="menu" id="more-menu" hidden>
+        <div class="menu-label">这一池素材</div>
+        <div class="menu-field muted small" id="pool-note-brief"></div>
+        <div class="menu-sep"></div>
+        <div class="menu-label">管起来</div>
+        <button class="menu-item" id="btn-categories"><svg class="ic"><use href="#ic-tag"/></svg>分类管理<span class="kbd k">C</span></button>
+        <button class="menu-item" id="btn-view-batches"><svg class="ic"><use href="#ic-layers"/></svg>看导入批次<span class="kbd k">B</span></button>
+        <button class="menu-item" id="pool-refresh"><svg class="ic"><use href="#ic-check"/></svg>重新读取磁盘<span class="kbd k">R</span></button>
+        <div class="menu-sep"></div>
+        <div id="menu-modules"></div>
+        <div class="menu-label">关于</div>
+        <div class="menu-field muted small"><span>版本</span><span class="mono" id="about-version">—</span></div>
+        <div class="menu-field muted small"><span>开发者</span><a id="about-dev"
+          href="https://github.com/windinchen" target="_blank" rel="noopener noreferrer">windinchen</a></div>
+        <a class="menu-item" id="about-home" href="https://github.com/windinchen/autolabel"
+           target="_blank" rel="noopener noreferrer"><svg class="ic"><use href="#ic-cube"/></svg>GitHub 仓库</a>
+        <button class="menu-item" id="about-check"><svg class="ic"><use href="#ic-refresh"/></svg>检查更新</button>
+        <div class="menu-field muted small" id="about-note"></div>
+        <div class="menu-sep"></div>
+        <button class="menu-item" id="btn-settings"><svg class="ic"><use href="#ic-gear"/></svg>系统设置<span class="kbd k">⌥S</span></button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="update-bar" id="update-bar" hidden>
+  <svg class="ic"><use href="#ic-refresh"/></svg>
+  <span id="update-text"></span>
+  <a id="update-open" href="https://github.com/windinchen/autolabel/releases"
+     target="_blank" rel="noopener noreferrer">查看更新</a>
+  <button id="update-later">知道了</button>
+</div>
+
+<div class="shell-row">
+  <div id="rail">
+    <button class="iconbtn on" id="rail-grid" title="按素材看（缩略图挑着管）"><svg class="ic"><use href="#ic-boxes"/></svg></button>
+    <button class="iconbtn" id="rail-batches" title="按导入批次看（一次上传算一批）（B）"><svg class="ic"><use href="#ic-layers"/></svg></button>
+    <button class="iconbtn" id="rail-cat" title="分类管理（C）"><svg class="ic"><use href="#ic-tag"/></svg></button>
+    <span class="rail-spacer"></span>
+    <button class="iconbtn" id="rail-help" title="本页操作说明（?）"><svg class="ic"><use href="#ic-key"/></svg></button>
+  </div>
+
+  <main class="page-main">
+    <div class="page-body">
+      <div id="recovery-note" class="notice hidden"></div>
+      <div id="job-strip" class="hidden">
+        <span id="job-strip-text"></span>
+        <button id="strip-clear-jobs" class="danger">清除任务</button>
+      </div>
+
+      <div id="pool-stats" class="stat-strip"></div>
+
+      <div class="model-section" id="sec-materials">
+        <div class="model-section-head">
+          <span class="panel-title">素材<span class="muted small"> · 三个标注库共用这一池，同一帧只存一份</span></span>
+          <span class="spacer"></span>
+          <span class="muted small" id="pool-count"></span>
+        </div>
+        <div id="pool-cats" class="cat-strip"></div>
+        <div class="pool-tools">
+          <label class="muted small">入库情况
+            <select id="pool-state">
+              <option value="">全部</option>
+              <option value="unassigned">还没入库（模块里看不到）</option>
+              <option value="in">已入库</option>
+              <option value="shared">几个库共用</option>
+            </select>
+          </label>
+          <label class="muted small">来源批次
+            <select id="pool-batch"><option value="">全部批次</option></select>
+          </label>
+          <label class="muted small grow">找素材
+            <input type="search" id="pool-query" placeholder="文件名 / 来自哪个视频" spellcheck="false">
+          </label>
+          <button class="btn" id="pool-select-all">全选这一屏</button>
+        </div>
+        <div id="pool-grid" class="pool-grid"><p class="pool-empty muted small">读取中…</p></div>
+        <div id="pool-bar" class="pool-bar">
+          <span class="muted small" id="pool-sel-note">没选中素材</span>
+          <span class="spacer"></span>
+          <label class="muted small">加进模块
+            <select id="pool-target-lib">
+              <option value="pose">姿态标注</option>
+              <option value="objects">提示词标注</option>
+              <option value="detect">目标检测标注</option>
+            </select>
+          </label>
+          <button class="btn" id="pool-adopt" disabled>加进这个模块</button>
+          <label class="muted small">移到分类
+            <select id="pool-move-cat"><option value="">未分类</option></select>
+          </label>
+          <button class="btn" id="pool-assign" disabled>移动</button>
+          <button class="btn danger" id="pool-delete" disabled><svg class="ic"><use href="#ic-trash"/></svg>删掉素材</button>
+        </div>
+        <div class="muted small" id="pool-log"></div>
+      </div>
+
+      <div class="model-section hidden" id="sec-batches">
+        <div class="model-section-head">
+          <span class="panel-title">导入批次<span class="muted small"> · 一次上传 / 一次抽帧算一批，删一批就是把这批素材整批退回池外</span></span>
+          <span class="spacer"></span>
+          <span class="muted small" id="batch-count"></span>
+        </div>
+        <div id="pool-batch-list" class="batch-list"></div>
+        <div class="btn-row">
+          <button id="batch-delete" class="danger" disabled>删掉所选批次</button>
+          <label class="muted small" title="不勾=只把图从各标注库摘掉，images/ 里的原图留着">
+            <input type="checkbox" id="purge-files"> 连原图文件一起删
+          </label>
+        </div>
+        <div class="muted small">批次记的是素材的来处（哪个文件、什么时候、抽了几帧），标好的结果仍记在各标注库里；
+          整批退回池外只摘引用，已经标过的内容在 <span class="mono">.autolabel/deleted/</span> 留有快照，误删能捞回来。</div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<div id="up-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title">导入素材<span class="muted small"> · 先进素材池，哪个模块要用再由你去那个模块点「从素材池添加」</span></div>
+    <div id="up-drop">把文件拖到这里，或用下面的按钮选择<br>
+      <span class="muted small">视频会先抽帧（默认每 2 秒 1 帧）；图片和目录直接进池</span>
+    </div>
+    <div class="pick-row">
+      <label class="btn"><input type="file" id="file-images" multiple accept="image/*" hidden> 选择图片</label>
+      <label class="btn"><input type="file" id="file-dir" webkitdirectory multiple hidden> 选择图片目录</label>
+      <label class="btn"><input type="file" id="file-video" accept="video/*" hidden> 选择视频</label>
+    </div>
+    <div class="param-row">
+      <label class="muted small">视频抽帧
+        <select id="up-fps">
+          <option value="0.5" selected>每 2 秒 1 帧</option>
+          <option value="1">每秒 1 帧</option>
+          <option value="2">每秒 2 帧</option>
+        </select>
+      </label>
+      <label class="muted small">最多帧数 <input type="number" id="up-max-frames" value="600" min="1" max="5000"></label>
+      <label class="muted small" title="默认按画面相似度丢掉近重复帧；动作很快、差异很小的视频可以勾上">
+        <input type="checkbox" id="up-keep-similar"> 保留近重复帧
+      </label>
+    </div>
+    <div class="vlm-row">
+      <label class="muted small grow">批次名（选填）
+        <input type="text" id="up-batch-name" placeholder="例如：10 月现场补拍" spellcheck="false">
+      </label>
+    </div>
+    <div id="up-files" class="muted small">尚未选择文件</div>
+    <div class="progress"><div id="up-bar" class="bar"></div></div>
+    <div class="btn-row">
+      <button class="btn primary" id="up-start" disabled>送进素材池</button>
+      <button class="btn" id="up-clear">清空</button>
+      <button class="btn" id="up-close">关闭</button>
+    </div>
+    <div class="muted small" id="up-log"></div>
+  </div>
+</div>
+
+<div id="cat-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title">分类管理<span class="muted small"> · 分类跟着素材走，三个模块里看到的完全一致</span></div>
+    <div id="cat-list" class="pool-list muted small">读取中…</div>
+    <div class="pick-row">
+      <label class="muted small grow">分类名
+        <input type="text" id="cat-name" placeholder="例如：户外 / 遮挡多 / 待复查" spellcheck="false" maxlength="24">
+      </label>
+      <label class="muted small">说明（选填）
+        <input type="text" id="cat-note" placeholder="一句话说清这类是什么" spellcheck="false" maxlength="80">
+      </label>
+    </div>
+    <div class="btn-row">
+      <button class="btn primary" id="cat-save">新增分类</button>
+      <button class="btn" id="cat-close">关闭</button>
+    </div>
+    <div class="muted small" id="cat-log">删分类不会删素材：底下的素材会退回「未分类」。</div>
+  </div>
+</div>
+
+<div id="palette-modal" class="modal hidden">
+  <div class="modal-card">
+    <input type="text" id="palette-input" placeholder="输入想做的事，比如「分类」「删掉没入库的」「去姿态标注」…" spellcheck="false" autocomplete="off">
+    <div id="palette-list"></div>
+    <div class="palette-hint"><span>↑↓ 选择</span><span>Enter 执行</span><span>Esc 关闭</span></div>
+  </div>
+</div>
+
+<div id="help-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title">素材池怎么用<span class="muted small"> · 这里只管素材本身，标框与骨骼去各标注模块</span></div>
+    <div class="help-grid">
+      <div class="panel-title">口径</div>
+      <div><span>素材归池</span><span>图片与抽出来的帧都存在 <span class="mono">images/</span>，同一个文件只有一份，不占双份空间</span></div>
+      <div><span>标注归库</span><span>哪个模块要标哪些素材，是那个模块自己的引用；删库里的图不会动到原文件</span></div>
+      <div><span>还没入库</span><span>只进了池、三个模块都还没引用的素材——在模块里看不到，到模块点「从素材池添加」才进去</span></div>
+      <div><span>分类</span><span>素材层的标签，存在池账本里一份；换模块、换视图都不会变</span></div>
+      <div class="panel-title">快捷</div>
+      <div><span>U</span><span>导入素材</span></div>
+      <div><span>C</span><span>分类管理</span></div>
+      <div><span>B</span><span>切到导入批次视图</span></div>
+      <div><span>A</span><span>把选中的素材加进右边那个模块</span></div>
+      <div><span>R</span><span>重新读取磁盘上的文件</span></div>
+      <div><span>⌘K</span><span>命令面板：跳模块、删素材、开系统设置都能搜</span></div>
+      <div><span>⌥T</span><span>白天 / 夜晚</span></div>
+      <div><span>⌥= / ⌥-</span><span>字号放大 / 缩小</span></div>
+      <div><span>⌥S</span><span>系统设置（外观 + 推理参数）</span></div>
+      <div><span>?</span><span>本说明</span></div>
+      <div><span>Esc</span><span>关闭弹层 / 取消选择</span></div>
+    </div>
+    <div class="btn-row"><button id="help-close">关闭</button></div>
+  </div>
+</div>
+
+<div id="confirm-modal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-title" id="confirm-title">确认操作</div>
+    <div id="confirm-body" class="muted"></div>
+    <div class="btn-row">
+      <button id="confirm-ok" class="danger">确定</button>
+      <button id="confirm-cancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<script src="/common.js"></script>
+<script src="/pool.js"></script>
+</body>
+</html>

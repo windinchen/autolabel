@@ -1,6 +1,6 @@
 "use strict";
 
-// 五个页面（门户 / 姿态标注 / 提示词标注 / 目标检测标注 / 模型管理）共用的极小工具集。
+// 六个页面（工作台 / 素材池 / 姿态标注 / 提示词标注 / 目标检测标注 / 模型管理）共用的极小工具集。
 // 页面自己的逻辑在 portal.js / app.js / objects.js / models.js 里，各页只加载自己那份；
 // 「目标检测标注」与「提示词标注」共用同一份 objects.js，靠 <body data-lib> 决定吃哪一库，
 // 绝不再复制一份：同一件事有两个入口，改天就只有一个跟着改。
@@ -46,7 +46,7 @@ function appendLog(id, msg, isErr) {
   box.classList.toggle("err", Boolean(isErr));
   box.scrollTop = box.scrollHeight;
 }
-const kb = (n) => (n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.max(1, Math.round(n / 1024)) + " KB");
+const kb = (n) => (n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : Math.round(n / 1024) + " KB");
 
 /** 上传单个文件，带**真实字节进度**（只有 XHR 有 upload.onprogress，fetch 没有）。
  *
@@ -88,8 +88,11 @@ const isVideo = (f) => VIDEO_EXTS.includes(extOf(f.name)) || /^video\//.test(f.t
 const isImage = (f) => IMAGE_EXTS.includes(extOf(f.name)) || /^image\//.test(f.type);
 
 // 模块清单只有一个来源：顶栏标签、「⋯」菜单里的跳转都从这儿渲染，icon 也给同一份。
-// 左侧竖条不再放模块跳转（理由见 ensureMenuModules 上方那段），省得五页各写一份、图标各撞各的。
+// 左侧竖条不再放模块跳转（理由见 ensureMenuModules 上方那段），省得各页写一份、图标各撞各的。
 const MODULES = [
+  // 顺序就是顶栏从左到右：先看全局、再管素材、然后三个标注库、最后才是权重与算力
+  { id: "portal", href: "/", name: "工作台", desc: "总览与导出", icon: "ic-home" },
+  { id: "pool", href: "/pool", name: "素材池", desc: "素材、分类与整理", icon: "ic-pool" },
   { id: "pose", href: "/pose", name: "姿态标注", desc: "人体骨骼关键点复核", icon: "ic-pose" },
   { id: "objects", href: "/objects", name: "提示词标注", desc: "大模型按你写的描述找物品", icon: "ic-prompt" },
   { id: "detect", href: "/detect", name: "目标检测标注", desc: "本地 YOLO 权重按自带类别出框", icon: "ic-boxes" },
@@ -616,6 +619,9 @@ function bindModalKeys() {
  *  左侧竖条同时也不再挂模块跳转：那边曾经凭空多出几枚和别页同形的方框图标、
  *  而且永远不亮，五枚一样的框摆在那儿，反而看不出自己在哪一页。模块入口只留
  *  顶栏中文标签（好认）和这里两处，竖条只管本页自己的弹层。
+ *
+ *  「导入素材」同理只在右上角一处：它以前在竖条也有一份，和右上角那颗长得一样、
+ *  去的是同一个弹层，五页四页都有，谁也不知道该点哪个。快捷键（W / U）照旧。
  */
 function ensureMenuModules() {
   const host = $("menu-modules");
@@ -1166,10 +1172,11 @@ function initShellChrome(options) {
   }
   bind("btn-palette", () => openPalette(true));
   bind("btn-more", (e) => { e.stopPropagation(); openMenu(); });
-  bind("btn-help", () => openHelp(true));
+  // 六页这颗按钮都叫 rail-help：以前这里绑的是 btn-help，只有提示词 / 目标检测两页
+  // 用了那个旧 id，姿态页的按钮点了半天没反应（说明只能按 ? 键打开）
+  bind("rail-help", () => openHelp(true));
   bind("help-close", () => openHelp(false));
   bind("rail-queue", opts.onQueue);
-  bind("rail-upload", opts.onUpload);
   bind("rail-batches", opts.onBatches);
   bind("rail-fields", opts.onFields);
   bind("rail-run", opts.onRun);

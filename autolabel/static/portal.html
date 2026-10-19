@@ -7,7 +7,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230E1113'/%3E%3Cg fill='none' stroke='%23F5A524' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M16 12v8M16 14l-5 3M16 14l5 3M16 20l-4 6M16 20l4 6'/%3E%3C/g%3E%3Ccircle cx='16' cy='8' r='3.2' fill='%23F5A524'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/app.css">
 <script>
-/* 首屏先把主题与字号定好，免得先黑后白闪一下；选择存在这台浏览器，五个页面共用 */
+/* 首屏先把主题与字号定好，免得先黑后白闪一下；选择存在这台浏览器，六个页面共用 */
 (function () {
   try {
     var a = JSON.parse(localStorage.getItem("autolabel.appearance") || "{}") || {};
@@ -25,25 +25,36 @@
 <body data-page="portal">
 
 <svg xmlns="http://www.w3.org/2000/svg" style="display:none" aria-hidden="true">
-  <symbol id="ic-mark" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 9v7M12 11l-4.2 2.6M12 11l4.2 2.6M12 16l-3.4 5M12 16l3.4 5"/></g><circle cx="12" cy="6" r="2.6" fill="currentColor"/></symbol>
   <symbol id="ic-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14 14"/></symbol>
   <symbol id="ic-dots" viewBox="0 0 16 16"><circle cx="3.4" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="8" cy="8" r=".9" fill="currentColor" stroke="none"/><circle cx="12.6" cy="8" r=".9" fill="currentColor" stroke="none"/></symbol>
   <symbol id="ic-upload" viewBox="0 0 16 16"><path d="M8 11V2.6M8 2.6 4.8 5.8M8 2.6l3.2 3.2M2.6 10v2.4a1 1 0 0 0 1 1h8.8a1 1 0 0 0 1-1V10"/></symbol>
+  <symbol id="ic-pool" viewBox="0 0 16 16"><path d="M1.8 5.4 8 2.2l6.2 3.2L8 8.6 1.8 5.4Z"/><path d="M1.8 8.6 8 11.8l6.2-3.2M1.8 11.6 8 14.8l6.2-3.2"/></symbol>
   <symbol id="ic-layers" viewBox="0 0 16 16"><path d="M8 1.8 1.6 5 8 8.2 14.4 5 8 1.8ZM1.6 8.4 8 11.6l6.4-3.2M1.6 11.4 8 14.6l6.4-3.2"/></symbol>
   <symbol id="ic-boxes" viewBox="0 0 16 16"><rect x="2" y="3.2" width="12" height="9.6" rx="1.4"/><path d="M5.6 10.4 7.4 7.6l1.8 2.2 1.4-2 1.4 2.6"/></symbol>
   <symbol id="ic-cube" viewBox="0 0 16 16"><path d="M8 1.8 14 5v6l-6 3.2L2 11V5l6-3.2ZM2 5l6 3.2L14 5M8 8.2v6"/></symbol>
   <symbol id="ic-key" viewBox="0 0 16 16"><rect x="1.6" y="4" width="12.8" height="8" rx="1.4"/><path d="M4.2 6.6h.01M6.6 6.6h.01M9 6.6h.01M11.4 6.6h.01M4.2 9.4h7.6"/></symbol>
   <symbol id="ic-target" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3.2"/><path d="M8 .8v2.4M8 12.8v2.4M.8 8h2.4M12.8 8h2.4"/></symbol>
   <symbol id="ic-export" viewBox="0 0 16 16"><path d="M8 10.4V2M8 2 5 4.8M8 2l3 2.8M2.6 9.4v3a1.2 1.2 0 0 0 1.2 1.2h8.4a1.2 1.2 0 0 0 1.2-1.2v-3"/></symbol>
-  <symbol id="ic-check" viewBox="0 0 16 16"><path d="m3.2 8.4 3.2 3.2 6.4-7.2"/></symbol>  <symbol id="ic-refresh" viewBox="0 0 16 16"><path d="M13.4 8a5.4 5.4 0 1 1-1.6-3.8"/><path d="M12.2 1.4v2.9H9.3"/></symbol>  <symbol id="ic-gear" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.3"/><path d="M8 1.3v2.1M8 12.6v2.1M1.3 8h2.1M12.6 8h2.1M3.3 3.3l1.5 1.5M11.2 11.2l1.5 1.5M12.7 3.3l-1.5 1.5M4.8 11.2l-1.5 1.5"/></symbol>
+  <symbol id="ic-run" viewBox="0 0 16 16"><path d="M4.6 2.4 13 8l-8.4 5.6V2.4Z"/></symbol>
+  <symbol id="ic-check" viewBox="0 0 16 16"><path d="m3.2 8.4 3.2 3.2 6.4-7.2"/></symbol>
+  <symbol id="ic-cross" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+  <symbol id="ic-undo" viewBox="0 0 16 16"><path d="M3 6.6h6.4a3 3 0 0 1 0 6H6"/><path d="M5.6 4 3 6.6 5.6 9.2"/></symbol>
+  <symbol id="ic-refresh" viewBox="0 0 16 16"><path d="M13.4 8a5.4 5.4 0 1 1-1.6-3.8"/><path d="M12.2 1.4v2.9H9.3"/></symbol>
+  <symbol id="ic-gear" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.3"/><path d="M8 1.3v2.1M8 12.6v2.1M1.3 8h2.1M12.6 8h2.1M3.3 3.3l1.5 1.5M11.2 11.2l1.5 1.5M12.7 3.3l-1.5 1.5M4.8 11.1l-1.5 1.5"/></symbol>
   <symbol id="ic-pose" viewBox="0 0 16 16"><circle cx="8" cy="3" r="1.7"/><path d="M8 4.7v4.2M4.6 6.6h6.8M8 8.9 5.6 13.8M8 8.9l2.4 4.9"/></symbol>
   <symbol id="ic-prompt" viewBox="0 0 16 16"><path d="M2.1 2.1h5.6l6.2 6.2a1.3 1.3 0 0 1 0 1.85l-3.95 3.95a1.3 1.3 0 0 1-1.85 0L2.1 7.7V2.1Z"/><path d="M5.2 5.2h.01"/></symbol>
   <symbol id="ic-home" viewBox="0 0 16 16"><path d="M2.3 7.1 8 2.4l5.7 4.7v6.1a1 1 0 0 1-1 1H3.3a1 1 0 0 1-1-1V7.1Z"/><path d="M6.3 13.9V9.4h3.4v4.5"/></symbol>
   <symbol id="ic-list" viewBox="0 0 16 16"><path d="M6.4 4.1h7.4M6.4 8h7.4M6.4 11.9h7.4M2.6 4.1h.01M2.6 8h.01M2.6 11.9h.01"/></symbol>
+  <symbol id="ic-tag" viewBox="0 0 16 16"><path d="M7.4 1.9H2.1v5.3l6.5 6.5a1.2 1.2 0 0 0 1.7 0l3.6-3.6a1.2 1.2 0 0 0 0-1.7L7.4 1.9Z"/><path d="M4.6 4.6h.01"/></symbol>
+  <symbol id="ic-person" viewBox="0 0 16 16"><circle cx="8" cy="4.4" r="2.4"/><path d="M2.9 14.1a5.1 5.1 0 0 1 10.2 0"/></symbol>
+  <symbol id="ic-object" viewBox="0 0 16 16"><rect x="2.6" y="2.6" width="10.8" height="10.8" rx="1.6"/><path d="M2.6 6.2h10.8"/></symbol>
+  <symbol id="ic-scene" viewBox="0 0 16 16"><rect x="1.8" y="3.4" width="12.4" height="9.2" rx="1.5"/><path d="m4.6 10.6 2.6-3 2 2.2 1.6-1.8 2.4 2.6"/><circle cx="5.4" cy="6" r=".9"/></symbol>
+  <symbol id="ic-video" viewBox="0 0 16 16"><rect x="1.9" y="4" width="8.6" height="8" rx="1.4"/><path d="m10.5 8.4 3.6-2.3v4.6l-3.6-2.3Z"/></symbol>
+  <symbol id="ic-trash" viewBox="0 0 16 16"><path d="M2.8 4.4h10.4M6.2 4.4V2.9h3.6v1.5M4.2 4.4l.6 8.3a1 1 0 0 0 1 .9h4.4a1 1 0 0 0 1-.9l.6-8.3"/></symbol>
 </svg>
 
 <header>
-  <a class="brand" id="nav-portal" href="/"><svg class="mark"><use href="#ic-mark"/></svg>工作台<span id="ds-name" class="muted"></span></a>
+  <a class="brand" id="nav-portal" href="/">自动标注<span id="ds-name" class="muted"></span></a>
   <nav id="nav-modules"></nav>
   <div class="controls">
     <a class="vchip" id="version-chip" href="https://github.com/windinchen/autolabel"
@@ -54,7 +65,8 @@
         搜动作或页面<span class="kbd">⌘K</span>
       </button>
     </div>
-    <a class="btn primary" id="btn-import" href="/pose?upload=1" title="导入图片 / 目录 / 视频">
+    <a class="btn primary" id="btn-import" href="/pool?upload=1"
+       title="上传图片 / 目录 / 视频：先进素材池，哪个模块要用再由你点头">
       <svg class="ic"><use href="#ic-upload"/></svg>导入素材
     </a>
     <div class="wrap-rel">
@@ -67,7 +79,7 @@
         <div class="menu-sep"></div>
         <div class="menu-label">跳到</div>
         <button class="menu-item" id="jump-export"><svg class="ic"><use href="#ic-export"/></svg>导出训练用文件</button>
-        <button class="menu-item" id="jump-batches"><svg class="ic"><use href="#ic-layers"/></svg>批次管理</button>
+        <a class="menu-item" href="/pool"><svg class="ic"><use href="#ic-pool"/></svg>素材池：管素材与来处</a>
         <div class="menu-sep"></div>
         <button class="menu-item" id="portal-refresh"><svg class="ic"><use href="#ic-check"/></svg>重新读取磁盘<span class="kbd k">R</span></button>
         <div class="menu-sep"></div>
@@ -97,8 +109,6 @@
 
 <div class="shell-row">
   <div id="rail">
-    <a class="iconbtn" href="/pose?upload=1" title="导入素材（到姿态标注页上传）"><svg class="ic"><use href="#ic-upload"/></svg></a>
-    <button class="iconbtn" id="rail-batches" title="批次管理"><svg class="ic"><use href="#ic-layers"/></svg></button>
     <span class="rail-spacer"></span>
     <button class="iconbtn" id="rail-help" title="本页操作说明（?）"><svg class="ic"><use href="#ic-key"/></svg></button>
   </div>
@@ -139,33 +149,23 @@
         <div id="export-rows"></div>
       </div>
 
-      <div class="model-section" id="sec-batches">
+      <div class="model-section" id="sec-pool">
         <div class="model-section-head">
-          <span class="panel-title">批次管理</span>
+          <span class="panel-title">素材池</span>
           <span class="spacer"></span>
-          <label class="muted small">模块
-            <select id="batch-module">
-              <option value="all" selected>全部模块</option>
-              <option value="pose">姿态标注</option>
-              <option value="objects">提示词标注</option>
-              <option value="detect">目标检测标注</option>
-            </select>
-          </label>
-          <span id="batch-count" class="muted small"></span>
+          <span class="muted small">素材、分类、哪一批传进来的都在这管；三个标注库只挑要标的，标好的结果才归库</span>
         </div>
-        <div id="batch-summary" class="muted small"></div>
-        <div id="portal-batches"></div>
-        <div class="btn-row">
-          <button id="batch-delete" class="danger" disabled>删除所选批次</button>
-          <button id="file-delete" class="danger" disabled>删除所选图片</button>
-          <label class="muted small" title="不勾=只把图从当前库移除，图片文件和另一个库的标注都留着">
-            <input type="checkbox" id="purge-files"> 连图片文件一起删（每个库都移除）
-          </label>
+        <div class="flow">
+          <div class="flow-row">
+            <span class="flow-ic"><svg class="ic"><use href="#ic-pool"/></svg></span>
+            <span class="flow-main">
+              <span class="flow-title">素材池<span class="chip" id="pool-chip">—</span></span>
+              <span class="flow-sub muted small" id="pool-brief">读取中…</span>
+            </span>
+            <a class="btn" href="/pool?upload=1">导入素材</a>
+            <a class="btn primary" href="/pool">管理素材池</a>
+          </div>
         </div>
-        <div class="muted small">每次导入算一批，点「看文件」展开就能逐张勾着删。默认只把图从它所在的那个库摘掉，
-          <span class="mono">images/</span> 里的原图和另一个库已经标好的结果都不动；
-          勾上「连图片文件一起删」才会把所有库一起摘掉并删文件。删掉的东西在
-          <span class="mono">.autolabel/deleted/</span> 留有快照，误删能捞回来。</div>
       </div>
     </div>
   </main>
@@ -186,8 +186,9 @@
     <div class="modal-title">工作台怎么用<span class="muted small"> · 这里只是总览，改图要去各个标注库</span></div>
     <div class="help-grid">
       <div class="panel-title">页面</div>
-      <div><span>共 5 个页面</span><span>工作台总览、姿态标注、提示词标注、目标检测标注、模型管理</span></div>
-      <div><span>左侧竖条</span><span>随时在五个页面之间跳</span></div>
+      <div><span>共 6 个页面</span><span>工作台、素材池、姿态标注、提示词标注、目标检测标注、模型管理</span></div>
+      <div><span>素材归池</span><span>导入的图片视频先落素材池，去哪个模块标注由你在模块里点「从素材池添加」</span></div>
+      <div><span>标注归库</span><span>三个库只存自己的标注结果，删库里的引用不碰素材文件</span></div>
       <div class="panel-title">快捷</div>
       <div><span>⌘K</span><span>命令面板：导出、刷新、跳页面（含目标检测标注）都能搜</span></div>
         <div><span>⌥T</span><span>白天 / 夜晚</span></div>

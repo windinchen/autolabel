@@ -17,9 +17,9 @@ const modelState = {
   hub: { ok: true, loaded: false, query: "", task: "", local: [], results: [], note: "",
          error: "", remote_state: "skipped", catalog: null },
   refreshing: false,      // 「更新目录」正在核对官方 release，按钮这期间不重复点
-  // installedOnly：目录默认只摆本机已下载的模型。官方一摆就是一百六十档，
-  // 全列出来真正能点的下载按钮反而找不到；要看全量随时能关。
-  installedOnly: true,
+  // installedOnly：目录默认摆全量，开关只留给"我只想看手上有什么"的人。
+  // 上一版默认只列已下载，结果第一次进来的人以为官方就这几档。
+  installedOnly: false,
   // 目标检测库当前用的权重：存在数据集 .autolabel/detect/prefs.json，跟姿态默认是两件事
   detectPrefs: {},
 };
@@ -57,6 +57,8 @@ async function refreshModels() {
     toast("模型信息读取失败：" + err.message, true);
     return;
   }
+  const dsName = (data.dataset && data.dataset.name) || "";
+  if (dsName) { $("ds-name").textContent = " · " + dsName; }
   modelState.weights = data.weights || [];
   modelState.weightsDir = data.weights_dir || "";
   modelState.downloads = {};
@@ -564,7 +566,8 @@ function paintCatalogRefresh() {
   text.textContent = "更新目录";
   // now_str() 是 "YYYY-MM-DD HH:MM:SS"，按钮上只要 "10-19 23:12" 这一截
   const fetched = String(info.fetched_at || "");
-  stamp.textContent = info.refreshed && fetched.length >= 16 ? "核对于 " + fetched.slice(5, 16) : "从未核对";
+  stamp.textContent = info.refreshed && fetched.length >= 16
+    ? "· 更新于 " + fetched.slice(5, 16) : "· 从未核对";
 }
 
 /** 「更新目录」：让后端去官方 release 取最新档位与体积，回来把目录和权重列表一起重画。 */
@@ -1103,9 +1106,6 @@ function modelCommands() {
   return [
     { label: "下载 yolo11s-pose（默认推荐）", tag: "姿态权重", run: () => downloadWeight("yolo11s-pose.pt", false) },
     { label: "下载 yolo11m-pose（更准）", tag: "姿态权重", run: () => downloadWeight("yolo11m-pose.pt", false) },
-    { label: "去姿态标注", tag: "姿态标注", run: () => { location.href = "/pose"; } },
-    { label: "去提示词标注", tag: "提示词标注", run: () => { location.href = "/objects"; } },
-    { label: "回工作台总览", tag: "工作台", run: () => { location.href = "/"; } },
     { label: "在模型目录里搜索", key: "/", tag: "模型目录", run: () => focusModelSearch() },
     { label: "联网搜 GitHub（开 / 关）", tag: "模型目录", run: () => toggleModelRemote() },
     { label: modelState.installedOnly ? "看官方完整目录（含未下载）" : "只看本机已下载的模型",
@@ -1127,6 +1127,7 @@ function onModelKey(e) {
   if (isTyping(e)) { return; }
   switch (String(e.key).toLowerCase()) {
     case "r": e.preventDefault(); refreshModels(); break;
+    case "u": e.preventDefault(); refreshCatalog(); break;
     case "/": e.preventDefault(); focusModelSearch(); break;
     default:
   }
@@ -1135,9 +1136,9 @@ function onModelKey(e) {
 async function bootModels() {
   initNav();
   registerShellCommands(modelCommands());
-  initShellChrome({});
+  initShellChrome({ onCatalog: refreshCatalog });
   document.addEventListener("keydown", onModelKey);
-  $("rail-help").onclick = () => openHelp(true);
+  $("rail-catalog").onclick = refreshCatalog;
   $("model-refresh").onclick = refreshModels;
   $("model-del-weight").onclick = deleteSelectedWeights;
   // 任务筛选直接走后端匹配：中文任务词（分割 / 旋转框…）也由后端统一判定
@@ -1153,7 +1154,7 @@ async function bootModels() {
   $("model-search-clear").onclick = (e) => { e.preventDefault(); clearModelSearch(); };
   // 联网检索默认关：开着之后每次搜索都要等 GitHub 几秒，本地搜不该被它拖慢
   $("model-remote").onclick = (e) => { e.preventDefault(); toggleModelRemote(); };
-  // 「只看已下载」默认开：一屏全是没下过的档位，真正能用的那几行反而要翻半天
+  // 「只看已下载」默认关：一屏先看全貌，勾上才只留手上有的
   $("model-installed-only").onclick = (e) => { e.preventDefault(); toggleInstalledOnly(); };
   $("model-catalog-refresh").onclick = (e) => { e.preventDefault(); refreshCatalog(); };
   syncInstalledOnlySwitch();

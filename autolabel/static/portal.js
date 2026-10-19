@@ -1,24 +1,28 @@
 "use strict";
 
-// 上层门户：下一步行动流 + 概览数字 + 三个标注库入口 + 坐标/训练集导出 + 批次管理。
+// 上层门户：下一步行动流 + 概览数字 + 素材池入口 + 三个标注库入口 + 坐标/训练集导出。
+//
+// 分工（别再往回改）：**素材归池，标注归库**。导入的图片视频一律先落素材池，
+// 分类和「哪一批传进来的」也只在池里记一本账；三个标注库只存引用和标好的结果。
+// 所以门户这边只留一句「池子现在什么样」加两个入口，批次清单去素材池看。
 
 /** 模块卡片配置：文案与统计口径都在这里，避免和 common.js 的导航漂移。 */
 const MODULE_CARDS = [
   {
     id: "pose", href: "/pose", name: "姿态标注", tag: "标注库",
     desc: "YOLO-pose 人体骨骼关键点的复核与微调：拖点、改可见性、补目标、接受/驳回。",
-    upload: true, lib: "pose",
+    lib: "pose",
   },
   {
     id: "objects", href: "/objects", name: "提示词标注", tag: "标注库",
     desc: "自定义字段名 + 中文描述提示词，让多模态大模型在画面里找物品出检测框，复核时删错框、补漏框。",
-    upload: true, lib: "objects",
+    lib: "objects",
   },
   {
     id: "detect", href: "/detect", name: "目标检测标注", tag: "标注库",
     desc: "本机 YOLO 权重按它自带的类别表（COCO-80 等）出检测框：不联网、单张几十毫秒，"
       + "类别由权重决定，复核时删错框、补漏框。",
-    upload: true, lib: "detect",
+    lib: "detect",
   },
   {
     id: "models", href: "/models", name: "模型管理", tag: "公共配置",
@@ -29,12 +33,11 @@ const MODULE_CARDS = [
 
 /** 概览数字：只留看得懂且会用的这几条，实现细节词一律不上界面。 */
 const STAT_STRIP = [
-  { key: "files", name: "图片文件", unit: "张" },
+  { key: "files", name: "素材池", unit: "个" },
   { key: "pose_items", name: "姿态库", unit: "帧" },
   { key: "object_items", name: "提示词库", unit: "帧" },
   { key: "detect_items", name: "检测库", unit: "帧" },
   { key: "pending", name: "等你复核", unit: "帧" },
-  { key: "batches", name: "导入批次", unit: "批" },
 ];
 
 
@@ -58,7 +61,6 @@ function buildStats(ds) {
     pose_labeled: 0, pose_unreviewed: 0, pose_flagged: 0, pending: 0,
     prompt_labeled: 0, prompt_boxes: 0, prompt_flagged: 0, prompt_unreviewed: 0,
     detect_labeled: 0, detect_boxes: 0, detect_flagged: 0, detect_unreviewed: 0,
-    batches: (ds.batches || []).length,
   };
   for (const item of pose) {
     if (item.objects !== null && item.objects !== undefined) values.pose_labeled += 1;
@@ -98,12 +100,11 @@ function buildStats(ds) {
 function renderStats(ds) {
   const values = buildStats(ds);
   const hints = {
-    files: "几个库共用同一份，不占双份",
+    files: "素材都在池里，下面「管理素材池」能按分类和批次管",
     pose_items: "已标 " + values.pose_labeled + " · 带标记 " + values.pose_flagged,
     object_items: "已标 " + values.prompt_labeled + " · 框 " + values.prompt_boxes,
     detect_items: "本机权重出的框 已标 " + values.detect_labeled + " · 框 " + values.detect_boxes,
     pending: "三个库都没点接受 / 驳回的，与页内队列同口径",
-    batches: "每次导入算一批",
   };
   const box = $("portal-stats");
   box.innerHTML = "";
@@ -125,14 +126,23 @@ function nextActions(ds, values) {
   const poseReady = (ds.models || []).filter((m) => m.ready && m.capability === "pose").length;
   const untouched = Math.max(0, values.object_items - values.prompt_labeled);
   if (!values.files) {
-    acts.push({ icon: "ic-upload", title: "先导入图片或视频", sub: "传完模型会自动预标，再回来复核",
-      href: "/pose?upload=1", go: "去导入" });
+    acts.push({ icon: "ic-upload", title: "先把图片或视频传进素材池",
+      sub: "素材先进池子统一管，哪个模块要用再去那个模块点「从素材池添加」",
+      href: "/pool?upload=1", go: "去导入" });
   }
   if (values.pose_items && !poseReady) {
     acts.push({ icon: "ic-cube", title: "姿态权重还没下载", sub: "没有权重就没法自动预标关键点",
       href: "/models", go: "去下载" });
   }
-  if (values.pose_unreviewed) {
+  // 先分清「还没标」和「标了没复核」：从素材池刚添加进来的库一张都没标，
+  // 这时候说「N 帧骨骼没复核」是假话——连骨骼都还没有，该做的是先批量标一轮
+  const poseUntouched = Math.max(0, values.pose_items - values.pose_labeled);
+  if (poseUntouched) {
+    acts.push({ icon: "ic-pose", chip: "姿态标注", title: "有 " + poseUntouched + " 帧还没生成骨骼",
+      sub: "点「批量姿态标注」按当前权重先出一轮，再人工改错的（快捷键 G）",
+      href: "/pose", go: "去标注" });
+  }
+  if (values.pose_unreviewed && values.pose_labeled) {
     acts.push({ icon: "ic-target", chip: "姿态标注", title: "还有 " + values.pose_unreviewed + " 帧骨骼没复核",
       sub: "其中 " + values.pose_flagged + " 帧被标了可疑，进去按 J / K 一条条跳",
       href: "/pose", go: "去复核" });
@@ -147,9 +157,15 @@ function nextActions(ds, values) {
       sub: "漏标 / 小框 / 贴边的排在最前面",
       href: "/objects", go: "去复核" });
   }
-  if (values.detect_unreviewed) {
-    acts.push({ icon: "ic-boxes", chip: "检测标注", title: "有 " + values.detect_unreviewed + " 帧本机权重出的框没复核",
-      sub: "本地图已入库的，点批量目标检测标注几十秒就出一轮",
+  const detectUntouched = Math.max(0, values.detect_items - values.detect_labeled);
+  if (detectUntouched) {
+    acts.push({ icon: "ic-boxes", chip: "目标检测标注", title: "有 " + detectUntouched + " 帧本机权重还没跑过",
+      sub: "点「批量目标检测标注」几十秒出一轮框，再进来删错补漏（快捷键 G）",
+      href: "/detect", go: "去标注" });
+  }
+  if (values.detect_unreviewed && values.detect_labeled) {
+    acts.push({ icon: "ic-target", chip: "目标检测标注", title: "有 " + values.detect_unreviewed + " 帧检测框没复核",
+      sub: "画错的删掉、漏的补上，其中 " + values.detect_flagged + " 帧被权重自己报了问题",
       href: "/detect", go: "去复核" });
   }
   if (!acts.length) {
@@ -220,9 +236,7 @@ function renderCards(ds) {
     el.className = "module-card";
     el.href = card.href;
     el.innerHTML = '<div class="module-tag muted small"></div><div class="module-name"></div>'
-      + '<div class="module-desc muted small"></div><div class="module-nums"></div>'
-      + (card.upload ? '<div class="module-extra"><span class="btn primary" data-upload="1">'
-        + '导入图片 / 视频</span></div>' : "");
+      + '<div class="module-desc muted small"></div><div class="module-nums"></div>';
     el.querySelector(".module-tag").textContent = card.tag;
     el.querySelector(".module-name").textContent = card.name;
     el.querySelector(".module-desc").textContent = card.desc;
@@ -234,10 +248,6 @@ function renderCards(ds) {
       b.textContent = String(value);
       bit.append(b);
       nums.append(bit);
-    }
-    const extra = el.querySelector("[data-upload]");
-    if (extra) {
-      extra.onclick = (e) => { e.preventDefault(); e.stopPropagation(); location.href = card.href + "?upload=1"; };
     }
     box.appendChild(el);
   }
@@ -260,7 +270,7 @@ function renderExports(ds) {
       desc: "坐标：一行一个框（class_id + 英文类名 + 中文显示名 + 像素/归一化两套）。"
         + "训练集：train/val 切分 + data.yaml（类别名取字段登记表的英文类名）。",
       links: [["CSV", "/api/prompt/coords?format=csv"], ["JSONL", "/api/prompt/coords?format=jsonl"]],
-      action: { id: "export-detect", label: "导出 YOLO 训练集", kind: "detect" },
+      action: { id: "export-detect", label: "导出 YOLO 训练集", kind: "detect", lib: "objects" },
       count: (ds.prompt && ds.prompt.boxes) || 0, unit: "框",
     },
     {
@@ -341,302 +351,17 @@ async function exportDataset(button, kind, scopeSelect, lib) {
   await refresh();
 }
 
-const BATCH_STATUS = {
-  running: "标注中", done: "已完成", cancelled: "已取消", failed: "失败",
-  interrupted: "已中断", "-": "历史数据", unknown: "未知",
-};
-const BATCH_SOURCE = { upload: "网页上传", cli: "命令行", unknown: "历史", "-": "历史" };
-const REVIEW_LABEL = { unreviewed: "待复核", approved: "已接受", edited: "已修改", rejected: "已驳回" };
-const batchState = { ds: null, module: "all", selected: new Set(), expanded: "",
-                     files: {}, fileSel: new Set(), loading: "" };
-
-/** 批次汇总：三个模块各自推进到哪一步，一行说清。 */
-function renderBatchSummary(ds) {
-  const info = (ds.batches || []).length ? (ds.by_module || {}) : {};
-  const parts = [];
-  for (const key of ["pose", "objects", "detect"]) {
-    const row = info[key];
-    if (!row) continue;
-    // 老键名 prompt_labeled 只有提示词库有，检测库读的是 labeled / boxes
-    parts.push(`${row.label} ${row.batches} 批 / ${row.items} 张`
-      + (key === "pose" ? ` / 已标 ${row.labeled} 张`
-        : ` / 已标 ${row.prompt_labeled !== undefined ? row.prompt_labeled : row.labeled} 张`
-          + ` · ${row.prompt_boxes !== undefined ? row.prompt_boxes : row.boxes} 框`));
-  }
-  $("batch-summary").textContent = parts.length ? "按模块汇总：" + parts.join(" · ") : "";
-}
-
-function renderBatches(ds) {
-  batchState.ds = ds;
-  const all = ds.batches || [];
-  const rows = batchState.module === "all" ? all
-    : all.filter((b) => (b.module || "unknown") === batchState.module);
-  $("batch-count").textContent = all.length ? `共 ${all.length} 个批次` : "还没有批次记录";
-  renderBatchSummary(ds);
-  const box = $("portal-batches");
-  box.innerHTML = "";
-  if (!all.length) {
-    box.innerHTML = '<div class="batch-empty muted small">还没有批次：去「姿态标注」「提示词标注」或「目标检测标注」点「导入素材」上传图片和视频。</div>';
-  } else if (!rows.length) {
-    box.innerHTML = '<div class="batch-empty muted small">这个模块还没有批次记录。</div>';
-  }
-  for (const batch of rows) box.append(batchRow(batch));
-  syncBatchButtons();
-}
-
-function batchRow(batch) {
-  const wrap = document.createElement("div");
-  wrap.className = "batch-block" + (batchState.selected.has(batch.id) ? " selected" : "");
-
-  const row = document.createElement("div");
-  row.className = "batch-row";
-  const check = document.createElement("input");
-  check.type = "checkbox";
-  check.checked = batchState.selected.has(batch.id);
-  check.onchange = (e) => {
-    if (e.target.checked) batchState.selected.add(batch.id);
-    else batchState.selected.delete(batch.id);
-    renderBatches(batchState.ds);
-  };
-
-  const main = document.createElement("div");
-  main.className = "batch-main";
-  const name = document.createElement("div");
-  name.className = "batch-name";
-  const badge = document.createElement("span");
-  const module = batch.module || "unknown";
-  badge.className = "badge module " + module;
-  badge.textContent = batch.module_name || module;
-  name.append(badge, document.createTextNode(" " + batch.name));
-  const meta = document.createElement("div");
-  meta.className = "muted small batch-meta";
-  const files = (batch.files || []).slice(0, 3).join("、")
-    + (batch.file_count > 3 ? ` 等 ${batch.file_count} 个` : "");
-  meta.textContent = `${batch.created_at || "时间未知"} · ${BATCH_SOURCE[batch.source] || batch.source || "历史"} · `
-    + (files ? `${files} · ` : "") + (batch.message || "");
-  main.append(name, meta);
-
-  const nums = document.createElement("div");
-  nums.className = "batch-nums";
-  const pose = batch.pose || {}, prompt = batch.prompt || {}, detect = batch.detect || {};
-  const boxBits = module === "detect" ? detect : prompt;
-  const bits = [
-    ["素材", batch.items],
-    ["骨骼", `${pose.labeled || 0}/${batch.items} 张 · ${pose.people || 0} 人`],
-    [module === "detect" ? "检测框（本机权重）" : "检测框",
-     `${boxBits.labeled || 0}/${batch.items} 张 · ${boxBits.boxes || 0} 框`],
-  ];
-  for (const [label, value] of bits) {
-    const span = document.createElement("span");
-    span.append(document.createTextNode(label + " "));
-    const b = document.createElement("b");
-    b.textContent = String(value);
-    span.append(b);
-    nums.append(span);
-  }
-
-  const status = document.createElement("span");
-  status.className = "badge " + (batch.status || "unknown");
-  status.textContent = BATCH_STATUS[batch.status] || batch.status || "未知";
-
-  const peek = document.createElement("button");
-  peek.className = "peek";
-  const expanded = batchState.expanded === batch.id;
-  peek.textContent = expanded ? "收起文件" : "看文件";
-  peek.onclick = () => toggleBatchFiles(batch.id);
-
-  const link = document.createElement("a");
-  link.className = "btn";
-  link.href = module === "objects" ? "/objects" : module === "detect" ? "/detect" : "/pose";
-  link.textContent = "去复核";
-
-  row.append(check, main, nums, status, peek, link);
-  wrap.append(row);
-
-  const detail = document.createElement("div");
-  detail.className = "batch-files";
-  if (expanded) detail.append(batchFileList(batch));
-  wrap.append(detail);
-  return wrap;
-}
-
-function batchFileList(batch) {
-  const box = document.createElement("div");
-  const files = batchState.files[batch.id];
-  if (!files) {
-    box.textContent = batchState.loading === batch.id ? "文件清单读取中…" : "点「看文件」加载清单";
-    return box;
-  }
-  if (!files.length) {
-    box.textContent = "这个批次里已经没有图片了（可能都删掉了），可以直接删除批次记录。";
-    return box;
-  }
-  for (const file of files) {
-    const line = document.createElement("div");
-    line.className = "file-row";
-    const check = document.createElement("input");
-    check.type = "checkbox";
-    check.checked = batchState.fileSel.has(file.image);
-    check.onchange = (e) => {
-      if (e.target.checked) batchState.fileSel.add(file.image);
-      else batchState.fileSel.delete(file.image);
-      syncBatchButtons();
-    };
-    const name = document.createElement("span");
-    name.className = "file-name";
-    name.textContent = file.name;
-    name.title = file.image;
-    const meta = document.createElement("span");
-    meta.className = "muted small";
-    meta.textContent = `${file.imported_at || ""}${file.video ? " · 来自 " + file.video : ""}`
-      + ` · ${file.width || "?"}×${file.height || "?"} · ${kb(file.bytes || 0)}`;
-    const pose = document.createElement("span");
-    pose.className = "chip" + (file.flags && file.flags.length ? " warn" : "");
-    pose.textContent = `骨骼 ${REVIEW_LABEL[file.status] || file.status} · `
-      + `${file.objects === null || file.objects === undefined ? "未标" : file.objects + " 人"}`;
-    const prompt = document.createElement("span");
-    prompt.className = "chip" + (file.prompt_flags && file.prompt_flags.length ? " warn" : "");
-    prompt.textContent = `检测框 ${REVIEW_LABEL[file.prompt_status] || file.prompt_status} · `
-      + `${file.prompt_objects === null || file.prompt_objects === undefined ? "未标" : file.prompt_objects + " 框"}`;
-    const detect = document.createElement("span");
-    detect.className = "chip" + (file.detect_flags && file.detect_flags.length ? " warn" : "");
-    detect.textContent = `本机框 ${REVIEW_LABEL[file.detect_status] || file.detect_status || "待复核"} · `
-      + `${file.detect_objects === null || file.detect_objects === undefined ? "未标" : file.detect_objects + " 框"}`;
-    const shared = document.createElement("span");
-    shared.className = "chip" + (file.shared ? " warn" : "");
-    shared.textContent = file.shared ? "另一个库也在用" : "只在这个库";
-    const del = document.createElement("button");
-    del.className = "btn danger";
-    del.textContent = purgeMode() ? "删素材" : "从本库移除";
-    del.title = purgeMode()
-      ? "两个库一起移除，并删掉 images/ 里的这份文件"
-      : "只把这张从当前库移除，素材文件与另一个库的标注都留着";
-    del.onclick = () => deleteFiles([file.image], file.name, file.lib);
-    line.append(check, name, meta, pose, prompt, detect, shared, del);
-    box.append(line);
-  }
-  return box;
-}
-
-function syncBatchButtons() {
-  const chosen = (batchState.ds && batchState.ds.batches || []).filter((b) => batchState.selected.has(b.id));
-  const images = chosen.reduce((a, b) => a + (b.items || 0), 0);
-  $("batch-delete").disabled = !chosen.length;
-  $("batch-delete").textContent = chosen.length
-    ? `删除所选批次（${chosen.length} 批 · ${images} 张）` : "删除所选批次";
-  const count = batchState.fileSel.size;
-  $("file-delete").disabled = !count;
-  $("file-delete").textContent = count
-    ? `${purgeMode() ? "删除所选素材" : "从本库移除所选"}（${count} 张）`
-    : (purgeMode() ? "删除所选素材" : "从本库移除所选图片");
-}
-
-async function toggleBatchFiles(batchId) {
-  if (batchState.expanded === batchId) {
-    batchState.expanded = "";
-    renderBatches(batchState.ds);
-    return;
-  }
-  batchState.expanded = batchId;
-  batchState.fileSel = new Set();
-  if (!batchState.files[batchId]) {
-    batchState.loading = batchId;
-    renderBatches(batchState.ds);
-    try {
-      const data = await getJson("/api/batch/files?id=" + encodeURIComponent(batchId));
-      batchState.files[batchId] = data.files || [];
-    } catch (err) {
-      toast("文件清单读取失败：" + err.message, true);
-      batchState.expanded = "";
-    }
-    batchState.loading = "";
-  }
-  renderBatches(batchState.ds);
-}
-
-async function deleteSelectedBatches() {
-  const ids = Array.from(batchState.selected);
-  if (!ids.length) { toast("先勾选要删除的批次", true); return; }
-  const chosen = (batchState.ds && batchState.ds.batches || []).filter((b) => ids.includes(b.id));
-  const images = chosen.reduce((a, b) => a + (b.items || 0), 0);
-  const ok = await confirmBox({
-    title: "删除这些批次的数据",
-    body: `将删除 ${chosen.length} 个批次、共 ${images} 张素材，连同本库标签、复核记录、QC 叠加图与批次记录一起清掉。`
-      + "素材文件只有在另一个库不再引用时才会删，否则只摘本库引用（素材留在池里给对方用）。"
-      + "删除前会在 .autolabel/deleted/ 写快照（含标签原文），界面里不能一键恢复。",
-    okLabel: "确定删除",
-  });
-  if (!ok) return;
-  try {
-    const data = await postJson("/api/batches/delete", { ids });
-    const libs = (data.libs || []).map(libLabel).join("、") || "本库";
-    toast(`已从「${libs}」移除 ${data.items} 张素材 · 连带清理 ${data.files_removed} 个标签/素材文件`);
-    batchState.selected = new Set();
-  } catch (err) {
-    toast("删除失败：" + err.message, true);
-    return;
-  }
-  await refresh();
-}
-
-/** 勾选框决定删除粒度：不勾=只摘本库引用，勾上=两个库一起摘并删素材文件。 */
-function purgeMode() {
-  const box = $("purge-files");
-  return Boolean(box && box.checked);
-}
-
-/** 这批图当前属于哪个库：展开的批次行说了算，取不到时退回清单里第一条的 lib。 */
-function currentLib(fallback) {
-  const row = (batchState.ds && batchState.ds.batches || []).find((b) => b.id === batchState.expanded);
-  return fallback || (row && row.lib) || "pose";
-}
-
-async function deleteFiles(images, label, lib) {
-  if (!images.length) { toast("先勾选要删的图片", true); return; }
-  const target = currentLib(lib);
-  const purge = purgeMode();
-  const ok = await confirmBox({
-    title: purge ? "删除素材（两个库都受影响）" : `从「${libLabel(target)}」移除`,
-    body: `共 ${images.length} 张${label && images.length === 1 ? `（${label}）` : ""}。`
-      + (purge
-        ? "两个库一起移除，并删掉 images/ 里的素材文件与各自的标签、复核记录、QC 叠加图——另一个库也会立刻看不到这些图。"
-        : `只从「${libLabel(target)}」移除它们的索引条目与标签，images/ 里的素材文件和另一个库的标注都不动。`)
-      + "同批次其余图片保留，删除前会在 .autolabel/deleted/ 写快照。",
-    okLabel: purge ? "确定删素材" : "确定移除",
-  });
-  if (!ok) return;
-  let data;
-  try {
-    data = await postJson("/api/images/delete", { images, lib: target, mode: purge ? "purge" : "lib" });
-  } catch (err) {
-    toast("删除失败：" + err.message, true);
-    return;
-  }
-  const libs = (data.libs || []).map(libLabel).join("、") || libLabel(target);
-  toast(`已从「${libs}」移除 ${data.items} 张素材`
-    + (data.files_removed ? ` · 连带清理 ${data.files_removed} 个标签/素材文件`
-      : " · 素材文件留在池里，另一个库还能用"));
-  for (const key of Object.keys(batchState.files)) delete batchState.files[key];
-  batchState.fileSel = new Set();
-  await refresh();
-}
-
-async function deleteSelectedFiles() {
-  const images = Array.from(batchState.fileSel);
-  if (!images.length) { toast("先在展开的批次里勾选要删的图片", true); return; }
-  await deleteFiles(images, "");
-}
-
 /** 命令面板条目：门户能做的事都收在这儿，顶栏因此不用堆按钮。 */
 function portalCommands() {
   return [
-    { label: "导入图片 / 视频 / 目录", tag: "姿态标注", run: () => { location.href = "/pose?upload=1"; } },
+    { label: "导入图片 / 视频 / 目录（进素材池）", tag: "素材池", run: () => { location.href = "/pool?upload=1"; } },
+    { label: "去素材池管素材与分类", tag: "素材池", run: () => { location.href = "/pool"; } },
     { label: "去姿态标注复核", tag: "姿态标注", run: () => { location.href = "/pose"; } },
     { label: "去提示词标注", tag: "提示词标注", run: () => { location.href = "/objects"; } },
     { label: "去目标检测标注", tag: "目标检测标注", run: () => { location.href = "/detect"; } },
     { label: "去模型管理", tag: "模型管理", run: () => { location.href = "/models"; } },
     { label: "跳到「导出训练用文件」", run: () => scrollToSection("sec-export") },
-    { label: "跳到「批次管理」", run: () => scrollToSection("sec-batches") },
+    { label: "跳到「素材池」摘要", run: () => scrollToSection("sec-pool") },
     { label: "重新读取磁盘上的文件", key: "R", run: () => refresh() },
     { label: "看本页操作说明", key: "?", run: () => openHelp(true) },
   ];
@@ -658,14 +383,10 @@ async function bootPortal() {
   document.addEventListener("keydown", onPortalKey);
   $("portal-refresh").onclick = refresh;
   $("jump-export").onclick = () => { openMenu(false); scrollToSection("sec-export"); };
-  $("jump-batches").onclick = () => { openMenu(false); scrollToSection("sec-batches"); };
-  $("rail-batches").onclick = () => scrollToSection("sec-batches");
-  $("rail-help").onclick = () => openHelp(true);
-
-  $("batch-module").onchange = (e) => { batchState.module = e.target.value; renderBatches(batchState.ds); };
-  $("batch-delete").onclick = deleteSelectedBatches;
-  $("file-delete").onclick = deleteSelectedFiles;
-  $("purge-files").onchange = () => { if (batchState.ds) renderBatches(batchState.ds); };
+  // 菜单里的「素材池」是直接跳转的链接，点的时候把菜单收掉，别留一层浮层
+  document.querySelectorAll("#more-menu a[href='/pool']").forEach((link) => {
+    link.onclick = () => openMenu(false);
+  });
   await refresh();
 }
 
@@ -683,8 +404,23 @@ async function refresh() {
   renderNextActions(ds);
   renderCards(ds);
   renderExports(ds);
-  renderBatches(ds);
+  renderPoolBrief(ds);
   renderRecovery(ds);
+}
+
+/** 素材池摘要：只报「有多少、占用、几个还没入库」，剩下的事去素材池页做。 */
+function renderPoolBrief(ds) {
+  const pool = ds.pool || {};
+  const files = pool.files || 0;
+  const orphan = pool.orphan || 0;
+  const chip = $("pool-chip");
+  chip.textContent = files ? files + " 个素材" : "池子空的";
+  chip.className = "chip" + (files ? " sky" : " warn");
+  const bits = [`共 ${files} 个素材 · 占用 ${kb(pool.bytes || 0)}`,
+                `姿态 ${pool.pose || 0} / 提示词 ${pool.objects || 0} / 检测 ${pool.detect || 0} 个库在用`];
+  if (orphan) { bits.push(`${orphan} 个还没入库，模块里看不到`); }
+  if (pool.shared) { bits.push(`${pool.shared} 个被几个库共用`); }
+  $("pool-brief").textContent = bits.join(" · ");
 }
 
 /** 上次任务被中断时，后端会按磁盘补回素材，这里把结果说清楚。 */

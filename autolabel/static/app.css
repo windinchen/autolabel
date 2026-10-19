@@ -1,5 +1,5 @@
 /* ==========================================================================
-   自动标注 · Graphite 设计系统（五个页面共用：工作台 / 姿态标注 / 提示词标注 / 目标检测标注 / 模型管理）
+   自动标注 · Graphite 设计系统（六个页面共用：工作台 / 素材池 / 姿态标注 / 提示词标注 / 目标检测标注 / 模型管理）
    一个强调色（琥珀=下一步与主操作）+ 语义色（玉=已接受 / 珊瑚=可疑与驳回 / 天蓝=选中与所在）；
    两种「亮起来」别混用：天蓝只说「你在这／选中的是这个」，琥珀只说「这一步该做／开关开着」；
    发丝线分层、面板不投影只浮层投影；间距走 4px 阶，圆角只用 2/4/7/胶囊。
@@ -82,15 +82,10 @@ header .brand {
   text-decoration: none; font-weight: 600; font-size:  calc(14px * var(--fs)); letter-spacing: -.01em; white-space: nowrap;
 }
 header .brand:hover { color: var(--amber); }
-.brand .mark { width: 22px; height: 22px; flex: 0 0 auto; color: var(--amber); }
-/* 工作台自己不在模块标签里，那就就地标它：否则五页里偏偏这一页没有「我在哪」 */
-body[data-page="portal"] header .brand {
-  padding: 3px 10px; border-radius: 5px; color: var(--sky);
-  background: color-mix(in srgb, var(--sky) 16%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sky) 45%, transparent);
-}
-body[data-page="portal"] header .brand:hover { color: var(--sky); background: color-mix(in srgb, var(--sky) 22%, transparent); }
-#ds-name { font-family: var(--mono); font-size:  calc(11.5px * var(--fs)); font-weight: 400; color: var(--ink-3); }
+/* 品牌位只写字，不挂图标：图标在 52px 顶栏里既认不出是什么，又和「工作台」抢注意力 */
+#ds-name { font-family: var(--mono); font-size:  calc(11.5px * var(--fs)); font-weight: 400; color: var(--ink-3);
+  max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 1280px) { #ds-name { display: none; } }
 .capsule {
   display: inline-flex; align-items: center; gap: 7px; height: 26px; padding: 0 11px;
   border: 1px solid var(--hairline); border-radius: var(--r-pill); background: var(--surface-2);
@@ -616,21 +611,13 @@ footer #hint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; whi
 .model-tools { display: flex; align-items: center; gap: var(--s2); margin-bottom: 6px; flex-wrap: wrap; }
 .model-tools button { flex: 0 0 auto; padding: 4px 12px; font-size:  calc(12px * var(--fs)); }
 .model-tools input[type=text] { flex: 1; min-width: 160px; font-size:  calc(12px * var(--fs)); }
-/* 「更新目录」是这一页唯一要联网的按钮：描边实心 + 图标 + 上次核对时间，别混在普通开关里 */
-.model-tools .catalog-refresh {
-  display: inline-flex; align-items: center; gap: 6px; flex: 0 0 auto; height: 28px; padding: 0 10px;
-  border-color: color-mix(in srgb, var(--amber) 46%, transparent);
-  background: color-mix(in srgb, var(--amber) 14%, transparent); color: var(--amber);
-  font-size: calc(12px * var(--fs));
-}
-.model-tools .catalog-refresh:hover {
-  background: color-mix(in srgb, var(--amber) 24%, transparent);
-  border-color: color-mix(in srgb, var(--amber) 70%, transparent);
-}
-.model-tools .catalog-refresh svg { width: 14px; height: 14px; fill: none; stroke: currentColor;
+/* 「更新目录」就是个普通按钮：琥珀色留给「这一步该做的事」，别让它和主操作抢；
+   只有「上次核对到的是什么时候」用等宽字淡出显示，够判断要不要点就行 */
+button.catalog-refresh { display: inline-flex; align-items: center; gap: 6px; }
+button.catalog-refresh svg { width: 14px; height: 14px; fill: none; stroke: currentColor;
   stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; flex: 0 0 auto; }
 .catalog-refresh .catalog-refresh-time { font-family: var(--mono); font-size: calc(11px * var(--fs));
-  color: color-mix(in srgb, var(--amber) 78%, var(--ink-2)); }
+  color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .catalog-refresh.busy svg { animation: ic-spin 900ms linear infinite; }
 @keyframes ic-spin { to { transform: rotate(360deg); } }
 .model-catalog-row { align-items: flex-start; }
@@ -678,6 +665,8 @@ footer #hint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; whi
 .stat-cell { flex: 1 1 172px; background: var(--surface); padding: 10px 12px; }
 .stat-value { font-size:  calc(24px * var(--fs)); font-weight: 600; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
 .stat-name { font-size:  calc(12px * var(--fs)); margin-top: 2px; color: var(--ink-2); }
+/* 统计卡第三行只说口径，五页统一：大数字 → 名称 → 一句人话 */
+.stat-hint { margin-top: 2px; line-height: 1.5; overflow-wrap: anywhere; }
 .module-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(268px, 1fr)); gap: 10px; }
 .module-card {
   display: block; background: var(--surface); border: 1px solid var(--hairline); border-radius: var(--r7);
@@ -938,3 +927,66 @@ footer #hint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; whi
   border-color: color-mix(in srgb, var(--amber) 48%, transparent); }
 .switch.on span { transform: translateX(16px); background: var(--amber); }
 @media (max-width: 720px) { .settings-grid { grid-template-columns: 1fr; } }
+
+/* -------------------------------------------------------------------------- */
+/* 素材池：分类条 · 筛选行 · 素材网格 · 底部操作条 */
+/* 这一页管素材本身（在不在、归哪类、从哪来），标注状态回模块看，别在这页假装能标 */
+/* -------------------------------------------------------------------------- */
+.cat-strip { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: var(--s2); }
+.cat-chip {
+  display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px;
+  border: 1px solid var(--hairline); border-radius: var(--r-pill); background: var(--surface-2);
+  color: var(--ink-2); font-size: calc(12px * var(--fs)); cursor: pointer;
+  transition: color var(--t1), border-color var(--t1), background var(--t1);
+}
+.cat-chip:hover { color: var(--ink); border-color: color-mix(in srgb, var(--ink) 22%, transparent); }
+.cat-chip svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.6;
+  stroke-linecap: round; stroke-linejoin: round; flex: 0 0 auto; }
+.cat-chip.on { color: var(--sky); border-color: color-mix(in srgb, var(--sky) 48%, transparent);
+  background: color-mix(in srgb, var(--sky) 12%, transparent); }
+.cat-n { font-family: var(--mono); font-size: calc(11px * var(--fs)); color: var(--ink-3);
+  font-variant-numeric: tabular-nums; }
+.cat-chip.on .cat-n { color: var(--sky); }
+.cat-chip.on .cat-n:empty::before { content: "0"; }
+
+.pool-tools { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; margin-bottom: 10px; }
+.pool-tools label { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.pool-tools label.grow { flex: 1; min-width: 220px; }
+.pool-tools label.grow input { flex: 1; min-width: 0; }
+.pool-tools select, .pool-tools input { font-size: calc(12px * var(--fs)); }
+.pool-tools button { flex: 0 0 auto; padding: 4px 12px; font-size: calc(12px * var(--fs)); }
+
+.pool-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(196px, 1fr)); gap: 10px; }
+.pool-empty { grid-column: 1 / -1; line-height: 1.7; overflow-wrap: anywhere; margin: 0; }
+.pool-card {
+  position: relative; background: var(--surface-2); border: 1px solid var(--hairline);
+  border-radius: var(--r7); overflow: hidden; cursor: pointer;
+  transition: border-color var(--t1), transform var(--t1);
+}
+.pool-card:hover { border-color: color-mix(in srgb, var(--ink) 24%, transparent); transform: translateY(-1px); }
+/* 选中=天蓝（和标注页同一个意思），琥珀在这页只留给「下一步该点的按钮」 */
+.pool-card.selected { border-color: color-mix(in srgb, var(--sky) 62%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--sky) 42%, transparent); }
+.pool-card img { display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; background: var(--well); }
+.pool-card input[type=checkbox] {
+  position: absolute; top: 7px; left: 7px; width: 16px; height: 16px; margin: 0;
+  accent-color: var(--sky); cursor: pointer; background: var(--canvas-veil); border-radius: var(--r2);
+}
+.pool-card-meta { padding: 7px 9px 9px; }
+.pool-card-name { font-size: calc(12.5px * var(--fs)); font-weight: 600; letter-spacing: -.01em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pool-card-chips { margin-top: 6px; }
+.pool-card-chips-inner { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.pool-card-chips .chip { flex: 0 0 auto; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 底部操作条：选完就地动手，素材一多也不用一路滚回顶上找按钮 */
+.pool-bar {
+  position: sticky; bottom: 0; z-index: 2; display: flex; align-items: center; gap: var(--s2);
+  flex-wrap: wrap; margin-top: 10px; padding: 8px 10px; background: var(--surface-2);
+  border: 1px solid var(--hairline); border-radius: var(--r7);
+}
+.pool-bar label { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.pool-bar select { font-size: calc(12px * var(--fs)); }
+.pool-bar button { flex: 0 0 auto; padding: 4px 12px; font-size: calc(12px * var(--fs)); }
+.pool-bar .spacer { flex: 1; }
+#pool-log { margin-top: 6px; min-height: 17px; line-height: 1.6; overflow-wrap: anywhere; }

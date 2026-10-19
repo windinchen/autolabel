@@ -1652,7 +1652,6 @@ function initShell() {
       resizeCanvas();
       draw();
     },
-    onUpload: () => openUpload(true),
     onRun: () => openRun(true),
     onBatches: () => openBatches(true),
   });

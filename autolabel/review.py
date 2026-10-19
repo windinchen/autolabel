@@ -482,21 +482,68 @@ class ReviewStore:
             self.index.save()
         return {"ok": True, "image": image_rel, "status": status}
 
-    def pool_payload(self, lib: str = "") -> dict:
-        """共享素材池清单：每张图被哪些库引用，供「从素材池添加」和删除确认用。"""
+    def pool_payload(self, lib: str = "", view: str = "picker") -> dict:
+        """共享素材池清单：每张图被哪些库引用，供「从素材池添加」和删除确认用。
+
+        ``view`` 决定给哪一批图：``picker`` 是各模块的「从素材池添加」，只给本库还没有的；
+        ``all`` 是素材池页自己的清单，全给，另附分类与来处（分类只存在池账本里一份，
+        三个模块看到的分类永远一致）。
+        """
+        from . import pool as pool_catalog
+
         rows = pool_items(self.root)
         wanted = normalize(lib) if lib else ""
+        counts: dict = {}
+        for row in rows:
+            cid = str(row.get("category") or "")
+            counts[cid] = counts.get(cid, 0) + 1
+        categories = pool_catalog.categories(self.root)
+        for row in categories:  # 分类条上的张数直接算好，省得前端自己凑
+            row["files"] = counts.get(str(row["id"]), 0)
         return {
             "lib": wanted,
             "lib_name": lib_name(wanted) if wanted else "全部",
+            "view": view,
+            # 顶栏要写「自动标注 · 数据集名」：名字只有一个来源（索引里的 name），
+            # 各页不许自己拼一份，否则改了名总有几页还在叫老名字
+            "dataset": {"name": self.index.name},
+            "all": rows if view == "all" else [],
+            "categories": categories,
+            "category_summary": pool_catalog.category_summary(self.root, rows),
+            "batches": pool_catalog.batches(self.root),
             "files": [row for row in rows
                       if not wanted or not row.get(f"in_{wanted}")],
             "stats": {"files": len(rows),
                       **{lib: sum(1 for row in rows if row.get("in_" + lib)) for lib in LIBRARIES},
                       "shared": sum(1 for row in rows if len(row.get("libs") or []) > 1),
+                      # 只进了池、三个库都还没引用：素材池页的「未入库」和门户摘要卡都读它
+                      "orphan": sum(1 for row in rows if not row.get("libs")),
                       "bytes": sum(int(row.get("bytes") or 0) for row in rows)},
             "libs": [{"lib": lib_key, "name": LIB_NAMES[lib_key]} for lib_key in LIBRARIES],
         }
+
+    def save_pool_category(self, payload: dict) -> dict:
+        """新建 / 改名一个素材分类。"""
+        from . import pool as pool_catalog
+
+        return pool_catalog.save_category(
+            self.root, str(payload.get("name") or ""), note=str(payload.get("note") or ""),
+            icon=str(payload.get("icon") or ""), category_id=str(payload.get("id") or ""))
+
+    def delete_pool_category(self, category_id: str) -> dict:
+        """删分类：底下的素材退回未分类，素材文件一张都不动。"""
+        from . import pool as pool_catalog
+
+        return pool_catalog.delete_category(self.root, category_id)
+
+    def assign_pool_category(self, payload: dict) -> dict:
+        """给一批素材设分类 / 取消分类（``category`` 传空就是取消）。"""
+        from . import pool as pool_catalog
+
+        rels = [str(rel) for rel in (payload.get("images") or []) if str(rel).strip()]
+        if not rels:
+            raise ValueError("没有选择要分类的素材")
+        return pool_catalog.assign(self.root, rels, str(payload.get("category") or ""))
 
     def adopt_pool(self, image_rels: List[str], lib: str = LIB_POSE,
                    batch_name_text: str = "") -> dict:
@@ -1142,7 +1189,10 @@ class ReviewStore:
     # --- 模型管理 ---
     def models_payload(self) -> dict:
         """权重清单 + 下载进度 + 多模态大模型配置，一次给全「模型管理」面板。"""
-        return vlm_payload(dataset_root=self.root)
+        payload = vlm_payload(dataset_root=self.root)
+        # 顶栏「自动标注 · 数据集名」六页同一个口径：这页以前不给名字，顶栏就空一截
+        payload["dataset"] = {"name": self.index.name}
+        return payload
 
     def active_models(self) -> List[str]:
         """当前仍有未完成任务在用的权重，删除时要把住这道门。"""
@@ -1514,9 +1564,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
             elif path in ("/detect", "/detect/"):
                 # 目标检测标注页与提示词页共用同一套检测框编辑器，差别只在吃哪一库
                 self._send_page("detect.html")
+            elif path in ("/pool", "/pool/", "/materials", "/materials/"):
+                # 素材池：素材本体与分类都归它管，三个标注模块只从池里挑要标的
+                self._send_page("pool.html")
             elif path in ("/models", "/models/"):
                 self._send_page("models.html")
-            elif path in ("/app.js", "/common.js", "/portal.js", "/objects.js", "/models.js"):
+            elif path in ("/app.js", "/common.js", "/portal.js", "/objects.js",
+                          "/pool.js", "/models.js"):
                 self._send_file(os.path.join(STATIC_DIR, path.lstrip("/")),
                                 "application/javascript; charset=utf-8")
             elif path == "/app.css":
@@ -1557,8 +1611,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 batch_id = parse_qs(parsed.query).get("id", [""])[0]
                 self._send_json(self.store.batch_files(unquote(batch_id)))
             elif path == "/api/pool":
-                lib = parse_qs(parsed.query).get("lib", [""])[0]
-                self._send_json(self.store.pool_payload(lib))
+                query = parse_qs(parsed.query)
+                self._send_json(self.store.pool_payload(
+                    query.get("lib", [""])[0],
+                    view="all" if query.get("view", ["picker"])[0] == "all" else "picker"))
             elif path == "/api/models":
                 self._send_json(self.store.models_payload())
             elif path == "/api/version":
@@ -1729,6 +1785,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     images, keep_files=bool(payload.get("keep_files")),
                     lib=str(payload.get("lib") or "pose"),
                     mode=str(payload.get("mode") or "lib"))})
+            elif parsed.path == "/api/pool/category":
+                self._send_json(self.store.save_pool_category(payload))
+            elif parsed.path == "/api/pool/category/delete":
+                wanted = str(payload.get("id") or "").strip()
+                if not wanted:
+                    raise ValueError("没有指定要删除的分类")
+                self._send_json(self.store.delete_pool_category(wanted))
+            elif parsed.path == "/api/pool/assign":
+                self._send_json(self.store.assign_pool_category(payload))
             elif parsed.path == "/api/pool/adopt":
                 rels = [str(item) for item in (payload.get("images") or []) if str(item).strip()]
                 self._send_json(self.store.adopt_pool(

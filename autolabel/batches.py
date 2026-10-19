@@ -33,12 +33,17 @@ from .dataset import (
     file_sha256,
     images_dir,
     label_path_for,
+    libs_holding_image,
     load_index,
     load_index_or_none,
     now_str,
     resolve_image,
 )
 from .atomic import atomic_write_json
+# 池账本（分类 / 只进池的素材）：它只依赖 dataset 与 library，不会绕回本模块
+from .pool import pool_items_map
+from .pool import POOL_BATCH_PREFIX, STATUS_RUNNING as POOL_STATUS_RUNNING
+from .pool import prune as prune_pool
 from .library import (
     LIBRARIES,
     LIB_DETECT,
@@ -320,8 +325,12 @@ def _reconcile_lib(root: str, lib: str, tombstones: set,
     # 1500 张的库光启动对账就要 1 秒、两万张要几分钟（实测是 O(N^2)）。
     other_indexes = [load_index_or_none(root, other) or _EmptyIndex()
                      for other in other_libs(lib)]
+    # 池账本记着的图是"故意还没入库"（从素材池页只进池上传的），不是孤儿图。
+    # 不加这条过滤，用户在素材页传完 200 张没入库，重启一次服务它们就全躺进姿态库了
+    pool_owned = set(pool_items_map(root))
     orphans = [rel for rel in referenced
-               if idx.get(rel) is None and all(o.get(rel) is None for o in other_indexes)]
+               if idx.get(rel) is None and all(o.get(rel) is None for o in other_indexes)
+               and rel not in pool_owned]
     one["missing"] = [rel for rel in idx.items if not os.path.exists(resolve_image(root, rel))]
     batches = load_batches(root, lib)
     running = [row for row in batches if row.get("status") == STATUS_RUNNING]
@@ -622,6 +631,154 @@ def _index_key(idx, rel: str) -> str:
 # 删除
 # --------------------------------------------------------------------------- #
 
+def pool_only_rels(root: str, image_rels: Sequence[str]) -> List[str]:
+    """挑出"只进了池、还没有任何库引用"的素材：它们不在索引里，得走池自己的删除口径。"""
+    catalog = pool_items_map(root)
+    return [rel for rel in (str(item).replace("\\", "/") for item in (image_rels or []))
+            if rel and rel in catalog and not libs_holding_image(root, rel)]
+
+
+def is_pool_batch(batch_id: object) -> bool:
+    """池批次 ID 一律 ``p_`` 开头，库批次是裸 hex——按前缀分流，两套账各删各的。"""
+    return str(batch_id or "").startswith(POOL_BATCH_PREFIX)
+
+
+def delete_pool_batches(root: str, batch_ids: Sequence[str], *, keep_files: bool = False,
+                        active_ids: Optional[Iterable[str]] = None, force: bool = False) -> dict:
+    """删素材池的导入批次：这批素材从各库摘引用，``keep_files=False`` 时连原图一起删。
+
+    以前池页的「删批次」一路走到库批次那条路，报一句「批次不存在: p_xxxx」——
+    素材归池之后来处记在池账本上，删除也得从池账本动手：
+
+    * 还被某个库引用的素材走库口径（摘引用 / 连素材一起删），别绕过标签与快照；
+    * 只进了池的素材走 :func:`delete_pool_only`，文件和账本一起清；
+    * 批次行删掉之后，素材上指向它的「来处」也一起抹掉，不留指向不存在批次的暗账
+      （否则素材池页按这批筛就永远筛不到东西，界面上却还写着来自这批）。
+
+    :param keep_files: 只摘引用，``images/`` 里的原图留在池里
+    :param active_ids: 还在跑任务的批次 ID；正在导入的批次默认拒绝删
+    :param force: 忽略「还在导入中」的保护
+    """
+    from . import pool as pool_catalog
+
+    root = os.path.abspath(root)
+    ids = [str(bid) for bid in batch_ids if str(bid)]
+    if not ids:
+        raise ValueError("没有指定要删除的批次")
+    live = None if active_ids is None else {str(bid) for bid in active_ids}
+    rows = {str(row.get("id")): row for row in pool_catalog.batches(root)}
+    picked = []
+    for batch_id in ids:
+        record = rows.get(batch_id)
+        if record is None:
+            raise ValueError(f"素材池里没有这个批次: {batch_id}")
+        if record.get("status") == POOL_STATUS_RUNNING and not force \
+                and (live is None or batch_id in live):
+            raise ValueError(f"批次「{record.get('name')}」还在导入中，等它跑完再删")
+        picked.append(record)
+
+    rels: List[str] = []
+    for record in picked:
+        for rel in record.get("items") or []:
+            rel = str(rel).replace("\\", "/")
+            if rel and rel not in rels:
+                rels.append(rel)
+    held = [rel for rel in rels if libs_holding_image(root, rel)]
+    spare = [rel for rel in rels if rel not in set(held)]
+
+    items = removals = files = 0
+    snapshot = ""
+    libs: List[str] = []
+    if held:
+        out = delete_images(root, held, lib="all",
+                            mode=DELETE_LIB if keep_files else DELETE_PURGE)
+        items += int(out.get("items") or 0)
+        removals += int(out.get("removals") or 0)
+        files += int(out.get("files_removed") or 0)
+        snapshot = str(out.get("snapshot") or "")
+        libs = [str(lib) for lib in (out.get("libs") or [])]
+    if spare:
+        out = delete_pool_only(root, spare, keep_files=keep_files)
+        items += int(out.get("items") or 0)
+        files += int(out.get("files_removed") or 0)
+
+    catalog = pool_catalog.load_catalog(root)
+    wanted = set(ids)
+    catalog["batches"] = [row for row in catalog["batches"]
+                          if str(row.get("id")) not in wanted]
+    detached = 0
+    for item in list(catalog["items"].values()):
+        if str(item.get("batch") or "") in wanted:
+            item.pop("batch", None)
+            detached += 1
+    pool_catalog.save_catalog(root, catalog)
+    return {"batches": sorted(wanted), "items": items, "removals": removals,
+            "files_removed": files, "snapshot": snapshot, "keep_files": keep_files,
+            "mode": "pool_batch", "lib": "pool", "libs": sorted(set(libs)),
+            "detached": detached, "pool_only": len(spare)}
+
+
+def keep_tracked_in_pool(root: str, image_rels: Sequence[str]) -> List[str]:
+    """把「文件还在、但已经没有任何库引用」的素材记回池账本，返回真记上的那些。
+
+    只补素材层的客观字段（哈希 / 体积 / 尺寸 / 进池时间），标注状态一概不写：
+    同一张图在三个库里各自是什么状态，仍以各库自己的索引为准。
+    """
+    from . import pool as pool_catalog
+    from .dataset import image_size
+
+    root = os.path.abspath(root)
+    ledger = pool_catalog.pool_items_map(root)
+    recorded: List[str] = []
+    for rel in image_rels:
+        rel = str(rel).replace("\\", "/")
+        if not rel or libs_holding_image(root, rel):
+            continue
+        path = os.path.join(images_dir(root), rel)
+        if not os.path.exists(path):
+            continue
+        known = ledger.get(rel) or {}
+        fields = {"bytes": os.path.getsize(path), "imported_at": now_str()}
+        width, height = image_size(path)
+        fields["width"], fields["height"] = width or None, height or None
+        if not known.get("sha256"):
+            # 哈希是去重的唯一依据：漏一次，同一个视频抽两遍就落双份
+            fields["sha256"] = file_sha256(path)
+        pool_catalog.record_file(root, rel, fields)
+        recorded.append(rel)
+    return recorded
+
+
+def delete_pool_only(root: str, image_rels: Sequence[str], *, keep_files: bool = False) -> dict:
+    """删掉只进池没入库的素材：文件 + 池账本条目 + 批次里的引用，三个库索引本来就没它们。
+
+    :param keep_files: 只清账，``images/`` 里的文件留着
+    """
+    root = os.path.abspath(root)
+    rels = [rel for rel in (str(item).replace("\\", "/") for item in (image_rels or [])) if rel]
+    if not rels:
+        raise ValueError("没有指定要删除的素材")
+    if keep_files:
+        # 原图留着 = 素材还在池里：账本一起留着，否则下次导入认不出这是重复帧
+        kept = keep_tracked_in_pool(root, rels)
+        return {"items": 0, "removals": 0, "files_removed": 0, "snapshot": "",
+                "keep_files": True, "mode": DELETE_LIB, "lib": "pool", "libs": [],
+                "missing": [], "batches_updated": [], "batches_emptied": [],
+                "pool_only": len(rels), "kept": len(kept)}
+    removed_files = 0
+    for rel in rels:
+        removed_files += _remove_pool_files(root, rel)
+        try:
+            os.remove(os.path.join(qc_dir(root), "overlays", os.path.splitext(rel)[0] + ".jpg"))
+        except OSError:
+            pass
+    prune_pool(root, rels)
+    return {"items": len(rels), "removals": 0, "files_removed": removed_files,
+            "snapshot": "", "keep_files": keep_files, "mode": DELETE_PURGE, "lib": "pool",
+            "libs": [], "missing": [], "batches_updated": [], "batches_emptied": [],
+            "pool_only": len(rels)}
+
+
 def delete_images(root: str, image_rels: Sequence[str], *, lib: str = LIB_POSE,
                   mode: str = DELETE_LIB, keep_files: Optional[bool] = None,
                   regenerate: bool = True,
@@ -650,6 +807,18 @@ def delete_images(root: str, image_rels: Sequence[str], *, lib: str = LIB_POSE,
     rels = [str(rel).replace("\\", "/") for rel in (image_rels or []) if str(rel).strip()]
     if not rels:
         raise ValueError("没有指定要删除的图片")
+    # 只进了池的图（还没被任何库引用）不在索引里，先按池的口径删掉，剩下的才走各库
+    # 只有"删素材"（purge）才轮到池出手；「从本库移除」对池独占的素材本来就是空操作，
+    # 让它按原路报"不在索引里"比悄悄把文件删了诚实
+    pool_only = pool_only_rels(root, rels) if mode == DELETE_PURGE else []
+    if pool_only:
+        rest = [rel for rel in rels if rel not in set(pool_only)]
+        pool_result = delete_pool_only(root, pool_only, keep_files=bool(keep_files))
+        if not rest:
+            return pool_result
+        rels = rest
+    else:
+        pool_result = {"items": 0, "files_removed": 0}
     live = None if active_ids is None else {str(b) for b in active_ids}
     targets = list(LIBRARIES) if (mode == DELETE_PURGE or all_libs) else [lib]
     with _file_lock(root):
@@ -703,9 +872,14 @@ def delete_images(root: str, image_rels: Sequence[str], *, lib: str = LIB_POSE,
             _drop_from_batches(root, target, owner_before.get(target, {}), snapshot, idx)
             idx.save()
         # 素材文件：只有所有库都不再引用（且这次是 purge）才真删
+        survivors = sorted({rel for group in chosen.values() for rel in group})
         if mode == DELETE_PURGE and not keep_files:
-            for rel in sorted({rel for group in chosen.values() for rel in group}):
+            for rel in survivors:
                 removed_files += _maybe_remove_pool(root, lib, rel)
+            prune_pool(root, survivors)  # 文件没了，池账本里的分类与来处也别留着
+        else:
+            # 文件还在 images/ 里，池账本就得有它：下次导入才认得出这是同一帧
+            keep_tracked_in_pool(root, survivors)
         snapshot["items"] = snapshots
         snapshot_path = _write_snapshot(root, snapshot) if snapshots else ""
 
@@ -720,6 +894,9 @@ def delete_images(root: str, image_rels: Sequence[str], *, lib: str = LIB_POSE,
                                          if isinstance(b, dict)})}
     result["batches_emptied"] = [b["id"] for b in snapshot.get("batches", [])
                                  if isinstance(b, dict) and b.get("emptied")]
+    if pool_result.get("items"):
+        result["items"] += int(pool_result["items"])
+        result["files_removed"] += int(pool_result["files_removed"])
     if regenerate and snapshots:
         result.update(_regenerate(root))
     return result
@@ -782,6 +959,16 @@ def delete_batches(root: str, batch_ids: Sequence[str], *, keep_files: bool = Fa
     if not ids:
         raise ValueError("没有指定要删除的批次")
     live = None if active_ids is None else {str(b) for b in active_ids}
+    # 池批次（``p_`` 开头）记在池账本上，走不通库批次那条路——以前一路走到这儿
+    # 只会报「批次不存在: p_xxxx」，素材池页的「删批次」等于一颗坏按钮
+    pool_ids = [bid for bid in ids if is_pool_batch(bid)]
+    pool_result = None
+    if pool_ids:
+        pool_result = delete_pool_batches(root, pool_ids, keep_files=keep_files,
+                                         active_ids=active_ids, force=force)
+        ids = [bid for bid in ids if not is_pool_batch(bid)]
+        if not ids:
+            return pool_result
     # 「未分组」在每个库里各有一个桶，不带库名的写法等价于三个库一起清
     expanded: List[str] = []
     for batch_id in ids:
@@ -849,9 +1036,25 @@ def delete_batches(root: str, batch_ids: Sequence[str], *, keep_files: bool = Fa
               "files_removed": removed_files,
               "snapshot": snapshot_path, "keep_files": keep_files,
               "libs": sorted({lib for lib, _r, _rels in plan})}
+    if pool_result:
+        result = _merge_delete_results(result, pool_result)
     if regenerate and result["items"]:
         result.update(_regenerate(root))
     return result
+
+
+def _merge_delete_results(one: dict, two: dict) -> dict:
+    """一次勾选里混了池批次和库批次：两份结果合成一句，数字相加、ID 取并集。"""
+    merged = dict(one)
+    merged["batches"] = sorted(set(one.get("batches") or []) | set(two.get("batches") or []))
+    merged["items"] = int(one.get("items") or 0) + int(two.get("items") or 0)
+    merged["removals"] = int(one.get("removals") or 0) + int(two.get("removals") or 0)
+    merged["files_removed"] = int(one.get("files_removed") or 0) + int(two.get("files_removed") or 0)
+    merged["libs"] = sorted(set(one.get("libs") or []) | set(two.get("libs") or []))
+    merged["snapshot"] = str(one.get("snapshot") or two.get("snapshot") or "")
+    merged["mode"] = "mixed"
+    merged["pool_only"] = int(one.get("pool_only") or 0) + int(two.get("pool_only") or 0)
+    return merged
 
 
 # --------------------------------------------------------------------------- #

@@ -74,6 +74,20 @@ def prune_stale_uploads(root: str, max_age_hours: float = STALE_UPLOAD_HOURS) ->
     return report
 
 
+def finish_batch_any(root: str, batch_id: str, status: str = "done", message: str = "") -> None:
+    """批次收尾：``p_`` 开头的是素材池批次（记在 ``pool.json``），其余是各库批次。
+
+    上传任务只有"批次 ID"这一个线索，靠 ID 前缀分派比每个调用点多问一遍 kind 稳当——
+    少分派一次，池批次就会永远挂在"标注中"，界面上删不掉。
+    """
+    if str(batch_id or "").startswith("p_"):
+        from . import pool as pool_catalog
+
+        pool_catalog.finish_batch(root, batch_id, status, message)
+        return
+    finish_batch(root, batch_id, status, message)
+
+
 def lib_for_kind(kind: str) -> str:
     """任务类型 → 标注库：``prompt*`` 归提示词库，``detect*`` 归目标检测库，其余归姿态库。"""
     name = str(kind or "")
@@ -240,7 +254,7 @@ class JobStore:
 
     # --- 对外 ---
     def submit(self, kind: str, files: Sequence[str], params: Optional[dict] = None) -> Job:
-        if kind not in ("image", "video", "pose", "prompt", "prompt_upload",
+        if kind not in ("image", "video", "pool", "pose", "prompt", "prompt_upload",
                         "detect", "detect_upload"):
             raise ValueError(f"未知任务类型: {kind}")
         # 只跑标注不入库的那三类，files 是本库索引里的相对路径，不能被 basename 削掉子目录
@@ -369,11 +383,13 @@ class JobStore:
                 self._run_detect(job)
             elif job.kind == "detect_upload":
                 self._run_detect_upload(job)
+            elif job.kind == "pool":
+                self._run_pool(job)
             else:
                 self._run_import(job)
         except JobCancelled as exc:
             self._attach_batch(job)
-            finish_batch(self.root, job.batch_id, "cancelled", f"{exc or '任务已取消'}，已完成的标注保留")
+            finish_batch_any(self.root, job.batch_id, "cancelled", f"{exc or '任务已取消'}，已完成的标注保留")
             salvaged = self._salvage(job)
             job.result = salvaged
             job.set_stage("cancelled", f"{exc or '任务已取消'}，已完成的标注与坐标已保留")
@@ -382,7 +398,7 @@ class JobStore:
             job.error = f"{type(exc).__name__}: {exc}"
             job.set_stage("failed", job.error)
             job.finished, job.ok = True, False
-            finish_batch(self.root, job.batch_id, "failed", job.error)
+            finish_batch_any(self.root, job.batch_id, "failed", job.error)
         finally:
             with self.lock:
                 if self._running_id == job.id:
@@ -424,6 +440,16 @@ class JobStore:
 
     def _start_batch(self, job: Job) -> None:
         params = job.params
+        if job.kind == "pool":
+            # 只进池的素材在任何库的索引里都没有条目，批次只能记在池账本上
+            from . import pool as pool_catalog
+
+            job.batch_id = pool_catalog.create_batch(
+                self.root,
+                name=batch_name("pool", [display_name(f) for f in job.files],
+                                str(params.get("batch_name") or "")),
+                kind="pool", source="upload", uploads=job.files)["id"]
+            return
         batch = create_batch(
             self.root,
             name=batch_name(job.kind, [display_name(f) for f in job.files],
@@ -444,13 +470,21 @@ class JobStore:
 
     def _attach_batch(self, job: Job) -> None:
         """把已入库的图片挂到批次上（取消时也只挂实际落盘的那部分）。"""
-        if job.batch_id and job.ingested:
-            attach_items(self.root, job.batch_id, job.ingested, lib=lib_for_kind(job.kind))
+        if not (job.batch_id and job.ingested):
+            return
+        if str(job.batch_id).startswith("p_"):
+            from . import pool as pool_catalog
+
+            pool_catalog.attach_items(self.root, job.batch_id, job.ingested)
+            return
+        attach_items(self.root, job.batch_id, job.ingested, lib=lib_for_kind(job.kind))
 
     def _ingest(self, job: Job) -> int:
         from .dataset import import_images
         from .video import extract_frames
 
+        # 素材池页的导入只落文件、不进库：各库要用再从「从素材池添加」里挑
+        register = job.kind != "pool"
         paths = [os.path.join(uploads_dir(self.root), name) for name in job.files]
         if job.kind == "video":
             imported = 0
@@ -462,14 +496,14 @@ class JobStore:
                                         scene=job.params.get("scene"),
                                         max_side=int(job.params.get("max_side", 1600)),
                                         dedupe=str(job.params.get("video_dedupe", "perceptual")),
-                                        lib=lib_for_kind(job.kind))
+                                        lib=lib_for_kind(job.kind), register=register)
                 imported += int(result["imported"]) + int(result.get("reused") or 0)
                 job.ingested.extend(rel for _src, rel in result.get("imported_files", []))
             self._attach_batch(job)
             return imported
         stats = import_images(self.root, paths, max_side=int(job.params.get("max_side", 1600)),
                               dedupe=str(job.params.get("dedupe", "exact")),
-                              lib=lib_for_kind(job.kind))
+                              lib=lib_for_kind(job.kind), register=register)
         job.ingested.extend(rel for _src, rel in stats.get("imported_files", []))
         self._attach_batch(job)
         return (int(stats["imported"]) + int(stats["reused"])
@@ -539,7 +573,7 @@ class JobStore:
             done += f"；{protected} 张人工接受过或画过框的图未覆盖（勾「覆盖已有框」可重标）"
         job.set_stage("done", done)
         job.finished, job.ok = True, True
-        finish_batch(self.root, job.batch_id, "done", job.message)
+        finish_batch_any(self.root, job.batch_id, "done", job.message)
 
     def _prompt_targets(self, job: Job):
         """解析这次任务要标的字段与多模态配置（两个提示词任务共用）。"""
@@ -570,6 +604,19 @@ class JobStore:
 
         return str(write_object_coordinate_files(self.root, tag=f"prompt-{job.id}")["out"])
 
+    def _run_pool(self, job: Job) -> None:
+        """素材池导入：文件落进共享池就结束，不进库、不跑标注、不出坐标。"""
+        job.set_stage("importing", f"导入 {len(job.files)} 个文件")
+        ingested = self._ingest(job)
+        self._check(job)
+        self._cleanup(job)
+        job.result = {"imported": ingested, "batch_id": job.batch_id}
+        job.set_stage("done", f"已进池 {ingested} 张", done=ingested, total=ingested)
+        # finished / ok 必须在这儿落定：以前只写了 stage=done，任务条会一直转，
+        # 「还在导入中」的保护还会把这批素材一直拦住不让删
+        job.finished, job.ok = True, True
+        finish_batch_any(self.root, job.batch_id, "done", job.message)
+
     def _run_import(self, job: Job) -> None:
         """上传任务：入库 → 姿态自动标注 → QC → 坐标导出。"""
         job.set_stage("importing", f"导入 {len(job.files)} 个文件")
@@ -595,7 +642,7 @@ class JobStore:
                       "report": report, "coords": coords, "batch_id": job.batch_id}
         job.set_stage("done", f"完成：入库 {ingested} 张，标注 {labeled.get('labeled', 0)} 张")
         job.finished, job.ok = True, True
-        finish_batch(self.root, job.batch_id, "done", job.message)
+        finish_batch_any(self.root, job.batch_id, "done", job.message)
 
     def _run_prompt_upload(self, job: Job) -> None:
         """提示词标注模块的上传：入库 →（可选）逐图问多模态大模型出框 → 写检测框坐标。
@@ -611,7 +658,7 @@ class JobStore:
             job.result = {"imported": 0, "labeled": 0, "boxes": 0, "batch_id": job.batch_id}
             job.set_stage("done", "完成：没有新图入库（可能与已有图片重复，或文件里没有可用图片）")
             job.finished, job.ok = True, True
-            finish_batch(self.root, job.batch_id, "done", job.message)
+            finish_batch_any(self.root, job.batch_id, "done", job.message)
             return
 
         self._check(job)
@@ -645,7 +692,7 @@ class JobStore:
             done += f"（{stats['failed']} 张没答上）"
         job.set_stage("done", done)
         job.finished, job.ok = True, True
-        finish_batch(self.root, job.batch_id, "done", job.message)
+        finish_batch_any(self.root, job.batch_id, "done", job.message)
 
     # --- 目标检测任务：本地 YOLO 权重出它自带的类别，不联网、比多模态快一个数量级 ---
     def _detect_targets(self, job: Job):
@@ -733,7 +780,7 @@ class JobStore:
                          if labeled.get("skipped_human") else "")
                       + (f" · 失败 {labeled['failed']} 张" if labeled.get("failed") else ""))
         job.finished, job.ok = True, True
-        finish_batch(self.root, job.batch_id, "done", job.message)
+        finish_batch_any(self.root, job.batch_id, "done", job.message)
 
     def _run_detect(self, job: Job) -> None:
         """已入库的图批量跑目标检测：不导入、不跑姿态，产出只进 ``detect_labels/``。"""
@@ -756,7 +803,7 @@ class JobStore:
                       "batch_id": job.batch_id, "classes": names}
         job.set_stage("done", self._detect_done_text(stats))
         job.finished, job.ok = True, True
-        finish_batch(self.root, job.batch_id, "done", job.message)
+        finish_batch_any(self.root, job.batch_id, "done", job.message)
 
     def _run_detect_upload(self, job: Job) -> None:
         """目标检测标注模块的上传：入库 →（可选）本地权重出框 → 写检测框坐标。"""
@@ -769,7 +816,7 @@ class JobStore:
             job.result = {"imported": 0, "labeled": 0, "boxes": 0, "batch_id": job.batch_id}
             job.set_stage("done", "完成：没有新图入库（可能与已有图片重复，或文件里没有可用图片）")
             job.finished, job.ok = True, True
-            finish_batch(self.root, job.batch_id, "done", job.message)
+            finish_batch_any(self.root, job.batch_id, "done", job.message)
             return
 
         self._check(job)
@@ -800,7 +847,7 @@ class JobStore:
                       "coords": coords, "batch_id": job.batch_id, "classes": names}
         job.set_stage("done", self._detect_done_text(stats, ingested))
         job.finished, job.ok = True, True
-        finish_batch(self.root, job.batch_id, "done", job.message)
+        finish_batch_any(self.root, job.batch_id, "done", job.message)
 
     def _cleanup(self, job: Job) -> None:
         if job.kind in ("prompt", "detect"):  # 只跑标注的任务没有临时上传文件要清

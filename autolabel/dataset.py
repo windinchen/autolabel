@@ -308,6 +308,17 @@ def file_sha256(path: str) -> str:
     return h.hexdigest()
 
 
+def image_size(path: str) -> Tuple[int, int]:
+    """只读文件头拿宽高（不整张解码）：给"手工拷进 images/ 的素材"补尺寸用。"""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            return int(im.width), int(im.height)
+    except Exception:  # noqa: BLE001 读不出就当不知道，别拖垮整张清单
+        return 0, 0
+
+
 def _load_rgb(path: str, max_side: Optional[int] = None):
     from PIL import Image, ImageOps
 
@@ -341,6 +352,8 @@ def _entry_defaults(lib: str) -> dict:
 
 def pool_entries(root: str, lib: str = LIB_POSE) -> Dict[str, dict]:
     """三个库索引合并出的「素材池视角」：``相对路径 -> 条目``，用于跨库去重与复用。"""
+    from . import pool as pool_catalog
+
     merged: Dict[str, dict] = {}
     for other in LIBRARIES:
         other_idx = load_index_or_none(root, other)
@@ -349,6 +362,12 @@ def pool_entries(root: str, lib: str = LIB_POSE) -> Dict[str, dict]:
         for rel, item in other_idx.items.items():
             merged.setdefault(rel, item)
     merged.pop("__missing__", None)
+    # 只进池、还没被任何库引用的素材记在池账本里：漏掉它们，下一次导入认不出这是重复帧
+    # （同一个视频抽两遍就落双份），「从素材池添加」也会回一句"池里查无此图"
+    for rel, item in pool_catalog.pool_items_map(root).items():
+        if rel not in merged:
+            merged[rel] = {name: value for name, value in item.items()
+                           if name in POOL_KEYS and value is not None}
     return merged
 
 
@@ -386,17 +405,35 @@ def pool_items(root: str) -> List[dict]:
     ``libs`` 是引用它的库名列表——判断"删文件会不会影响别的库"只看这一个，
     两个库的时代可以瞎写 ``in_pose and in_objects``，三个库就不够用了。
     """
+    from . import pool as pool_catalog
+
     indexes = {lib: load_index_or_none(root, lib) for lib in LIBRARIES}
+    catalog = pool_catalog.load_catalog(root)
     rows: List[dict] = []
     for rel in pool_files(root):
         found = {lib: (idx.get(rel) if idx is not None else None) for lib, idx in indexes.items()}
-        base = next((item for item in found.values() if item), {})
+        # 只进池的图三个库索引里都没有，尺寸与大小得从池账本补，否则界面上全是 0 KB
+        own = catalog["items"].get(rel) or {}
+        base = dict(next((item for item in found.values() if item), {}))
+        for name in pool_catalog.POOL_ITEM_KEYS:
+            if base.get(name) is None and own.get(name) is not None:
+                base[name] = own[name]
+        if base.get("bytes") is None and base.get("width") is None:
+            # 三处都查不到（既没入库也没记账）：按磁盘现状补，卡片才不必写"尺寸未知"
+            path = os.path.join(images_dir(root), rel)
+            try:
+                base["bytes"] = os.path.getsize(path)
+            except OSError:
+                base["bytes"] = 0
+            width, height = image_size(path)
+            base["width"], base["height"] = width or None, height or None
         holders = [lib for lib, item in found.items() if item is not None]
         rows.append({
             "image": rel, "name": os.path.basename(rel),
             "bytes": int(base.get("bytes") or 0),
             "width": base.get("width"), "height": base.get("height"),
             "imported_at": base.get("imported_at"),
+            "batch_id": base.get("batch_id") or "",
             "video": os.path.basename(str(base["video"])) if base.get("video") else "",
             "in_pose": found[LIB_POSE] is not None, "in_objects": found[LIB_OBJECTS] is not None,
             "in_detect": found[LIB_DETECT] is not None, "libs": holders,
@@ -405,7 +442,7 @@ def pool_items(root: str) -> List[dict]:
             "detect_status": (found[LIB_DETECT] or {}).get("detect_status") or "",
         })
     rows.sort(key=lambda row: str(row.get("imported_at") or ""), reverse=True)
-    return rows
+    return pool_catalog.attach(root, rows, catalog=catalog)
 
 
 def adopt_from_pool(root: str, image_rels: Sequence[str], lib: str = LIB_POSE) -> dict:
@@ -455,11 +492,14 @@ def import_images(
     subdir: str = "",
     on_progress=None,
     lib: str = LIB_POSE,
+    register: bool = True,
 ) -> dict:
     """把图片规范化导入共享素材池，并登记进 ``lib`` 指定的标注库。
 
     :param dedupe: ``none`` | ``exact``（内容哈希）| ``perceptual``（dHash 近似重复）
     :param lib: 目标标注库，``pose`` 或 ``objects``
+    :param register: ``False`` 表示**只进素材池**，不进任何标注库索引；这类素材只在
+        池账本里记一笔，各模块要用时再从池里挑（``adopt_from_pool``）
 
     去重看的是**素材池**（三个库的并集）：另一个库已经存过同一帧时不再复制文件，
     只把已有文件登记进本库，计入 ``reused``。本库已有才算 ``skipped_*``。
@@ -486,7 +526,10 @@ def import_images(
              "skipped_similar": 0, "failed": 0, "imported_files": [], "lib": lib}
 
     def _reuse(rel: str) -> str:
-        """命中另一个库已入库的同一帧：复用文件，本库新增条目。"""
+        """命中池里已有的同一帧：复用文件，本库新增条目。"""
+        if not register:
+            # 只进池：走到这里说明池里已经有同一帧，本库索引一个字节都不动
+            return ""
         if idx.get(rel) is not None:
             return ""
         return rel if adopt_pool_entry(idx, pool.get(rel), rel) else ""
@@ -531,7 +574,12 @@ def import_images(
             fields.update(_entry_defaults(lib))
             if ph is not None:
                 fields["dhash"] = ph
-            idx.upsert(rel, **fields)
+            if register:
+                idx.upsert(rel, **fields)
+            else:
+                from . import pool as pool_catalog
+
+                pool_catalog.record_file(root, rel, fields)
             exact_seen[digest] = rel
             if ph is not None:
                 phash_seen.append((ph, rel))
@@ -542,7 +590,9 @@ def import_images(
         except Exception as exc:  # noqa: BLE001 - 单张失败不阻断整批
             stats["failed"] += 1
             print(f"[warn] 导入失败 {src}: {type(exc).__name__}: {exc}")
-    idx.save()
+    if register:
+        idx.save()
+    stats["register"] = bool(register)
     return stats
 
 
@@ -595,11 +645,13 @@ def import_prepared(
     jpeg_quality: int = 95,
     subdir: str = "",
     lib: str = LIB_POSE,
+    register: bool = True,
 ) -> dict:
     """按指定文件名导入图片，用于视频帧这类需要携带时间戳的来源。
 
     :param prepared: (源文件, 目标文件名主干, 附加索引字段) 列表
     :param lib: 目标标注库，去重同样以共享素材池为准
+    :param register: ``False`` 表示只进素材池，不进标注库索引（素材页上传视频用）
     """
     from .image_utils import dhash64, hamming
 
@@ -616,6 +668,9 @@ def import_prepared(
              "skipped_similar": 0, "failed": 0, "imported_files": [], "lib": lib}
 
     def _reuse(rel: str) -> str:
+        if not register:
+            # 只进池：池里已有同一帧就是不落新文件，别库的索引也不该被这次导入改动
+            return ""
         if idx.get(rel) is not None:
             return ""
         return rel if adopt_pool_entry(idx, pool.get(rel), rel) else ""
@@ -662,7 +717,12 @@ def import_prepared(
             if ph is not None:
                 fields["dhash"] = ph
             fields.update(extra or {})
-            idx.upsert(rel, **fields)
+            if register:
+                idx.upsert(rel, **fields)
+            else:
+                from . import pool as pool_catalog
+
+                pool_catalog.record_file(root, rel, fields)
             exact_seen[digest] = rel
             if ph is not None:
                 phash_seen.append((ph, rel))
@@ -671,7 +731,9 @@ def import_prepared(
         except Exception as exc:  # noqa: BLE001
             stats["failed"] += 1
             print(f"[warn] 导入失败 {src}: {type(exc).__name__}: {exc}")
-    idx.save()
+    if register:
+        idx.save()
+    stats["register"] = bool(register)
     return stats
 
 

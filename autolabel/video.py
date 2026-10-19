@@ -99,12 +99,14 @@ def extract_frames(
     subdir: str = "",
     keep_temp: bool = False,
     lib: str = "pose",
+    register: bool = True,
 ) -> dict:
     """抽帧并导入数据集。
 
     :param fps: 每秒采样帧数（0.5 = 每 2 秒一帧）；scene 模式下忽略
     :param scene: 场景切换阈值（0~1，常用 0.25~0.4），设置后按镜头切点取帧
     :param lib: 目标标注库（``pose`` / ``objects``），素材仍落在共享池里
+    :param register: ``False`` 表示抽出来的帧只进素材池，不进标注库索引
     """
     from .dataset import import_prepared
 
@@ -120,7 +122,7 @@ def extract_frames(
         prepared, extracted = _run_ffmpeg(video, tmp, stem, fps, scene, start, duration,
                                           max_side, max_frames, info)
         result = import_prepared(dataset_root, prepared, dedupe=dedupe, max_side=max_side,
-                                 subdir=subdir, lib=lib)
+                                 subdir=subdir, lib=lib, register=register)
     finally:
         if not keep_temp:
             shutil.rmtree(tmp, ignore_errors=True)

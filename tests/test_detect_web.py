@@ -214,14 +214,18 @@ def test_navigation_offers_the_third_module_everywhere():
     portal = read_static("portal.js")
     block = portal[portal.index("const MODULE_CARDS"):portal.index("function buildStats")]
     assert 'id: "detect", href: "/detect"' in block
-    for banned in ("素材池", "两库共用", "二级模块"):
+    # 「素材池」不再是不许上界面的实现细节词：它是一等模块，但别混进三张标注库卡片里
+    for banned in ("两库共用", "二级模块"):
         assert banned not in block
-    assert 'for (const key of ["pose", "objects", "detect"])' in portal
     assert '"export-yolo-detect"' in portal and '"yolo_detect"' in portal
     assert 'key: "detect_items"' in portal
+    assert "目标检测标注" in portal
     html = read_static("portal.html")
-    assert '<option value="detect">目标检测标注</option>' in html
     assert "三个标注库" in html
+    assert 'id: "pool", href: "/pool"' in common, "顶栏导航得认得素材池这一页"
+    # 每个库被引用了多少张由后端算，门户只念一遍；「加进哪个模块」的下拉框在素材池页
+    assert '"orphan"' not in portal and 'pool.detect' in portal
+    assert '<option value="detect">目标检测标注</option>' in read_static("pool.html")
 
 
 # --------------------------------------------------------------------------- //

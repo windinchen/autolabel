@@ -72,11 +72,11 @@ def test_every_filter_option_is_actually_understood():
 # --------------------------------------------------------------------------- //
 # 门户与模型管理：文档型页面也必须共用同一套壳层
 # --------------------------------------------------------------------------- //
-DOC_PAGES = {"portal.html": "portal.js", "models.html": "models.js"}
+DOC_PAGES = {"portal.html": "portal.js", "pool.html": "pool.js", "models.html": "models.js"}
 
 
 def test_document_pages_share_the_same_shell():
-    """门户和模型管理不许留旧顶栏：左导航条、命令面板、速查表、溢出菜单一个都不能少。"""
+    """工作台 / 素材池 / 模型管理不许留旧顶栏：左导航条、命令面板、速查表、溢出菜单一个都不能少。"""
     css = read("app.css")
     assert ".shell-row" in css, "缺 .shell-row：文档页的左导航条没地方放"
     for page, script in DOC_PAGES.items():
@@ -103,7 +103,7 @@ def test_document_pages_handle_every_key_they_advertise():
 # 外观：白天 / 夜晚 · 字号缩放
 # --------------------------------------------------------------------------- //
 ALL_PAGES = {"review.html": "app.js", "objects.html": "objects.js",
-             "portal.html": "portal.js", "models.html": "models.js"}
+             "portal.html": "portal.js", "pool.html": "pool.js", "models.html": "models.js"}
 
 
 def test_appearance_controls_are_wired_on_every_page():
@@ -225,10 +225,15 @@ def test_portal_leads_with_next_actions_and_drops_internalese():
     assert 'id="next-actions"' in html, "门户缺行动流区块"
     assert "renderNextActions(" in portal_js and "renderNextActions(ds);" in portal_js, "行动流没被渲染"
     assert "slice(0, 3)" in portal_js, "行动流要限量，否则又变成一屏卡片墙"
-    for banned in ("素材池", "两库共用", "二级模块"):
+    for banned in ("两库共用", "二级模块", "素材索引"):
         assert banned not in html, f"门户界面文案还留着「{banned}」"
         block = portal_js[portal_js.index("const MODULE_CARDS"):portal_js.index("function buildStats")]
         assert banned not in block, f"门户卡片/数字文案还留着「{banned}」"
+    # 素材池是正式模块：门户只给一句摘要 + 两个入口，批次清单不许在门户再留一份
+    assert 'id="sec-pool"' in html and 'href="/pool"' in html and 'href="/pool?upload=1"' in html
+    assert "renderPoolBrief(" in portal_js and "renderPoolBrief(ds);" in portal_js
+    for leftover in ('id="sec-batches"', 'id="portal-batches"', "renderBatches(", "batchState"):
+        assert leftover not in html + portal_js, f"门户还留着批次管理：{leftover}"
     assert ".stat-strip" in read("app.css"), "门户概览应该是紧凑数字条，不是十几张卡片"
 
 
@@ -274,20 +279,25 @@ CATALOG_ROWS = [
 ]
 
 
-def test_catalog_defaults_to_installed_models_only():
-    """官方目录一摆就是一百六十档，默认只留本机已有的，下载按钮才找得到。"""
+def test_catalog_defaults_to_the_whole_official_catalog():
+    """目录默认给全量（下载入口比「只看已下载」更常被找），勾上开关才收窄到本机已有的。"""
     html = read("models.html")
     source = read("models.js")
 
-    assert 'class="switch on" id="model-installed-only"' in html, "开关默认得是开的"
-    assert "installedOnly: true" in source
+    assert 'class="switch" id="model-installed-only"' in html, "「只看已下载」默认得是关的"
+    assert 'aria-checked="false"' in html, "开关的无障碍状态要和默认一致"
+    assert "installedOnly: false" in source
     assert "visibleCatalogRows(" in source and "toggleInstalledOnly()" in source
     assert "另有" in source and "未下载没显示" in source, "藏掉多少条要说出来，否则像目录只剩几个"
 
-    got = run_models_function("visibleCatalogRows",
-                              {"installedOnly": True, "query": "", "filter": ""}, CATALOG_ROWS)
-    assert [row["id"] for row in got["shown"]] == ["yolo11n", "ollama-qwen"], got
-    assert got["hidden"] == 1
+    default = run_models_function("visibleCatalogRows",
+                                  {"installedOnly": False, "query": "", "filter": ""}, CATALOG_ROWS)
+    assert [row["id"] for row in default["shown"]] == [row["id"] for row in CATALOG_ROWS], default
+    assert default["hidden"] == 0, "默认就该看全量：没下载的也得能点下载"
+    narrowed = run_models_function("visibleCatalogRows",
+                                   {"installedOnly": True, "query": "", "filter": ""}, CATALOG_ROWS)
+    assert [row["id"] for row in narrowed["shown"]] == ["yolo11n", "ollama-qwen"], narrowed
+    assert narrowed["hidden"] == 1
 
 
 def test_searching_the_catalog_beats_the_installed_only_switch():
@@ -390,7 +400,8 @@ def test_catalog_refresh_is_wired_end_to_end():
     refresh = source.split("async function refreshCatalog()", 1)[1].split("\n}", 1)[0]
     assert "button.textContent =" not in refresh, "整块写 textContent 会把按钮里的图标抹掉"
     assert "function paintCatalogRefresh()" in source and "paintCatalogRefresh();" in source
-    assert "核对于 " in source, "按钮上要写清上次核对的时间，不然没人知道该不该点"
+    assert "更新于 " in source, "按钮上要写清上次核对的时间，不然没人知道该不该点"
+    assert "从未核对" in source, "从没核对过的情况也得说清楚"
     assert '"/api/modelhub/refresh"' in review and "refresh_model_catalog" in review
     assert "更新模型目录" in source, "命令面板也得找得到这件事"
 
@@ -410,8 +421,9 @@ def test_pose_dropdown_only_offers_pose_weights():
 # --------------------------------------------------------------------------- //
 # 最左边那一竖条：只管本页动作，模块跳转只有一处代码在生成
 # --------------------------------------------------------------------------- //
-PAGES = ("portal.html", "review.html", "objects.html", "detect.html", "models.html")
-MODULE_HREFS = ('href="/"', 'href="/pose"', 'href="/objects"', 'href="/detect"', 'href="/models"')
+PAGES = ("portal.html", "pool.html", "review.html", "objects.html", "detect.html", "models.html")
+MODULE_HREFS = ('href="/"', 'href="/pool"', 'href="/pose"', 'href="/objects"',
+                'href="/detect"', 'href="/models"')
 
 
 def rail_block(html):
@@ -433,16 +445,61 @@ def test_module_jumps_are_generated_in_one_place_with_one_placeholder_per_page()
 
 
 def test_rail_holds_only_this_pages_own_actions():
-    """竖条不再挂模块跳转：五枚同形图标并排放，反而看不出自己在哪一页。
-
-    工作台那张「导入素材」是发起动作的捷径，不是模块定位，留着。
-    """
+    """竖条不再挂模块跳转：五枚同形图标并排放，反而看不出自己在哪一页。"""
     for page in PAGES:
         rail = rail_block(read(page))
         for href in MODULE_HREFS:
             assert href not in rail, f"{page} 的竖条里还留着模块跳转 {href}"
         assert "rail-spacer" in rail, f"{page} 的竖条没把帮助钉在底部"
-    assert 'href="/pose?upload=1"' in rail_block(read("portal.html"))
+
+
+def test_import_has_exactly_one_entrance_and_it_is_top_right():
+    """「导入素材」六页只有右上角一处，模型管理页压根不管素材。
+
+    以前它同时挂在右上角和竖条上（工作台还有第三处：素材池摘要卡里的按钮），
+    两颗长得一样的图标去的是同一个弹层，用户只能猜哪颗是正主。现在竖条只管
+    本页面板开关，导入的位置六页统一在右上角，快捷键（W / U）不变。
+    """
+    for page in PAGES:
+        rail = rail_block(read(page))
+        assert 'id="rail-upload"' not in rail, f"{page} 的竖条又长出第二颗导入按钮"
+        assert "pool?upload=1" not in rail, f"{page} 的竖条又挂回导入捷径"
+    assert 'id="btn-import" href="/pool?upload=1"' in read("portal.html"), \
+        "工作台的导入要指向素材池，别再塞进某个库"
+    for page in ("pool.html", "review.html", "objects.html", "detect.html"):
+        assert 'id="btn-upload"' in read(page), f"{page} 右上角缺导入按钮"
+    assert 'id="btn-upload"' not in read("models.html"), "模型管理页不该管素材"
+    assert 'onUpload' not in read("common.js"), "竖条导入的绑定已废，别引回来"
+
+
+def test_portal_next_step_separates_annotating_from_reviewing():
+    """「下一步」得先分清还没标和标了没复核：从素材池刚加进来的库一张都没标。
+
+    上一版这种库会被写成「有 2 帧本机权重出的框没复核」，可它一个框都还没有，
+    按这句话点进复核队列只会看到一片空白，等于让主页说了句假话。
+    """
+    source = read("portal.js")
+    assert "poseUntouched" in source and "detectUntouched" in source
+    assert 'values.pose_unreviewed && values.pose_labeled' in source, "没标的库不该说「骨骼没复核」"
+    assert 'values.detect_unreviewed && values.detect_labeled' in source, "同上，检测库口径一致"
+    assert "还没生成骨骼" in source and "还没跑过" in source
+    assert 'chip: "目标检测标注"' in source, "模块名要写全，别再用「检测标注」这个第三名字"
+
+
+def test_help_button_is_the_same_button_on_every_page():
+    """六页那颗「说明」必须是同一个 id、同一处接线：姿态页曾经点了没反应。
+
+    接线只在 :func:`initShellChrome` 里做一次，各页不再自己补一条 ``onclick``，
+    否则加一页要么漏绑（点了没动静态按钮），要么两条语句互相覆盖看不出来。
+    """
+    for page in PAGES:
+        assert 'id="rail-help"' in read(page), f"{page} 的说明按钮没跟着统一 id"
+        assert 'id="btn-help"' not in read(page), f"{page} 还留着老 id，那根线已经不在这里了"
+    common = read("common.js")
+    assert 'bind("rail-help", () => openHelp(true));' in common
+    assert 'bind("btn-help"' not in common
+    for page in ("portal.js", "pool.js", "models.js"):
+        assert '$("rail-help").onclick' not in read(page), f"{page} 又自己绑了一遍说明按钮"
 
 
 def test_icons_say_one_thing_each():
