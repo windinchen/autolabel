@@ -297,6 +297,33 @@ def test_a_broken_image_fails_alone_not_the_whole_batch(detect_ds, monkeypatch):
     assert "model_failed" in (item["detect_flags"] or []) and item["detect_error"]
 
 
+def test_named_images_that_are_not_in_the_library_are_rejected(detect_ds, monkeypatch):
+    """点名的图压根不在本库：一行说清楚，别在索引里造一行打不开的图。
+
+    ``--images`` 打错一个字，以前会照样 upsert 出一条 ``model_failed`` 记录——
+    界面凭空多一行没有宽高的图，张数与未标数跟着对不上，还甩 8 行 Python 栈。
+    """
+    use_backend(monkeypatch)
+    dt.add_model_classes(detect_ds, "yolo11n.pt", ["person"])
+    before = rels_of(detect_ds)
+    with pytest.raises(ValueError, match="不在目标检测") as exc:
+        dt.run_detect_labeling(detect_ds, images=["ghost.jpg"], verbose=False)
+    assert "ghost.jpg" in str(exc.value) and "autolabel import" in str(exc.value)
+    assert rels_of(detect_ds) == before
+
+
+def test_half_unknown_names_are_warned_and_never_written_to_the_index(detect_ds, monkeypatch,
+                                                                      capsys):
+    """一半点名一半打错：能标的照标，打错那张只警告，不进索引、不进批次统计。"""
+    use_backend(monkeypatch)
+    dt.add_model_classes(detect_ds, "yolo11n.pt", ["person"])
+    known = rels_of(detect_ds)[0]
+    stats = dt.run_detect_labeling(detect_ds, images=[known, "ghost.jpg"], verbose=True)
+    assert stats["labeled"] == 1 and stats["unknown_images"] == ["ghost.jpg"]
+    assert "ghost.jpg" not in rels_of(detect_ds)
+    assert "跳过 1 张" in capsys.readouterr().out
+
+
 def test_segment_weight_is_accepted_as_a_box_source(detect_ds, monkeypatch):
     use_backend(monkeypatch, task="segment")
     dt.add_model_classes(detect_ds, "yolo11n.pt", ["person"])

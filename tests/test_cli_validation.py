@@ -35,6 +35,64 @@ def test_unknown_batch_id_reports_plain_words(dataset, capsys):
     assert "[error]" in err and "b_ghost" in err and "Traceback" not in err
 
 
+def test_detect_rejects_unknown_images_before_any_side_effect(dataset, monkeypatch, capsys):
+    """``--images`` 打错一个字：一行说清楚，别留下失败批次和打不开的幽灵行。
+
+    以前一次留三样脏东西——``model_failed`` 的索引记录（界面多一行没有宽高的图）、
+    一条失败的批次记录，再加 8 行 Python 栈。
+    """
+    from autolabel import detect as dt
+    from autolabel.batches import load_batches
+    from autolabel.library import LIB_DETECT
+    from test_detect import use_backend
+
+    use_backend(monkeypatch)
+    dt.add_model_classes(dataset, "yolo11n.pt", ["person"])
+    assert main(["detect", dataset, "--images", "ghost.jpg", "--quiet"]) == 1
+    err = capsys.readouterr().err
+    assert "[error]" in err and "ghost.jpg" in err and "Traceback" not in err
+    assert load_batches(dataset, LIB_DETECT) == []
+    assert load_index(dataset, LIB_DETECT).get("ghost.jpg") is None
+
+
+def test_prompt_rejects_unknown_images_before_any_side_effect(dataset, monkeypatch, capsys):
+    """提示词标注同理：路径打错连一次模型请求都不该发，也不该建批次。"""
+    from autolabel import fields as fd
+    from autolabel import models as model_manager
+    from autolabel.batches import load_batches
+    from autolabel.library import LIB_OBJECTS
+
+    fd.upsert_field(dataset, name="bottle", label="瓶子", prompt_hint="桌上的水瓶")
+    profile = model_manager.upsert_profile({"name": "本地 Ollama",
+                                           "base_url": "http://x/v1", "model": "qwen2.5vl:7b"})
+    monkeypatch.setattr(model_manager, "get_profile", lambda pid: dict(profile, image_limit=768))
+    assert main(["prompt", dataset, "--images", "ghost.jpg", "--quiet"]) == 1
+    err = capsys.readouterr().err
+    assert "[error]" in err and "ghost.jpg" in err and "Traceback" not in err
+    assert load_batches(dataset, LIB_OBJECTS) == []
+    assert load_index(dataset, LIB_OBJECTS).get("ghost.jpg") is None
+
+
+def test_runtime_failures_also_report_plain_words(dataset, monkeypatch, capsys):
+    """整批标注失败（显存不够、域名解析不了）也不该配一栈 traceback。
+
+    本项目 ``raise RuntimeError`` 的地方全是「用户能自己解决」的运行时状况，
+    文案本来就是一句人话，栈只会把它埋在最底下。
+    """
+    from autolabel import detect as dt
+    from test_detect import use_backend
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("0 张全部标注失败：显存不够")
+
+    use_backend(monkeypatch)
+    dt.add_model_classes(dataset, "yolo11n.pt", ["person"])
+    monkeypatch.setattr(dt, "run_detect_labeling", boom)
+    assert main(["detect", dataset, "--quiet"]) == 1
+    err = capsys.readouterr().err
+    assert "[error]" in err and "显存不够" in err and "Traceback" not in err
+
+
 @pytest.mark.parametrize("flag,value", [
     ("--val-ratio", "1.5"), ("--val-ratio", "0"),
     ("--conf", "5"), ("--iou", "-1"), ("--imgsz", "0"),
@@ -169,6 +227,45 @@ def test_pool_add_accepts_comma_separated_list(dataset, capsys):
 
     assert "新增 2 张" in out and "池里查无 0 张" in out
     assert set(load_index(dataset, "detect").items) == set(names)
+
+
+def test_pool_add_that_matches_nothing_fails_loudly(dataset, capsys):
+    """池里查无此文件：不能顶着一行 [ok] + 退出码 0 过去，脚本里的 ``&&`` 会白过。"""
+    assert main(["pool", dataset, "--add", "打错的名字.jpg", "--lib", "detect"]) == 1
+    out = capsys.readouterr().out
+    assert "[error]" in out and "素材池里没有这些文件" in out and "打错的名字.jpg" in out
+    assert set(load_index(dataset, "detect").items) == set()
+
+
+@pytest.mark.parametrize("lib,relabel,flag", [
+    ("pose", "label", "--force"),
+    ("objects", "prompt", "--overwrite"),
+    ("detect", "detect", "--overwrite"),
+])
+def test_duplicate_import_hint_names_that_library_command(dataset, capsys, lib, relabel, flag):
+    """重复导入时指路的命令必须是对着那个库的。
+
+    以前三句都写成 ``autolabel label --force``——那是姿态库的重标命令，往检测库导
+    素材的人照着敲，得到的是「姿态库还没有类别」之类毫不相干的第二句报错。
+    """
+    source = os.path.join(dataset, "images", sorted(idx_names(dataset))[0])
+    main(["import", dataset, source, "--lib", lib])   # 先让它进库（或认领素材池）
+    capsys.readouterr()
+    assert main(["import", dataset, source, "--lib", lib]) == 0
+    out = capsys.readouterr().out
+    assert "没有新图入库" in out
+    assert f"autolabel {relabel} {dataset} {flag}" in out
+    # 另一种去处：素材池里已有、只是没进本库，得指去 pool --add
+    assert "autolabel pool" in out
+
+
+def test_pool_add_partial_still_exits_zero(dataset, capsys):
+    """对一半错一半：加进去的那张算成功，但要单独点出没找到的名字。"""
+    names = sorted(idx_names(dataset))
+    assert main(["pool", dataset, "--add", f"{names[0]},打错的名字.jpg", "--lib", "detect"]) == 0
+    out = capsys.readouterr().out
+    assert "[ok]" in out and "新增 1 张" in out and "打错的名字.jpg" in out
+    assert set(load_index(dataset, "detect").items) == {names[0]}
 
 
 def test_batch_delete_accepts_comma_separated_ids(dataset, capsys):

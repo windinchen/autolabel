@@ -33,16 +33,19 @@ echo ! 没找到 uv，改用系统 Python。依赖要自己装好：python -m pi
 echo   想省事就装一次 uv：winget install astral-sh.uv
 echo.
 python -m autolabel launch %EXTRA% %*
+set "RC=%ERRORLEVEL%"
 goto :end
 
 :with_uv
 "%UV%" run --offline --quiet --with numpy --with pillow --with pyyaml --with requests --python 3.11 python3 -m autolabel launch %EXTRA% %*
+set "RC=%ERRORLEVEL%"
 
 :end
 echo.
 echo 关掉这个窗口就是停掉服务。想让它登录自己起、不占窗口：双击 后台服务.bat
 pause
-exit /b 0
+rem 退出码如实传出去（和 后台服务.bat 同一条规矩）：起不来还报 0，计划任务会以为一切正常
+exit /b %RC%
 
 :find_uv
 rem uv 是本项目用来备 Python 环境的工具；Windows 上装完常常不在 PATH 里，得自己找

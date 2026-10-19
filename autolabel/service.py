@@ -40,7 +40,15 @@ NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$"
 #: ``Get-ScheduledTask`` 的 ``State``（Windows）与 ``launchctl list`` 的读数都往这里对
 READY_STATES = ("ready", "queued", "not running", "就绪")
 RUNNING_STATES = ("running", "正在运行")
+#: 注册/重启之后等多久算「起不来」：与 ``launch.wait_for_port`` 的默认口径一致。
+#: 以前这里写死 40 秒、实例那条路等 90 秒，模型冷启动常要一分钟以上，
+#: 于是同样的机器同样的冷启动，注册时报「没起来」、稍后手动看又是好的。
+READY_WAIT = 90.0
 DISABLED_STATES = ("disabled", "已禁用")
+#: 清单里「设备」「半精度」两段的合法写法。实例名和端口天然不含空格，
+#: 读清单时靠这两张表把最后两段认出来，中间全归数据集路径（目录名带空格很常见）
+DEVICE_TOKENS = frozenset(DEVICE_ARGS) | {"-"}
+HALF_TOKENS = frozenset({"yes", "y", "true", "on", "no", "n", "false", "off"})
 
 
 class ServiceError(Exception):
@@ -94,6 +102,7 @@ def read_conf(path: object, *, root: Optional[object] = None) -> List[Instance]:
         raise ServiceError(f"没有实例清单：{target}", *hint)
     base = Path(str(root)).expanduser() if root else target.parent
     seen: Dict[str, Instance] = {}
+    seen_port: Dict[int, str] = {}
     order: List[str] = []
     try:
         body = target.read_text(encoding="utf-8", errors="replace")
@@ -103,9 +112,28 @@ def read_conf(path: object, *, root: Optional[object] = None) -> List[Instance]:
         fields = raw.split()
         if not fields or fields[0].startswith("#"):
             continue
-        while len(fields) < 5:
-            fields.append("")
-        name, port, dataset, device, half = fields[:5]
+        if len(fields) == 5:
+            name, port, dataset, device, half = fields
+        elif len(fields) < 5:
+            # 尾部留空是合法写法（"跟着系统设置走"）。只有在「明显是设备/半精度」
+            # 的时候才剥最后一段，否则整段都算数据集路径——数据集目录名带空格、
+            # 设备和半精度都留空，是模板里最省事、也最容易写的一种。
+            name, port = fields[0], fields[1]
+            tail = fields[2:]
+            if len(tail) > 1 and tail[-1].lower() in DEVICE_TOKENS:
+                dataset, device, half = " ".join(tail[:-1]), tail[-1], ""
+            elif len(tail) > 1 and tail[-1].lower() in HALF_TOKENS:
+                dataset, device, half = " ".join(tail[:-1]), "", tail[-1]
+            else:
+                dataset, device, half = " ".join(tail), "", ""
+        else:
+            # 段数多于五个只有一种解释：数据集路径里有空格。实例名（NAME_PATTERN
+            # 不许中文/空格）、端口、设备、半精度四段天然不含空格，于是两头照着
+            # 模板认，中间全归数据集——"项目 任务/素材 批次1"这种目录名太常见了，
+            # 以前一句 mps 8765 素材 批次1 - no 会被切成"设备不认识：批次1"。
+            name, port = fields[0], fields[1]
+            half, device = fields[-1], fields[-2]
+            dataset = " ".join(fields[2:-2])
 
         if not re.match(NAME_PATTERN, name):
             raise ServiceError(
@@ -115,6 +143,13 @@ def read_conf(path: object, *, root: Optional[object] = None) -> List[Instance]:
             raise ServiceError(f"{target} 第 {lineno} 行实例名重复：{name}")
         if not port.isdigit() or not 1 <= int(port) <= 65535:
             raise ServiceError(f"{target} 第 {lineno} 行端口不是数字：{port}（实例 {name}）")
+        clash = seen_port.get(int(port))
+        if clash:
+            raise ServiceError(
+                f"{target} 第 {lineno} 行的端口 {port} 与实例 {clash} 撞了（实例 {name}）",
+                "两个实例抢同一个端口，后注册的那个永远起不来，注册末尾却照样打\"✓ 就位\"，"
+                "于是没人知道自己少了一个实例；给每个实例留一个自己的端口")
+        seen_port[int(port)] = name
         dataset_dir = Path(dataset)
         if not dataset_dir.is_absolute():
             dataset_dir = base / dataset_dir
@@ -129,6 +164,8 @@ def read_conf(path: object, *, root: Optional[object] = None) -> List[Instance]:
             raise ServiceError(
                 f"{target} 第 {lineno} 行的设备不认识：{device}（实例 {name}）",
                 "可选 " + " / ".join(DEVICE_ARGS) + "；填 - 表示跟「系统设置」里那档走",
+                "如果数据集目录名里有空格，请把设备和半精度两栏都写上，"
+                "不然软件分不清哪一段是路径、哪一段是设备",
                 "写错了先别急着注册——这个值会原样传给 review --device，"
                 "后台任务一起来就退出码 2，再被服务管理器每 10 秒拉起一次")
         seen[name] = Instance(name=name, port=int(port), dataset=str(dataset_dir),
@@ -228,6 +265,13 @@ class LaunchdBackend(Backend):
         shim = self.shim_path(inst)
         log = str(platform_utils.service_log(inst.port))
         home = os.path.expanduser("~")
+        env_rows = [f"    <key>HOME</key><string>{xml_escape(home)}</string>"]
+        data_home = os.environ.get("AUTOLABEL_HOME")
+        if data_home:
+            # 服务用的目录另指过（纯英文路径）时，不写进任务定义的话后台实例读的还是
+            # ~/.autolabel，跟用户前台跑的完全是两份配置——排查时最能把人带偏
+            env_rows.append("    <key>AUTOLABEL_HOME</key>"
+                            f"<string>{xml_escape(data_home)}</string>")
         rows = [
             '<?xml version="1.0" encoding="UTF-8"?>',
             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
@@ -243,7 +287,7 @@ class LaunchdBackend(Backend):
             "  </array>",
             "  <key>EnvironmentVariables</key>",
             "  <dict>",
-            f"    <key>HOME</key><string>{xml_escape(home)}</string>",
+            *env_rows,
             "  </dict>",
             "  <key>RunAtLoad</key><true/>",
             "  <key>KeepAlive</key>",
@@ -351,11 +395,16 @@ class TaskSchedulerBackend(Backend):
         jump = (f'cd /d "%~dp0{link.name}"' if _link_target_is(link, Path(project))
                 else f'cd /d "{project}"')
         joined = " ".join(_cmd_quote(part) for part in prefix)
+        data_home = os.environ.get("AUTOLABEL_HOME")
+        # 注册时当前环境里设过就得带上，否则后台实例读的是默认 ~/.autolabel，
+        # 跟用户前台跑的那份不是同一套（任务计划程序不会继承你的环境变量）
+        carry = [f'set "AUTOLABEL_HOME={data_home}"'] if data_home else []
         return "\r\n".join([
             "@echo off",
             "rem 由 autolabel service 生成，别手改——下次注册会覆盖它。",
             "rem 端口被占就 exit 0，任务计划程序只认「非零退出」才重启，"
             "别让它在用户自己开着的工作台后面反复撞端口。",
+            *carry,
             jump,
             joined + " -m autolabel service-run " + inst.name,
             "exit /b %ERRORLEVEL%",
@@ -442,8 +491,11 @@ def register_script(inst: Instance, backend: TaskSchedulerBackend) -> str:
 
 
 def junction_argv(link: object, target: object) -> List[str]:
-    """建目录联接的命令。Windows 用 ``mklink /J``（不需要管理员），
-    其它系统退回符号链接（由 :func:`_make_junction_posix` 直接建）。"""
+    """建目录联接的命令，只有 Windows 用得上：``mklink /J`` 不要管理员权限。
+
+    macOS / Linux 上没有「目录联接」这个概念，也不需要——那两个系统的后端直接把
+    工作目录设成项目根，压根不建联接（所以这里没有 POSIX 分支，不是漏了）。
+    """
     return ["cmd", "/c", "mklink", "/J", str(link), str(target)]
 
 
@@ -610,7 +662,7 @@ def _shim_encoding() -> str:
         return "utf-8"
 
 
-def _verify_ready(backend_: Backend, inst: Instance, *, timeout: float = 40.0,
+def _verify_ready(backend_: Backend, inst: Instance, *, timeout: float = READY_WAIT,
                   echo: Callable[[str], None] = print) -> str:
     """返回 ``ok`` / ``foreign`` / ``down``。
 
@@ -636,7 +688,7 @@ def _verify_ready(backend_: Backend, inst: Instance, *, timeout: float = 40.0,
     echo(f"! {inst.name} · 端口 {inst.port} 有人在听，但不是这个后台实例"
          f"（PID {listener or '未知'}）")
     echo("  多半是你自己双击开了工作台，那个窗口一关服务就断。")
-    echo(f"  想让后台接管：关掉那个窗口，再跑 autolabel service --restart {inst.name}。")
+    echo(f"  想让后台接管：关掉那个窗口，再跑 {rerun_hint('--restart', inst.name)}。")
     return "foreign"
 
 
@@ -644,6 +696,19 @@ def url_for(port: int) -> str:
     from .launch import url_for as _url
 
     return _url(port)
+
+
+def rerun_hint(*args: str) -> str:
+    """「下一步该敲什么」要按系统给。
+
+    本项目的依赖是 ``后台服务.command`` / ``后台服务.bat`` 里的 uv 现备的，仓库里
+    没有 ``setup.py`` / ``pyproject.toml``，命令行入口根本没装：提示里写
+    ``autolabel service --restart mps``，用户照抄只会得到 ``command not found``；
+    换成 ``python3 -m autolabel service --status`` 又是英文的
+    ``ModuleNotFoundError: No module named 'numpy'``。
+    """
+    script = "后台服务.bat" if platform_utils.is_windows() else "./后台服务.command"
+    return " ".join((script, *args))
 
 
 def install(root: object, *, dry_run: bool = False,
@@ -658,6 +723,7 @@ def install(root: object, *, dry_run: bool = False,
     instances = read_conf(conf_path(root_path), root=root_path)
     echo(f"▸ 读实例清单 {conf_path(root_path)}（{len(instances)} 个）")
     skipped = 0
+    registered: List[Instance] = []
     for inst in instances:
         unit = write_unit(backend_, inst, root_path)
         if dry_run:
@@ -674,6 +740,7 @@ def install(root: object, *, dry_run: bool = False,
             echo(f"! {inst.name} · 端口 {inst.port} 还被别的程序占着，这个实例先不起")
             echo("  多半是你自己双击过 运行工作台。要么关掉那个窗口再跑一次，")
             echo("  要么把清单里这一行的端口换一个。")
+            echo(f"  关掉那个窗口之后：{rerun_hint('--restart', inst.name)}")
             continue
         from .launch import rotate_log
 
@@ -689,6 +756,7 @@ def install(root: object, *, dry_run: bool = False,
                 f"服务管理器拒绝了 {unit}",
                 (done.stderr or done.stdout or "").strip()[:200])
         echo(f"✓ {inst.name} · 端口 {inst.port} · 已注册（登录/开机自动加载）")
+        registered.append(inst)
     prune_stale(backend_, instances, root_path, dry_run=dry_run, echo=echo)
     if dry_run:
         echo("")
@@ -697,7 +765,9 @@ def install(root: object, *, dry_run: bool = False,
     echo("")
     echo("▸ 等服务起来")
     failed = 0
-    for inst in instances:
+    # 只等这一轮真注册上的：端口被占而跳过的那些根本没加载，
+    # 再验一遍会被同一个端口占问题数两次（先"先不起"、后"端口被占跳过"）
+    for inst in registered:
         loaded, _, _ = _query(backend_, inst.name)
         verdict = _verify_ready(backend_, inst, echo=echo)
         if verdict == "ok":
@@ -707,7 +777,7 @@ def install(root: object, *, dry_run: bool = False,
             continue
         failed += 1
         if loaded:
-            echo(f"! {inst.name} · 40 秒没监听：")
+            echo(f"! {inst.name} · {int(READY_WAIT)} 秒没监听：")
             explain_down(inst.port, echo, root_path)
         else:
             echo(f"! {inst.name} · 服务管理器没接这个任务，见 {backend_.unit_path(inst.name)}")
@@ -780,6 +850,7 @@ def status(root: object, *, echo: Callable[[str], None] = print) -> int:
     root_path = Path(str(root)).expanduser()
     instances = read_conf(conf_path(root_path), root=root_path)
     echo(f"常驻服务实例（清单 {conf_path(root_path)} · 后端 {backend_.name}）")
+    not_serving = 0
     for inst in instances:
         label = backend_.label(inst.name)
         loaded, running, pid = _query(backend_, inst.name)
@@ -788,25 +859,38 @@ def status(root: object, *, echo: Callable[[str], None] = print) -> int:
             if backend_.unit_path(inst.name).exists():
                 echo(f"! {inst.name} 的任务定义已写好，但服务管理器还没加载 · {url_for(inst.port)}")
                 _note_listener(inst.port, echo)
-                echo(f"  下次登录会自己加载；现在就想跑：autolabel service --restart {inst.name}")
+                echo(f"  下次登录会自己加载；现在就想跑：{rerun_hint('--restart', inst.name)}")
             else:
                 echo(f"✗ {inst.name} 未注册 · {url_for(inst.port)}")
-                echo("  跑一次 autolabel service 就注册上了")
+                echo(f"  跑一次 {rerun_hint()} 就注册上了")
             echo(f"  {note} · 日志 {platform_utils.service_log(inst.port)}")
             echo("")
             continue
         mine = pidfile_pid(inst.name) or pid
-        if running:
+        # 服务管理器只报「进程在不在」，进程活着不代表页面打得开：卡在加载、
+        # 或者起来的那个根本不是这个实例，状态页都会照样打勾。端口自己会说话。
+        silent = running and not platform_utils.port_busy(inst.port)
+        if running and not silent:
             echo(f"✓ {inst.name} 在跑 · PID {mine or '未知'} · {url_for(inst.port)}"
                  f" · 数据集 {inst.dataset}")
+        elif silent:
+            not_serving += 1
+            echo(f"! {inst.name} 进程在跑（PID {mine or '未知'}），"
+                 f"但端口 {inst.port} 没人监听 · {url_for(inst.port)}")
         else:
+            not_serving += 1
             echo(f"✗ {inst.name} 已注册但没在跑 · {url_for(inst.port)} · {label}")
             _note_listener(inst.port, echo)
         echo(f"  {note} · 日志 {platform_utils.service_log(inst.port)}")
-        if not running:
+        if silent:
+            echo("  刚注册/刚重启的头一分钟模型还在加载，稍后再看一次；一直不监听就查下面")
             explain_down(inst.port, echo, root_path)
             echo("")
-    return 0
+        elif not running:
+            explain_down(inst.port, echo, root_path)
+            echo("")
+    # 状态要诚实：注册了却没在服务的实例，退出码不能还是 0
+    return 1 if not_serving else 0
 
 
 def restart(root: object, target: Optional[str] = None,
@@ -831,7 +915,7 @@ def restart(root: object, target: Optional[str] = None,
                 echo(f"✓ {inst.name} 已加载并启动（端口 {inst.port}）")
                 done += 1
                 continue
-            echo(f"✗ {inst.name} 还没注册，先跑 autolabel service")
+            echo(f"✗ {inst.name} 还没注册，先跑 {rerun_hint()}")
             continue
         if run(backend_.restart_argv(inst.name)).returncode == 0:
             echo(f"✓ {inst.name} 已重启（端口 {inst.port}）")
@@ -843,7 +927,7 @@ def restart(root: object, target: Optional[str] = None,
     failed = 0
     for inst in instances:
         if _verify_ready(backend_, inst, echo=echo) == "down":
-            echo(f"! {inst.name} · 40 秒没监听，日志最后几行：")
+            echo(f"! {inst.name} · {int(READY_WAIT)} 秒没监听，日志最后几行：")
             explain_down(inst.port, echo, root_path)
             failed += 1
     return 1 if failed else 0
@@ -858,13 +942,34 @@ def remove(root: object, target: Optional[str] = None,
     root_path = Path(str(root)).expanduser()
     instances = [inst for inst in read_conf(conf_path(root_path), root=root_path)
                  if not target or inst.name == target]
+    if not instances:
+        echo(f"✗ 清单里没有实例：{target}")
+        echo(f"  看现在有哪些：{rerun_hint('--status')}")
+        return 1
+    failed = 0
     for inst in instances:
-        run(backend_.unregister_argv(inst.name))
-        echo(f"✓ {inst.name} 已注销")
+        loaded, _, _ = _query(backend_, inst.name)
+        if loaded:
+            done = run(backend_.unregister_argv(inst.name))
+            if done.returncode != 0:
+                # 以前这个返回码是丢掉的：launchctl bootout 那句
+                # 「Boot-out failed: 3: No such process」被 capture_output 吞干净，
+                # 屏幕照样打「✓ 已注销」，连名字敲错都算注销成功
+                detail = (done.stderr or done.stdout or "").strip().splitlines()
+                echo(f"✗ {inst.name} 注销失败（{backend_.label(inst.name)}）"
+                     + (f"：{detail[-1]}" if detail else ""))
+                echo(f"  任务定义先留着别删，弄对了再摘：{backend_.unit_path(inst.name)}")
+                failed += 1
+                continue
+            echo(f"✓ {inst.name} 已注销（{backend_.label(inst.name)}）")
+        else:
+            echo(f"✓ {inst.name} 本来就没在服务管理器里加载，把生成的文件清掉就行")
         for path in [backend_.unit_path(inst.name), backend_.shim_path(inst),
                      pid_file(inst.name), *backend_.stray_paths(inst.name)]:
             _remove_path(path)
-    echo("  清单里的实例都处理完了；要恢复常驻服务再跑一次 autolabel service")
+    if failed:
+        return 1
+    echo(f"  清单里的实例都处理完了；要恢复常驻服务再跑一次 {rerun_hint()}")
     return 0
 
 
@@ -874,7 +979,7 @@ def instance_for(root: object, name: str) -> Instance:
         if inst.name == name:
             return inst
     raise ServiceError(f"清单里没有实例：{name}",
-                       "改过 configs/后台实例.conf 就重跑一次 autolabel service")
+                       f"改过 configs/后台实例.conf 就重跑一次 {rerun_hint()}")
 
 
 def run(argv: Sequence[str], **kw: object) -> subprocess.CompletedProcess:

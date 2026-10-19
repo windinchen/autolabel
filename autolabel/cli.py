@@ -26,6 +26,7 @@ from .dataset import (
     load_index,
     missing_sources,
     status_of,
+    unknown_images,
 )
 from .library import (
     LIB_DETECT,
@@ -112,9 +113,18 @@ def cmd_import(args: argparse.Namespace) -> int:
                           subdir=args.subdir, lib=args.lib)
     added = [rel for _src, rel in stats["imported_files"]]
     if not added:
+        # 内容重复被跳过的图有两种去处，指错一条用户就照着敲出一句不相干的报错：
+        # 素材池里躺着但没进本库 —— 用 pool --add 认领；本库里已标过 —— 才是重标。
+        # 而「重标」的命令三个库各不相同（label --force / prompt|detect --overwrite）。
+        relabel = {"objects": "prompt", "detect": "detect"}.get(normalize(args.lib), "label")
+        flag = "--force" if relabel == "label" else "--overwrite"
         print(f"[info] 扫描 {stats['scanned']} 张，没有新图入库："
               f"完全重复 {stats['skipped_exact']} · 近似重复 {stats['skipped_similar']} · "
-              f"失败 {stats['failed']}（已入库的要重标用 autolabel label --force）")
+              f"失败 {stats['failed']}")
+        print(f"       素材池已有、只是没进{lib_name(args.lib)}："
+              f"autolabel pool {args.dataset} --lib {args.lib} --add <图片>")
+        print(f"       已在{lib_name(args.lib)}里要重标："
+              f"autolabel {relabel} {args.dataset} {flag}")
         return 0
     batch = create_batch(args.dataset,
                          name=batch_name("image", [os.path.basename(str(s)) for s in args.sources],
@@ -435,7 +445,11 @@ def cmd_coords(args: argparse.Namespace) -> int:
                                     require_label=not args.include_unlabeled,
                                     out=out, tag=getattr(args, "tag", None))
     meta = result["meta"]
-    print(f"[ok] 坐标导出 -> {result['out']}")
+    if result["images"]:
+        print(f"[ok] 坐标导出 -> {result['out']}")
+    else:
+        # 空库照样落 5 个文件、只有一行表头：报 [ok] 会让人以为导出成功了
+        print(f"[warn] 姿态标注库里没有可导出的帧，坐标文件只有表头 -> {result['out']}")
     for name in sorted(result["files"]):
         print(f"     - {name}")
     print(f"     图片 {result['images']} 张 · 人 {result['persons']} 个 · "
@@ -633,11 +647,18 @@ def cmd_pool(args: argparse.Namespace) -> int:
     rows = pool_items(args.dataset)
     if args.add:
         stats = adopt_from_pool(args.dataset, _split_multi(args.add), lib=args.lib)
-        print(f"[ok] 添加到{lib_name(stats['lib'])}：新增 {stats['added']} 张 · "
-              f"本来就在库里 {stats['already']} 张 · 池里查无 {len(stats['missing'])} 张")
+        landed = int(stats["added"]) + int(stats["already"])
+        # 一张都没落地却回 [ok]、退出码 0，脚本里 ``&&`` 就白过了：
+        # 名字打错的人只看第一行会以为加进去了
+        print(f"{'[ok]' if landed else '[error]'} 添加到{lib_name(stats['lib'])}："
+              f"新增 {stats['added']} 张 · 本来就在库里 {stats['already']} 张 · "
+              f"池里查无 {len(stats['missing'])} 张")
         if stats["missing"]:
-            print(f"[warn] 找不到：{'、'.join(stats['missing'][:10])}")
-        return 0
+            print(f"[warn] 素材池里没有这些文件："
+                  f"{'、'.join(stats['missing'][:10])}{'……' if len(stats['missing']) > 10 else ''}")
+            print(f"       池里有什么：autolabel pool {args.dataset}；"
+                  f"新素材先入库：autolabel import {args.dataset} --lib {args.lib} <图片>")
+        return 0 if landed else 1
 
     # 引用情况一律看 libs 那份清单：只写 ``in_pose and in_objects`` 会把
     # 「只在目标检测库里」的素材报成无人引用，害人去重新认领已经在用的文件
@@ -1062,6 +1083,8 @@ def cmd_prompt(args: argparse.Namespace) -> int:
     fields = resolve_fields(args.dataset, wanted)
     profile = resolve_profile(args.vlm or "")
     names = [str(field.get("name")) for field in fields]
+    if images:
+        _require_known_images(args.dataset, LIB_OBJECTS, images)
     batch = create_batch(args.dataset,
                          name=batch_name("prompt", names, args.batch_name or ""),
                          kind="prompt", source="cli",
@@ -1110,6 +1133,23 @@ def _split_multi(values: Sequence[str]) -> List[str]:
     for item in values or []:
         out += [piece.strip() for piece in str(item).split(",") if piece.strip()]
     return out
+
+
+def _require_known_images(dataset: str, lib: str, images: Sequence[str]) -> None:
+    """``--images`` 点名的图必须真在本库里，否则一行说清楚就退出。
+
+    打错一个字，以前一次留下三样脏东西：一条 ``model_failed`` 的幽灵索引记录
+    （界面凭空多一行没有宽高、永远打不开的图）、一条失败的批次记录，外加甩给用户
+    8 行看不懂的 Python 栈。界面那条路有 ``ReviewStore._require_item`` 把关，
+    命令行这条路一直没人管——而它恰恰最容易打错。
+    """
+    lost = unknown_images(load_index(dataset, lib), images)
+    if not lost:
+        return
+    tail = f" 等 {len(lost)} 张" if len(lost) > 5 else ""
+    raise ValueError(f"这些图不在{lib_name(lib)}里：{'、'.join(lost[:5])}{tail}；"
+                     f"先入库再标：autolabel import <数据集> --lib {lib} <图片>，"
+                     f"素材池里已有的图用 autolabel pool --lib {lib} --add <图片>")
 
 
 def cmd_detect(args: argparse.Namespace) -> int:
@@ -1195,6 +1235,9 @@ def cmd_detect(args: argparse.Namespace) -> int:
         print(f"  python3 -m autolabel detect {args.dataset} --model-classes {model}")
         print(f"  python3 -m autolabel detect {args.dataset} --model {model} --add-classes all")
         return 2
+
+    if images:
+        _require_known_images(args.dataset, LIB_DETECT, images)
 
     # 批次名直接写"用哪个权重新标了几类"：batch_name() 的"图片 N 个"是给导入用的，
     # 标注批次套用它会被读成"传进来 N 个文件"
@@ -1991,9 +2034,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     except KeyboardInterrupt:
         print("\n[info] 已中断")
         return 130
-    except (FileNotFoundError, NotADirectoryError, ValueError, KeyError) as exc:
+    except (FileNotFoundError, NotADirectoryError, ValueError, KeyError, RuntimeError) as exc:
         # 路径打错、批次不存在、参数越界这类用户自己就能改对的问题：一行说清楚。
         # 以前直接甩 Python 栈，普通用户看到的是 8 行看不懂的英文。
+        # RuntimeError 也在列：本项目 raise 它的地方全是「用户能自己解决」的运行时
+        # 状况（没装 ffmpeg、找不到 openssl、权重加载失败、整批标注全失败），
+        # 文案本来就是一句人话，配一栈 traceback 只会把它埋掉。
         message = exc.args[0] if isinstance(exc, KeyError) and exc.args else str(exc)
         print(f"[error] {message}", file=sys.stderr)
         if os.environ.get("AUTOLABEL_TRACEBACK"):  # 排查用：贴栈出来

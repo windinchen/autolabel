@@ -45,6 +45,7 @@ from .dataset import (
     now_str,
     resolve_image,
     source_missing,
+    unknown_images,
 )
 
 VALID_PROMPT_STATUS = {STATUS_UNREVIEWED, STATUS_APPROVED, STATUS_EDITED, STATUS_REJECTED}
@@ -615,7 +616,22 @@ def run_prompt_labeling(
     profile = resolve_profile(str((profile or {}).get("id") or ""))
 
     idx = load_index(root, LIB_OBJECTS)
+    unknown = unknown_images(idx, images or [])
+    if images and unknown and len(unknown) == len({str(rel) for rel in images}):
+        raise ValueError(f"这些图不在{lib_name(LIB_OBJECTS)}里：{'、'.join(unknown[:5])}"
+                         f"{' 等 ' + str(len(unknown)) + ' 张' if len(unknown) > 5 else ''}；"
+                         f"先入库再标：autolabel import <数据集> --lib {LIB_OBJECTS} <图片>，"
+                         f"或在界面「{lib_name(LIB_OBJECTS)}」里上传")
     targets = [str(rel) for rel in images] if images else [rel for rel, _ in idx.ordered_items()]
+    if unknown:
+        # 不在本库的图绝不进队列：upsert 会凭空造出一行没有文件的记录，
+        # 界面多出一张永远打不开的图，张数与未标数统统对不上
+        lost = set(unknown)
+        targets = [rel for rel in targets if rel not in lost]
+        if verbose:
+            print(f"[warn] 跳过 {len(unknown)} 张不在{lib_name(LIB_OBJECTS)}的图："
+                  f"{'、'.join(unknown[:5])}{'……' if len(unknown) > 5 else ''}"
+                  f"（先 autolabel import --lib {LIB_OBJECTS} 入库）")
     signature = signature_for(picked, profile["id"], extra_hint)
     protected = 0
     if not overwrite:
@@ -637,7 +653,7 @@ def run_prompt_labeling(
         targets = targets[:limit]
 
     stats = {"labeled": 0, "boxes": 0, "failed": 0, "skipped": 0, "protected": protected,
-             "images": len(targets), "unknown_fields": [],
+             "images": len(targets), "unknown_fields": [], "unknown_images": unknown,
              "fields": [f.get("name") for f in picked],
              "profile": profile.get("name", ""), "last_error": ""}
     known_ids = [int(f.get("class_id", -1)) for f in picked]

@@ -198,6 +198,21 @@ def parse_label_file(path: str, num_keypoints: Optional[int] = None) -> List[Per
     return persons
 
 
+def label_object_count(path: str) -> int:
+    """数一个标签文件里真正写了几个目标（非空行数），读不动就按 0 算。
+
+    「背景图」必须按**框数**判定，不能按文件字节数：手工编辑过的标签、旧版本写的
+    空标签常常只剩一个换行，1 字节的文件按大小算就成了"有人"。于是
+    ``--max-empty-ratio`` 对这一整批帧完全失效——实测 4 张图里 3 张是空图，
+    导出还报 empty 0、一张都没压，而同一份库 ``qc`` 报"无人图 3"，两边互相打脸。
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return sum(1 for raw in fh if raw.strip())
+    except OSError:
+        return 0
+
+
 # --------------------------------------------------------------------------- #
 # 几何工具
 # --------------------------------------------------------------------------- #

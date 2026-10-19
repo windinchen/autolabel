@@ -28,16 +28,21 @@ echo ! 没找到 uv，改用系统 Python。依赖要自己装好：python -m pi
 echo   想省事就装一次 uv：winget install astral-sh.uv
 echo.
 python -m autolabel service %*
+set "RC=%ERRORLEVEL%"
 goto :end
 
 :with_uv
 "%UV%" run --offline --quiet --with numpy --with pillow --with pyyaml --with requests --python 3.11 python3 -m autolabel service %*
+set "RC=%ERRORLEVEL%"
 
 :end
 echo.
 echo 上面就是结果。注册成功以后登录自己就起来，崩了自动拉起，不用再双击任何东西。
 pause
-exit /b 0
+rem 退出码要如实传出去：以前这里无条件 exit /b 0，
+rem 注册失败、Python 报错、uv 没找到，脚本一律报「成功」，别人的批处理和计划任务全被骗
+rem
+exit /b %RC%
 
 :find_uv
 rem uv 是本项目用来备 Python 环境的工具；Windows 上装完常常不在 PATH 里，得自己找

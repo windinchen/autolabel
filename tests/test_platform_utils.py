@@ -296,3 +296,55 @@ def test_force_utf8_streams_tolerates_odd_streams(monkeypatch):
     monkeypatch.setattr(sys, "stdout", object())
     monkeypatch.setattr(sys, "stderr", None)
     pu.force_utf8_streams()
+
+
+# --------------------------------------------------------------------------- #
+# 监听地址 / 展示地址：--host 写 IPv6 时这两条决定服务起不起得来、地址能不能点
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("host,family,address", [
+    ("127.0.0.1", socket.AF_INET, "127.0.0.1"),
+    ("localhost", socket.AF_INET, "localhost"),
+    ("192.168.1.9", socket.AF_INET, "192.168.1.9"),
+    ("0.0.0.0", socket.AF_INET, "0.0.0.0"),
+    ("*", socket.AF_INET, "0.0.0.0"),
+    ("", socket.AF_INET, "0.0.0.0"),
+    ("::1", socket.AF_INET6, "::1"),
+    ("[::1]", socket.AF_INET6, "::1"),
+    ("::", socket.AF_INET6, "::"),
+    ("fe80::1%en0", socket.AF_INET6, "fe80::1%en0"),
+])
+def test_bind_family_picks_the_socket_family(host, family, address):
+    """IPv6 得用 AF_INET6：父类写死 IPv4 时 ``--host ::1`` 在 bind 上就 gaierror 了。"""
+    assert pu.bind_family(host) == (family, address)
+
+
+def test_bind_family_differs_from_probe_address_on_wildcards():
+    """探活要把 ``::`` 折成 127.0.0.1，监听必须真绑 ``::``——两条不能合并成一条。"""
+    assert pu.probe_address("::") == (socket.AF_INET, "127.0.0.1")
+    assert pu.bind_family("::") == (socket.AF_INET6, "::")
+
+
+@pytest.mark.parametrize("host,expected", [
+    ("127.0.0.1", "https://127.0.0.1:8765/"),
+    ("localhost", "https://localhost:8765/"),
+    ("0.0.0.0", "https://localhost:8765/"),
+    ("::", "https://localhost:8765/"),
+    ("::1", "https://[::1]:8765/"),
+    ("[::1]", "https://[::1]:8765/"),
+    ("fe80::1%en0", "https://[fe80::1%en0]:8765/"),
+    ("192.168.1.9", "https://192.168.1.9:8765/"),
+])
+def test_url_for_host_is_pasteable_into_a_browser(host, expected):
+    """``https://::1:8765/`` 粘进地址栏打不开：IPv6 字面量必须带方括号。"""
+    assert pu.url_for_host(host, 8765) == expected
+
+
+def test_url_for_host_honours_scheme():
+    assert pu.url_for_host("::1", 8765, "http") == "http://[::1]:8765/"
+
+
+@pytest.mark.parametrize("host,expected", [
+    ("[::1]", "::1"), ("  ::1  ", "::1"), ("127.0.0.1", "127.0.0.1"), ("*", "*"),
+])
+def test_normalize_host_only_strips_brackets_and_blanks(host, expected):
+    assert pu.normalize_host(host) == expected

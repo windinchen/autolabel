@@ -227,6 +227,51 @@ def port_busy(port: int, host: str = "127.0.0.1", timeout: float = 0.4) -> bool:
         return sock.connect_ex(where) == 0
 
 
+#: 通配地址：绑它等于「本机所有网卡都能访问」，给用户看的地址要折回 localhost
+WILDCARD_HOSTS: Tuple[str, ...] = ("", "*", "0.0.0.0", "::", "::0")
+
+
+def normalize_host(host: object) -> str:
+    """把用户写的监听地址收成干净形式：去掉 IPv6 外面那对方括号。"""
+    text = str(host).strip()
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1].strip()
+    return text
+
+
+def bind_family(host: object) -> Tuple[int, str]:
+    """**监听**该地址该用哪个地址族、实际绑哪个地址。
+
+    必须和 :func:`probe_address` 分开：探活时 ``::`` 要折成 ``127.0.0.1``
+    （拿通配地址当*连接*目标是未定义行为），而监听时 ``::`` 就得真的绑 ``::``。
+    以前这里没有对应判断，服务端的地址族写死 IPv4，于是 ``--host ::1`` 与
+    ``--host ::`` 直接在 ``bind()`` 上抛 ``gaierror``——可证书早就签了 ``::1``、
+    启动提示也写着 ``::`` 能用，等于宣称支持却起不来。
+    """
+    text = normalize_host(host)
+    if text in ("", "*"):
+        return socket.AF_INET, "0.0.0.0"
+    if text in ("::", "::0"):
+        return socket.AF_INET6, "::"
+    if ":" in text:
+        return socket.AF_INET6, text
+    return socket.AF_INET, text
+
+
+def url_for_host(host: object, port: int, scheme: str = "https") -> str:
+    """给用户敲进浏览器的地址。
+
+    IPv6 字面量必须带方括号：``https://::1:8765/`` 粘进地址栏是打不开的，
+    而 ``--host ::`` 折成 ``localhost`` 才点得动（``::`` 本身不是合法主机名）。
+    """
+    text = normalize_host(host)
+    if text in WILDCARD_HOSTS:
+        text = "localhost"
+    if ":" in text:
+        text = f"[{text}]"
+    return f"{scheme}://{text}:{int(port)}/"
+
+
 def listening_pid_argv(port: int) -> List[str]:
     """查「在听的进程是谁」的命令。拆成纯函数是为了能在 mac 上单测 Windows 那条。"""
     if is_windows():
@@ -328,6 +373,7 @@ __all__ = [
     "current", "find_openssl", "find_uv", "force_utf8_streams", "is_macos",
     "is_windows", "legacy_logs", "openssl_missing_hint",
     "listening_pid", "listening_pid_argv", "log_dir", "log_paths", "open_argv",
+    "bind_family", "normalize_host", "url_for_host",
     "port_busy", "probe_address", "protected_parent", "remove_hint", "reveal_argv",
     "service_backend",
     "service_log", "state_dir", "tcc_hint", "uv_argv",

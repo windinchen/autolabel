@@ -118,6 +118,22 @@ def missing_sources(root: str, rels: Iterable[str]) -> List[str]:
     return [rel for rel in rels if source_missing(root, rel)]
 
 
+def unknown_images(index: "DatasetIndex", rels: Iterable[str]) -> List[str]:
+    """点名的图片里哪些压根不在本库索引，保持点名的先后并去重。
+
+    ``--images`` 打错一个字，以前会照样 ``upsert`` 出一条 ``model_failed`` 的
+    幽灵记录：界面凭空多出一行没有宽高的图，张数、未标数、缩略图列表全跟着对
+    不上。界面那条路有 :meth:`ReviewStore._require_item` 把关，命令行这条路以前
+    没人管——而它恰恰是最容易打错的一条。
+    """
+    out: List[str] = []
+    for rel in rels:
+        text = str(rel)
+        if text not in out and index.get(text) is None:
+            out.append(text)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # 索引
 # --------------------------------------------------------------------------- #
@@ -671,5 +687,5 @@ __all__ = [
     "import_prepared", "index_path", "init_dataset", "label_path_for", "labels_dir",
     "load_index", "load_index_or_none", "meta_dir", "missing_sources", "now_str", "pool_items",
     "prompt_label_path_for", "prompt_labels_dir", "qc_dir", "resolve_image",
-    "source_missing", "sync_missing_labels",
+    "source_missing", "sync_missing_labels", "unknown_images",
 ]

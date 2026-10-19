@@ -42,6 +42,7 @@ from .dataset import (
     _load_rgb,
     load_index,
     now_str,
+    unknown_images,
 )
 from .atomic import atomic_write_json
 from .library import LIB_DETECT, labels_dir, lib_name, meta_dir_for
@@ -337,6 +338,15 @@ def run_detect_labeling(
     if len(pairs) > MAX_RUN_CLASSES:
         raise ValueError(f"一次最多标 {MAX_RUN_CLASSES} 个类别，当前勾了 {len(pairs)} 个")
 
+    # 点名的图先过一遍库：权重加载要吃几秒，路径打错不该让人白等
+    idx = load_index(root, LIB)
+    unknown = unknown_images(idx, images or [])
+    if images and unknown and len(unknown) == len({str(rel) for rel in images}):
+        raise ValueError(f"这些图不在{lib_name(LIB)}里：{'、'.join(unknown[:5])}"
+                         f"{' 等 ' + str(len(unknown)) + ' 张' if len(unknown) > 5 else ''}；"
+                         f"先入库再标：autolabel import <数据集> --lib {LIB} <图片>，"
+                         f"或在界面「{lib_name(LIB)}」里上传")
+
     base = settings or BackendSettings()
     resolved = BackendSettings(model=matched["model"], device=device or base.device,
                                imgsz=base.imgsz, max_det=base.max_det, iou=base.iou,
@@ -347,8 +357,16 @@ def run_detect_labeling(
     signature = signature_for(matched["model"], local_ids, resolved)
     known_names = {str(row.get("name", "")).lower() for row, _ in pairs}
 
-    idx = load_index(root, LIB)
     targets = [str(rel) for rel in images] if images else [rel for rel, _ in idx.ordered_items()]
+    if unknown:
+        # 不在本库的图绝不进队列：upsert 会凭空造出一行没有文件的记录，
+        # 界面多出一张永远打不开的图，张数与未标数统统对不上
+        lost = set(unknown)
+        targets = [rel for rel in targets if rel not in lost]
+        if verbose:
+            print(f"[warn] 跳过 {len(unknown)} 张不在{lib_name(LIB)}的图："
+                  f"{'、'.join(unknown[:5])}{'……' if len(unknown) > 5 else ''}"
+                  f"（先 autolabel import --lib {LIB} 入库）")
     protected = 0
     if not overwrite:
         kept = []
@@ -368,6 +386,7 @@ def run_detect_labeling(
 
     stats = {"labeled": 0, "boxes": 0, "failed": 0, "skipped": 0, "protected": protected,
              "images": len(targets), "missing_classes": matched["missing"],
+             "unknown_images": unknown,
              "classes": sorted(known_names), "model": matched["model"],
              "task": matched["task"], "task_name": matched["task_name"],
              "device": matched["device"], "conf": resolved.conf, "last_error": ""}

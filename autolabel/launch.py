@@ -189,9 +189,18 @@ def wait_for_port(port: int, timeout: float = 90.0, host: str = "127.0.0.1") -> 
     return platform_utils.port_busy(port, host)
 
 
+#: 只绑本机的地址：给用户看的地址统一折成 ``localhost``——证书签的就是它，
+#: 而且它同时解析到 127.0.0.1 与 ::1，两种都好使
+LOCALHOST_ALIASES: Tuple[str, ...] = ("", "*", "0.0.0.0", "127.0.0.1", "::", "::0")
+
+
 def url_for(port: int, host: str = "127.0.0.1", secure: bool = True) -> str:
-    shown = "localhost" if host in ("0.0.0.0", "127.0.0.1", "::") else host
-    return f"{'https' if secure else 'http'}://{shown}:{int(port)}/"
+    """给用户敲进浏览器的地址：本机地址折成 localhost，IPv6 字面量补上方括号。
+
+    ``--host ::1`` 以前会拼出 ``https://::1:8765/``，粘进地址栏根本打不开。
+    """
+    shown = "localhost" if platform_utils.normalize_host(host) in LOCALHOST_ALIASES else host
+    return platform_utils.url_for_host(shown, port, "https" if secure else "http")
 
 
 def launch(root: object, dataset: str, *, port: int = 8765, host: str = "127.0.0.1",

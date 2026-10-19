@@ -350,6 +350,32 @@ def test_run_partial_failure_keeps_going(dataset, one_profile, monkeypatch):
     assert len(failed) == 1
 
 
+def test_run_rejects_images_that_are_not_in_the_library(dataset, one_profile, monkeypatch):
+    """点名的图不在本库就当场拒绝：不给一次提问都不该花，更不该写进索引。"""
+    monkeypatch.setattr("autolabel.vlm.chat",
+                        lambda profile, prompt, data_url: '{"objects":[]}')
+    fields = two_fields(dataset)
+    with pytest.raises(ValueError, match="不在提示词标注") as exc:
+        pr.run_prompt_labeling(dataset, fields=fields, profile=one_profile,
+                              images=["ghost.jpg"], verbose=False)
+    assert "autolabel import" in str(exc.value)
+    assert load_index(dataset, "objects").get("ghost.jpg") is None
+
+
+def test_run_skips_unknown_names_but_still_labels_known_ones(dataset, one_profile, monkeypatch):
+    """点名里混了打错的字：能标的照标，打错的只报一条，不留幽灵行。"""
+    asked = []
+    monkeypatch.setattr("autolabel.vlm.chat",
+                        lambda profile, prompt, data_url: asked.append(prompt)
+                        or '{"objects":[{"field":"bottle","bbox":[100,100,300,500]}]}')
+    fields = two_fields(dataset)
+    stats = pr.run_prompt_labeling(dataset, fields=fields, profile=one_profile,
+                                  images=["img0.jpg", "ghost.jpg"], verbose=False)
+    assert stats["labeled"] == 1 and len(asked) == 1
+    assert stats["unknown_images"] == ["ghost.jpg"]
+    assert load_index(dataset, "objects").get("ghost.jpg") is None
+
+
 def test_run_requires_fields_and_profile(dataset, one_profile):
     with pytest.raises(ValueError) as exc:
         pr.run_prompt_labeling(dataset, fields=[], profile=one_profile)

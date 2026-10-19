@@ -211,6 +211,9 @@ def dataset_stats(root: str) -> dict:
             "median": pct(persons_per_image, 50),
             "max": int(max(persons_per_image)) if persons_per_image else 0,
             "empty_images": int(sum(1 for v in persons_per_image if v == 0)),
+            # 缺标签的帧在统计前就 continue 了：不写清分母，"平均每图 1.0、无人图 0"
+            # 会让人以为 5 张图都标过，其实只有 2 张有标签
+            "counted": len(persons_per_image),
         },
         "box_height_px": {"p10": pct(box_heights, 10), "p50": pct(box_heights, 50),
                           "p90": pct(box_heights, 90), "min": pct(box_heights, 0),
@@ -220,6 +223,23 @@ def dataset_stats(root: str) -> dict:
         "keypoint_visibility": per_kpt,
         "label_settings": idx.data.get("settings", {}),
     }
+
+
+def pending_line(stats: dict, flagged_count: int, include_reviewed: bool) -> str:
+    """「待复核」那一行：加了 ``--include-reviewed`` 就不能再说"已定论的不占位"。"""
+    settled = stats["status_counts"].get("approved", 0) + stats["status_counts"].get("rejected", 0)
+    tail = (f"已定论的 {settled} 张也算进来了" if include_reviewed
+            else f"已定论 {settled} 张不占位")
+    return f"- 待复核：{flagged_count} 张（既没接受也没驳回、且机器自己报了问题；{tail}）"
+
+
+def missing_source_line(stats: dict) -> str:
+    """原图缺失必须单开一行：缺标签 0 完全不提这件事，而导出偏偏会在这些帧上跳过。"""
+    gone = stats.get("missing_files", 0)
+    if not gone:
+        return ""
+    return (f"- 原图缺失：{gone} 张（索引里记着、`images/` 里已经没有了；"
+            f"导出时整帧跳过，导出清单里写「源文件缺失」）")
 
 
 def write_report(root: str, top_n: int = 30, include_reviewed: bool = False) -> dict:
@@ -243,12 +263,14 @@ def write_report(root: str, top_n: int = 30, include_reviewed: bool = False) -> 
                         f"- 标注参数：`{json.dumps(stats['label_settings'], ensure_ascii=False, sort_keys=True)}`",
                         "", "## 总览", "",
                         f"- 图片总数：{stats['images']}（缺标签 {stats['missing_labels']} · "
-                        f"标签解析失败 {stats['bad_labels']}）",
-                        f"- 人数合计：{stats['persons_total']}，平均每图 {stats['persons_per_image']['mean']}，"
-                        f"无人图 {stats['persons_per_image']['empty_images']}",
+                        f"标签解析失败 {stats['bad_labels']} · 原图缺失 {stats['missing_files']}）",
+                        f"- 人数合计：{stats['persons_total']}，平均每图 {stats['persons_per_image']['mean']} 人，"
+                        f"无人图 {stats['persons_per_image']['empty_images']} 张"
+                        f"（只按有标签的 {stats['persons_per_image']['counted']} 张算；"
+                        f"缺标签 {stats['missing_labels']} 张、读不通 {stats['bad_labels']} 张不占这两项）",
                         "- 复核状态：" + ", ".join(f"{k}={v}" for k, v in sorted(stats["status_counts"].items())),
-                        f"- 待复核：{len(flagged)} 张（既没接受也没驳回、且机器自己报了问题；"
-                        f"已定论 {stats['status_counts'].get('approved', 0) + stats['status_counts'].get('rejected', 0)} 张不占位）",
+                        pending_line(stats, len(flagged), include_reviewed),
+                        missing_source_line(stats),
                         "", "## 框高度分布（像素）", "",
                         "| p10 | p50 | p90 | min | max |", "| --- | --- | --- | --- | --- |",
                         f"| {stats['box_height_px']['p10']} | {stats['box_height_px']['p50']} | "

@@ -11,12 +11,20 @@ import shutil
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .dataset import label_path_for, load_index, now_str, source_missing
-from .yolo_pose import COCO17_KEYPOINTS, COCO17_FLIP_IDX, COCO17_SKELETON, parse_label_file
+from .yolo_pose import (COCO17_KEYPOINTS, COCO17_FLIP_IDX, COCO17_SKELETON, label_object_count,
+                        parse_label_file)
 
 DEFAULT_EXCLUDE_STATUS = {"rejected"}
 MISSING_LABEL_REASON = "缺少标签"
 MISSING_SOURCE_REASON = "源文件缺失（images/ 里的文件不在了）"
 EMPTY_CAP_REASON = "背景图超出比例上限"
+CLASS_RANGE_REASON = "类别号不在当前类别表"
+
+
+def class_range_reason(class_id: int, names: Dict[int, str]) -> str:
+    """标签里的类别号在当前类别表里不存在时的跳过原因（导出与坐标共用一套说法）。"""
+    known = "、".join(f"{cid}={names[cid]}" for cid in sorted(names)) or "空表"
+    return f"{CLASS_RANGE_REASON}（{class_id}，当前只有 {known}）"
 
 
 def skipped_summary(skipped: Sequence[Tuple[str, str]]) -> str:
@@ -71,6 +79,9 @@ def no_sample_hint(skipped: Sequence[Tuple[str, str]], root: str = "") -> str:
         advice.append("背景图是被占比上限压掉的，命令行加 --max-empty-ratio 1 就全要")
     if MISSING_SOURCE_REASON in reasons:
         advice.append("有几张图索引里记着、images/ 里却没有了，把图片放回去或在库里删掉这些帧")
+    if any(reason.startswith(CLASS_RANGE_REASON) for reason in reasons):
+        advice.append("标签里的类别号在当前类别表里没有（多半是换了权重或改过类别设置），"
+                      "跑一次 autolabel validate <数据集> 找出这些行，重标或把类别表改回去")
     if not advice:
         return ("：姿态标注库里一张图都还没有，先导入图片或抽帧（命令行 autolabel import / auto）"
                 + (other_library_hint(root) if root else ""))
@@ -118,7 +129,7 @@ def export_dataset(
         if require_label and not os.path.exists(label):
             skipped.append((rel, MISSING_LABEL_REASON))
             continue
-        if os.path.exists(label) and os.path.getsize(label) == 0:
+        if os.path.exists(label) and label_object_count(label) == 0:
             empty.append((rel, item))
         else:
             populated.append((rel, item))
@@ -161,13 +172,31 @@ def export_dataset(
         os.makedirs(os.path.join(out_root, "images", split), exist_ok=True)
         os.makedirs(os.path.join(out_root, "labels", split), exist_ok=True)
 
+    names = idx.class_names
+    num_kpt = int(idx.data.get("kpt_shape", [17, 3])[0])
     counts = {"train": 0, "val": 0, "people": {"train": 0, "val": 0}, "empty": len(empty),
-              "empty_dropped": len(dropped_empty), "missing_source": len(missing_source)}
+              "empty_dropped": len(dropped_empty), "missing_source": len(missing_source),
+              "class_out_of_range": 0}
     coco_records: List[Tuple[str, dict, str, List]] = []
     written: Dict[str, set] = {"train": set(), "val": set()}
     split_by_rel: Dict[str, str] = {}
     taken: Dict[str, str] = {}
     placed: set = set()
+
+    def place(src: str, dst: str) -> str:
+        """放一份文件，失败时收拾干净并说人话。
+
+        软链→硬链→拷贝三级退让全失败时（导出目录只读、磁盘满、路径名太长），
+        以前抛的是裸 ``OSError``：英文 traceback + 已经建好的 ``images/train``
+        空目录，命令行退出码还归不进「用户能自己改对」那一类。
+        """
+        try:
+            return _place(src, dst, mode)
+        except OSError as exc:
+            if not out:
+                shutil.rmtree(out_root, ignore_errors=True)
+            raise ValueError(place_error_message(mode, src, out_root, exc)) from exc
+
     for rel, item in selected:
         src_img = os.path.join(os.path.abspath(root), "images", rel)
         src_lbl = label_path_for(root, rel)
@@ -178,13 +207,21 @@ def export_dataset(
             # 而且报错在"文件已经拷了一半"之后）。跳过这一帧，原因照常写进 manifest。
             skipped.append((rel, f"标签解析失败：{exc}"))
             continue
+        stray = sorted({int(person.cls) for person in persons} - set(names))
+        if stray:
+            # 类别号对不上类别表：data.yaml 里 names 只有 0，COCO 却写
+            # category_id=8 而 categories=[1]，按 id 查类别的评估脚本当场就炸。
+            # 宁可跳掉这一帧并在 manifest 里写清原因，也不能交一份自相矛盾的产物。
+            skipped.append((rel, class_range_reason(stray[0], names)))
+            counts["class_out_of_range"] += 1
+            continue
         split = "val" if rel in val_set else "train"
         split_unique = unique_stem(taken, export_stem(rel), rel)
         dst_img = os.path.join(out_root, "images", split, split_unique + ".jpg")
         dst_lbl = os.path.join(out_root, "labels", split, split_unique + ".txt")
-        placed.add(_place(src_img, dst_img, mode))
+        placed.add(place(src_img, dst_img))
         if os.path.exists(src_lbl):
-            placed.add(_place(src_lbl, dst_lbl, mode))
+            placed.add(place(src_lbl, dst_lbl))
         counts[split] += 1
         counts["people"][split] += len(persons)
         written[split].add(split_unique)
@@ -206,8 +243,6 @@ def export_dataset(
                          f"（{len(bad)} 帧读不通，例：{bad[0] if bad else '标签为空'}）"
                          + "：按提示里的 文件:行号 修掉坏行，或先跑 autolabel validate 查格式")
 
-    names = idx.class_names
-    num_kpt = int(idx.data.get("kpt_shape", [17, 3])[0])
     lines = [f"# 由自动标注系统生成 on {now_str()}", f"path: {out_root}", "train: images/train",
              "val: images/val", f"kpt_shape: [{num_kpt}, 3]",
              f"flip_idx: {flip_idx_for(num_kpt)}"]
@@ -241,7 +276,7 @@ def export_dataset(
         splits = split_by_rel
         coord_result = write_coordinate_files(
             root, out=os.path.join(out_root, "coords"), tag="coords",
-            exclude_status=tuple(exclude), splits=splits,
+            exclude_status=tuple(exclude), splits=splits, only=set(split_by_rel),
         )
         coord_out = coord_result["out"]
         manifest["coords"] = coord_out
@@ -267,6 +302,35 @@ def export_stem(rel: str) -> str:
     平铺的数据集（绝大多数）算出来和原来一模一样，只有带子目录的会多一段前缀。
     """
     stem = os.path.splitext(str(rel).replace(os.sep, "/"))[0].replace("/", "__").strip("_")
+    return safe_stem(stem)
+
+
+#: Windows 不能拿来当文件名的保留设备名（不分大小写，也不能带扩展名以外的点）
+WINDOWS_RESERVED = frozenset({"con", "prn", "aux", "nul"}
+                             | {f"com{index}" for index in range(1, 10)}
+                             | {f"lpt{index}" for index in range(1, 10)})
+#: 单个文件名允许的最长字节数（不含扩展名）。Linux 单个路径段上限 255 字节，
+#: 而中文一个字就占 3 字节：主目录里导入的 90 个汉字文件名，压上前缀实测 263 字节，
+#: 在 macOS APFS 侥幸过得去，换到 ext4 的训练机上导出直接 [Errno 36] File name too long。
+STEM_BYTE_BUDGET = 96
+_ILLEGAL_IN_STEM = re.compile(r'[\\/:*?"<>|\s\x00-\x1f]+')
+
+
+def safe_stem(stem: str, budget: int = STEM_BYTE_BUDGET) -> str:
+    """把导出文件名收进各系统都答应的写法：非法字符、保留名、长度一起管。
+
+    只动 Windows/Linux 真不认的部分（``:`` ``?`` ``*`` ``"`` ``<`` ``>`` ``|`` 空格
+    换成下划线，结尾的点去掉，保留名加后缀），中文和数字原样保留；超长才截断，
+    截完撞名由 :func:`unique_stem` 加 ``-2`` 兜底，不会悄悄少帧。
+    """
+    stem = _ILLEGAL_IN_STEM.sub("_", stem).strip("._")
+    if stem.lower() in WINDOWS_RESERVED:
+        stem = f"{stem}_x"
+    if len(stem.encode("utf-8")) > budget:
+        cut = stem
+        while cut and len(f"{cut}.".encode("utf-8")) > budget:
+            cut = cut[:-1]
+        stem = cut.strip("._")
     return stem or "image"
 
 
@@ -482,6 +546,21 @@ def find_reusable_export(root: str, fingerprint: str, kind: str = "pose") -> Opt
 PLACE_LABELS = {"symlink": "软链接", "hardlink": "硬链接", "copy": "直接拷贝"}
 #: 退路顺序：软链 → 硬链 → 拷贝，越往后越占磁盘但越不会失败
 PLACE_FALLBACKS = {"symlink": "hardlink", "hardlink": "copy", "copy": ""}
+#: 放文件失败的常见 errno 翻成人话：裸 [Errno 13] 对普通用户等于没说
+OSERROR_HINTS = {2: "路径不存在或层级太深", 13: "没有权限（导出目录只读、被别的程序占用，或 Windows 上需要管理员）",
+                 28: "磁盘已满", 36: "文件名太长（Linux 单个路径段上限 255 字节）",
+                 40: "路径太长", 63: "文件名太长"}
+
+
+def place_error_message(mode: str, src: str, out_root: str, exc: OSError) -> str:
+    """三级退让全失败时的一句人话：说清哪一步失败、为什么、下一步怎么办。"""
+    hint = OSERROR_HINTS.get(getattr(exc, "errno", None), "")
+    detail = f"{exc}｜{hint}" if hint and hint not in str(exc) else str(exc)
+    lines = [f"把文件放进导出目录失败（{PLACE_LABELS.get(mode, mode)}）：{detail}",
+             f"     源文件：{src}", f"     导出目录：{out_root}"]
+    if mode != "copy":
+        lines.append("     可以先换成 --mode copy（直接拷贝，最占磁盘但最不容易失败）再试一次")
+    return "\n".join(lines)
 
 
 def _place(src: str, dst: str, mode: str) -> str:

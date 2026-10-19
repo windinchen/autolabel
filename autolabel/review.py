@@ -5,10 +5,13 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import math
 import os
+import select
 import shutil
+import socket
 import threading
 import time
 from contextlib import contextmanager
@@ -1335,6 +1338,40 @@ class ReviewHandler(BaseHTTPRequestHandler):
             return
         super().log_message(fmt, *args)
 
+    def _redirect_if_http(self) -> bool:
+        """明文 HTTP 打到了 HTTPS 端口：说清楚该用 https，别只留一句「响应无效」。
+
+        这是「网页打不开」最常见的成因——书签或手敲少了一个 ``s``，而以前这种
+        连接在握手阶段就被丢掉，服务端日志一行不剩，谁也无从查起。
+        页面用 301（浏览器会自己换过来），接口用 400（POST 被 301 改写成 GET 更乱）。
+        """
+        import ssl
+
+        if getattr(self.server, "ssl_context", None) is None:
+            return False   # 这次本来就是 HTTP 服务，没什么好提醒的
+        if isinstance(self.request, ssl.SSLSocket):
+            return False   # 正经的 HTTPS 连接
+        from . import platform_utils
+
+        host = (self.headers.get("Host") or "").strip()
+        if not host:
+            address, port = self.server.server_address[0], self.server.server_address[1]
+            target = platform_utils.url_for_host(address, port, "https")
+        else:
+            target = f"https://{host}{urlparse(self.path).path}"
+        self.close_connection = True   # 请求体没读，留着这条连接只会串下一个包
+        if self.command in ("GET", "HEAD"):
+            self.send_response(301)
+            self.send_header("Location", target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self._send_json({"error": f"这个端口只说 HTTPS，请改用 {target}",
+                             "https": target}, status=400)
+        self.log_message("明文 HTTP 打到了 HTTPS 端口（%s %s）→ 请到 %s",
+                         self.command, self.path, target)
+        return True
+
     # --- 路由 ---
     @staticmethod
     def _lib_of(parsed, default: str = LIB_OBJECTS) -> str:
@@ -1371,6 +1408,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 "remote": remote, "note": "" if not remote else "本机模型目录检索（未启用在线源）"}
 
     def do_GET(self) -> None:  # noqa: N802
+        if self._redirect_if_http():
+            return
         parsed = urlparse(self.path)
         path = parsed.path
         try:
@@ -1516,6 +1555,8 @@ class ReviewHandler(BaseHTTPRequestHandler):
         return payload
 
     def do_POST(self) -> None:  # noqa: N802
+        if self._redirect_if_http():
+            return
         parsed = urlparse(self.path)
         length = self._content_length()
         if parsed.path == "/api/upload":
@@ -1771,6 +1812,129 @@ def local_cert_paths() -> tuple:
     return None, None
 
 
+#: TLS 记录的内容类型都落在 0x14–0x17（change_cipher_spec / alert / handshake /
+#: application data），而 HTTP 请求行的首字母全是可打印 ASCII（G、P、H、D、O…）。
+#: 一个字节就分得开「这是 TLS 连接」还是「有人在地址栏敲了 http://」。
+TLS_RECORD_TYPES = (0x14, 0x15, 0x16, 0x17)
+
+
+#: TLS 握手与 HTTP 请求都在 ``connect()`` 之后立刻发出第一个包：局域网几毫秒，
+#: 手机热点也就几十毫秒。这个超时只为「连上来一个字都不说」的浏览器预热连接兜底，
+#: 它是串行卡在 accept 上的，所以宁可短一点，也别让首屏多等好几秒。
+PROBE_TIMEOUT = 1.2
+#: 嗅探超时之后按明文处理、却始终等不到请求行的连接：30 秒还没开口就收掉，
+#: 免得浏览器预热带起来的那些不说话的连接把线程一个个占死。
+PLAINTEXT_IDLE_TIMEOUT = 30.0
+
+
+def _is_tls_connection(conn, timeout: float = PROBE_TIMEOUT) -> bool:
+    """嗅一下第一个字节，判断对方是不是在说 TLS。
+
+    用 ``MSG_PEEK`` 是必须的：字节看一眼还在缓冲区里，后面 ``ssl`` 或 handler
+    各自都要再完整读一遍。超时算明文——真能连上又不说话的只有浏览器的预热连接，
+    判错也只是多回一次 301，浏览器换个 https 重试就好，不会死循环。
+    """
+    head = b""
+    try:
+        conn.setblocking(False)
+        ready, _, _ = select.select([conn], [], [], timeout)
+        if ready:
+            head = conn.recv(1, socket.MSG_PEEK)
+    except OSError:
+        return False
+    finally:
+        try:
+            conn.setblocking(True)
+        except OSError:
+            pass
+    return bool(head) and head[0] in TLS_RECORD_TYPES
+
+
+class WorkbenchServer(ThreadingHTTPServer):
+    """工作台的服务端：地址族跟着监听地址走，并且同一个端口也认明文 HTTP。
+
+    两件事都是实测踩出来的：
+
+    - ``--host ::1`` / ``--host ::`` 以前在 ``bind()`` 就抛 ``gaierror``（父类地址族
+      写死 IPv4），可证书早签了 ``::1``、启动提示也写着 ``::``，宣称支持却起不来。
+    - 明文 ``http://`` 打到只听 HTTPS 的端口，握手在 ``accept()`` 里抛，而标准库把
+      ``get_request()`` 的 ``OSError`` 整个吞掉（连 ``handle_error`` 都不走）：浏览器
+      只剩一句「响应无效」，服务端日志一行都不留。改成逐连接握手，明文那条连接
+      交给 handler 回 301，握手失败也由我们自己说一句话。
+    """
+
+    def __init__(self, host: object, port: int, handler, ssl_context=None) -> None:
+        import ssl as _ssl
+
+        from . import platform_utils
+
+        self.ssl_context: Optional[_ssl.SSLContext] = ssl_context
+        self.address_family, self.bind_address = platform_utils.bind_family(host)
+        # 绑 :: 时一个套接字同时吃 IPv4/IPv6，才有「localhost 无论解析到哪个都通」
+        self.dual_stack = self.bind_address in ("::", "::0")
+        super().__init__((self.bind_address, int(port)), handler)
+
+    def server_bind(self) -> None:
+        # V6ONLY 的系统默认值不统一（Linux 默认双栈、部分 macOS 默认只 IPv6），
+        # 不显式写死就会出现「这台机能用、那台机连不上」。设不上就算了，退回只管 IPv6。
+        if self.dual_stack:
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except OSError:
+                pass
+        super().server_bind()
+
+    def get_request(self):  # noqa: D102
+        conn, addr = self.socket.accept()
+        if self.ssl_context is None:
+            return conn, addr
+        if not _is_tls_connection(conn):
+            # 明文：不握手，原样交给 handler 回 301。不往 socket 上挂标记——
+            # ``socket.socket`` 有 ``__slots__``，挂不上（第一次就崩在 accept 里）；
+            # handler 改成看「服务开了 SSL 而这条连接不是 SSLSocket」，一样准。
+            try:
+                # 给这条连接一个读超时：`http.server` 收到 socket.timeout 是安静关掉
+                # 连接、不吐栈，正好用来收掉那些连上来一直不说话的预热连接
+                conn.settimeout(PLAINTEXT_IDLE_TIMEOUT)
+            except OSError:
+                pass
+            return conn, addr
+        try:
+            return self.ssl_context.wrap_socket(conn, server_side=True), addr
+        except OSError as exc:
+            conn.close()
+            # 标准库对这里的 OSError 是直接 return，一行日志都不留，
+            # 所以这句话必须我们自己说，否则又是「打不开但不知道为什么」
+            print(f"[warn] 来自 {addr[0]} 的 HTTPS 握手没成功（{type(exc).__name__}）：{exc}\n"
+                  f"       先确认地址用的是 https://，再确认这台机器装过本项目的根证书"
+                  f"（autolabel ca --install）", flush=True)
+            raise
+
+
+#: 「这台机器没有 IPv6」的错误码：macOS/Linux 是 EAFNOSUPPORT，
+#: Windows 是 WSAEAFNOSUPPORT（10047，Python 不保证映射成同一个 errno）。
+_NO_IPV6_ERRNOS = {code for code in (getattr(errno, "EAFNOSUPPORT", None), 10047)
+                   if code is not None}
+
+
+def _bind_server(host: object, port: int, context) -> WorkbenchServer:
+    """起服务端；这台机器用不了 IPv6 就退回 IPv4 通配，而不是直接起不来。
+
+    Windows 关掉 IPv6 之后绑 ``::`` 抛的是 ``EAFNOSUPPORT``，而用户要的是
+    「网页能打开」，不是「必须走 IPv6」——端口被占用之类其它原因照旧往外抛。
+    """
+    from . import platform_utils
+
+    _, address = platform_utils.bind_family(host)
+    try:
+        return WorkbenchServer(host, port, ReviewHandler, ssl_context=context)
+    except OSError as exc:
+        if address != "::" or getattr(exc, "errno", None) not in _NO_IPV6_ERRNOS:
+            raise
+        print(f"[warn] 这台机器用不了 IPv6（{exc}），已改成监听 0.0.0.0", flush=True)
+        return WorkbenchServer("0.0.0.0", port, ReviewHandler, ssl_context=context)
+
+
 def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True,
           max_upload_mb: int = 1024, cert: Optional[str] = None,
           key: Optional[str] = None) -> None:
@@ -1790,21 +1954,27 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bo
     if stale["files"]:
         print(f"[info] 清理上次遗留的上传临时文件 {stale['files']} 个"
               f"（{stale['bytes'] / 1048576:.1f} MB，超过 24 小时未使用）")
-    httpd = ThreadingHTTPServer((host, port), ReviewHandler)
-    port = httpd.server_address[1]
-    secure, scheme, note = False, "http", ""
+    secure, note = False, ""
+    context = None
     if cert and key:
         import ssl
 
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         try:
-            context.load_cert_chain(certfile=cert, keyfile=key)
-        except ssl.SSLError as exc:
+            loaded = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            loaded.load_cert_chain(certfile=cert, keyfile=key)
+        except (ssl.SSLError, OSError) as exc:
+            # 证书文件被删了一半 / 权限不对时抛的不止 SSLError，都得退回 HTTP，
+            # 否则整个工作台起不来，而摄像头不可用远没到「这个软件不能用」的程度
             note = f"证书没加载成功（{exc}），本次改用 HTTP，摄像头会不可用"
         else:
-            httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
-            secure, scheme = True, "https"
-    url = f"{scheme}://{host}:{port}/"
+            context = loaded
+    secure = context is not None
+    scheme = "https" if secure else "http"
+    httpd = _bind_server(host, port, context)
+    port = httpd.server_address[1]
+    from . import platform_utils
+
+    url = platform_utils.url_for_host(host, port, scheme)
     total = len(store.index.items)
     objects_total = len(store.objects_index.items)
     detect_total = len(store.detect_index.items)
@@ -1828,8 +1998,10 @@ def serve(root: str, host: str = "127.0.0.1", port: int = 8765, open_browser: bo
         print("[info] 已启用 HTTPS（摄像头可用）· 重签证书：autolabel ca --force")
     if note:
         print(f"[warn] {note}")
-    if host in ("0.0.0.0", "::"):
+    if platform_utils.normalize_host(host) in platform_utils.WILDCARD_HOSTS:
         print(f"[info] 手机/同网电脑可访问 https://这台机器的IP:{port}/（需把 certs/ca.pem 装到那台设备）")
+    if getattr(httpd, "dual_stack", False):
+        print(f"[info] 已同时监听 IPv4 与 IPv6：127.0.0.1:{port} 与 [::1]:{port} 都通")
     print(f"[info] 自动标注 v{versioning.VERSION} · 开发者 {versioning.DEVELOPER} · {versioning.REPO_URL}")
     print(f"[info] 数据集 {store.index.name}：姿态库 {total} 张 · 提示词库 {objects_total} 张 · "
           f"检测库 {detect_total} 张，等你复核 {counts['pending']} 张（其中 {counts['flagged']} 张"

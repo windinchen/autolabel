@@ -11,6 +11,8 @@ models/*.pt
 models/*.onnx
 models/*.engine
 models/*.mlpackage
+# 开放词表模型的文本编码器权重（CLIP 等，第一次用开放词表时自动落在这，几百 MB）
+weights/
 datasets/
 runs/
 exports/

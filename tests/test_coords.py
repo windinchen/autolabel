@@ -129,3 +129,33 @@ def test_export_with_coords_adds_split_column(dataset):
     manifest = json.load(open(os.path.join(result["out"], "manifest.json"), "r", encoding="utf-8"))
     assert manifest["coords"] == coord_dir
     assert manifest["coords_counts"] == {"images": 2, "persons": 2}
+
+
+def test_one_broken_label_skips_only_that_frame(dataset):
+    """一张坏标签不能拉着一整批坐标文件陪葬（以前整批不写、manifest 也留不下来）。"""
+    from autolabel.coords import collect_records
+
+    names = seed(dataset)
+    broken = "0 0.500000 0.500000 0.200000 " + " ".join(
+        f"{0.30 + i * 0.02:.6f} {0.20 + i * 0.03:.6f} 2" for i in range(16))   # 少一个关键点
+    write_label(dataset, names[0], [broken])
+
+    records, meta = collect_records(dataset)
+    kept = {rec["image"] for rec in records}
+    assert names[1] in kept, kept                       # 好图照常出记录
+    assert names[0] not in kept, kept                   # 坏的那帧被跳，不是抛出去
+    reasons = {row["image"]: row["reason"] for row in meta["skipped"]}
+    assert names[0] in reasons and "标签解析失败" in reasons[names[0]], reasons
+
+
+def test_coordinate_files_still_written_when_a_label_is_broken(dataset):
+    """跳帧之后文件要照样落地，界面上的「最近导出」才看得见这次到底导了什么。"""
+    names = seed(dataset)
+    write_label(dataset, names[0], ["0 0.5 0.5"])      # 残行：连 bbox 都不全
+    result = write_coordinate_files(dataset, out=os.path.join(dataset, "coords", "broken"))
+    for name in ("coords.csv", "coords.jsonl", "summary.json"):
+        assert os.path.exists(os.path.join(result["out"], name)), name
+    with open(os.path.join(result["out"], "summary.json"), encoding="utf-8") as fh:
+        summary = json.load(fh)
+    assert summary["images"] == len(names) - 1, summary
+    assert any("标签解析失败" in row["reason"] for row in summary["skipped_items"]), summary

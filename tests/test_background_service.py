@@ -259,6 +259,47 @@ def test_conf_relative_dataset_is_resolved_against_the_project(home, tmp_path):
     assert Path(row.dataset).is_absolute() and Path(row.dataset).is_dir()
 
 
+@pytest.mark.parametrize("line,dataset,device,half", [
+    ("mps 8765 datasets/demo - no", "datasets/demo", "", False),
+    ("mps 8765 datasets/demo - yes", "datasets/demo", "", True),
+    ("cuda 8766 datasets/demo cuda no", "datasets/demo", "cuda", False),
+    ("cuda 8766 datasets/素材 批次1 cuda yes", "datasets/素材 批次1", "cuda", True),
+    ("cpu 8767 datasets/素材 批次1", "datasets/素材 批次1", "", False),
+    ("mps 8765 datasets/cuda", "datasets/cuda", "", False),
+    ("mps 8765 datasets/demo cuda", "datasets/demo", "cuda", False),
+    ("mps 8765 datasets/yes - no", "datasets/yes", "", False),
+])
+def test_conf_dataset_path_may_contain_spaces(home, tmp_path, line, dataset, device, half):
+    """目录名带空格是常态（``项目 任务/素材 批次1``）：整份清单不该因此读不动。
+
+    以前一律按空格切五段，``datasets/素材 批次1`` 被切成「数据集 = datasets/素材、
+    设备 = 批次1」，报的是「设备不认识：批次1」，看着像填错了算力。
+    认法改成：实例名 / 端口 / 设备 / 半精度四段天然不含空格，剩下的整段归数据集。
+    """
+    root = tmp_path / "项目 任务"
+    (root / dataset).mkdir(parents=True)
+    path = tmp_path / "带空格.conf"
+    path.write_text(line + "\n", encoding="utf-8")
+
+    row = service.read_conf(path, root=root)[0]
+    assert row.dataset == str(root / dataset)
+    assert row.device == device and row.half is half
+
+
+def test_conf_device_error_explains_the_spaced_path_trap(home, tmp_path):
+    """五段又带空格的写法认不出来时，报错要直接点破这一条，而不是只列可选算力。"""
+    root = tmp_path / "proj"
+    (root / "datasets" / "素材").mkdir(parents=True)
+    path = tmp_path / "trap.conf"
+    path.write_text("mps 8765 datasets/素材 批次1 -\n", encoding="utf-8")
+
+    with pytest.raises(service.ServiceError) as caught:
+        service.read_conf(path, root=root)
+
+    assert "设备不认识" in caught.value.head
+    assert "数据集目录名里有空格" in "\n".join(caught.value.details)
+
+
 def test_conf_of_only_comments_says_so(home, tmp_path):
     path = tmp_path / "empty.conf"
     path.write_text("# 注释\n\n   # 又是注释\n", encoding="utf-8")
@@ -552,6 +593,7 @@ def _status_lines(home, conf, monkeypatch, loaded=(), pids=None, listener=None):
     """把 launchd 的返回值换成可控的，再抓一遍 ``autolabel service --status`` 的输出。"""
     monkeypatch.setattr(service, "run", _launchctl(loaded=loaded, pids=pids))
     monkeypatch.setattr(platform_utils, "listening_pid", lambda _p: listener)
+    monkeypatch.setattr(platform_utils, "port_busy", lambda *_a, **_k: True)
     lines = []
     service.status(home / "Desktop" / "自动标注", echo=lines.append)
     return "\n".join(lines)
@@ -559,7 +601,9 @@ def _status_lines(home, conf, monkeypatch, loaded=(), pids=None, listener=None):
 
 def test_status_says_unregistered_plainly(home, conf, monkeypatch):
     text = _status_lines(home, conf, monkeypatch)
-    assert "未注册" in text and "autolabel service" in text
+    # 指路要指到人真敲得动的命令：仓库没装 console script，提示里写
+    # ``autolabel service`` 照抄只会得到 command not found
+    assert "未注册" in text and "后台服务" in text, text
 
 
 def test_status_tells_a_written_but_unloaded_job_apart(home, conf, monkeypatch):
@@ -581,12 +625,83 @@ def test_status_reports_a_running_job_with_its_pid(home, conf, monkeypatch):
     monkeypatch.setattr(service, "run",
                         _launchctl(loaded=("mps", "cuda"), pids={"mps": 4321}))
     monkeypatch.setattr(platform_utils, "listening_pid", lambda _p: None)
+    monkeypatch.setattr(platform_utils, "port_busy", lambda *_a, **_k: True)
     service.pid_file("mps").write_text("4321", encoding="ascii")
     lines = []
     service.status(home / "Desktop" / "自动标注", echo=lines.append)
     text = "\n".join(lines)
     assert "mps 在跑 · PID 4321" in text
     assert "cuda 已注册但没在跑" in text
+
+
+def test_status_catches_a_process_that_never_started_listening(home, conf, monkeypatch):
+    """launchd 说「在跑」、端口却没人听：进程卡在加载或起的根本不是这个实例。
+
+    以前状态页只转述服务管理器的话，照样打「✓ 在跑 · http://…」，
+    用户照着地址点开却是「无法访问」，而屏幕上明明写着运行中。
+    """
+    monkeypatch.setattr(service, "run", _launchctl(loaded=("mps", "cuda"), pids={"mps": 4321}))
+    monkeypatch.setattr(platform_utils, "listening_pid", lambda _p: None)
+    monkeypatch.setattr(platform_utils, "port_busy", lambda *_a, **_k: False)
+    service.pid_file("mps").parent.mkdir(parents=True, exist_ok=True)
+    service.pid_file("mps").write_text("4321", encoding="ascii")
+    lines = []
+    code = service.status(home / "Desktop" / "自动标注", echo=lines.append)
+    text = "\n".join(lines)
+
+    assert "进程在跑（PID 4321），但端口 8765 没人监听" in text, text
+    assert "mps 在跑 ·" not in text, "端口没听就不许打这一句"
+    assert "模型还在加载" in text, "要给一句「稍后再看一次」，别只报坏消息"
+    assert code == 1, "注册了却没在服务，退出码不能还是 0"
+
+
+def test_port_busy_instances_are_not_counted_twice(home, conf, monkeypatch):
+    """端口被占而跳过的实例根本没加载，第二遍别再拿去验一次、数两次。"""
+    monkeypatch.setattr(service, "run", lambda argv, **kw: _done())
+    monkeypatch.setattr(platform_utils, "port_busy", lambda *_a, **_k: True)
+    monkeypatch.setattr(platform_utils, "listening_pid", lambda _p: 777)
+    checked = []
+    monkeypatch.setattr(service, "_verify_ready",
+                        lambda _b, inst, **_k: checked.append(inst.name) or "foreign")
+    lines = []
+    assert service.install(home / "Desktop" / "自动标注", echo=lines.append) == 0
+    text = "\n".join(lines)
+
+    assert checked == [], "跳过的实例不该再被验一遍"
+    assert "还被别的程序占着" in text
+    assert "另外 2 个因为端口被占跳过了" in text, text
+    assert text.count("端口被占跳过") == 1
+
+
+def test_ready_wait_matches_the_launcher():
+    """注册那条路等 40 秒、实例那条路等 90 秒：同一台冷启动机器会一边报失败一边说正常。"""
+    from autolabel import launch
+
+    assert service.READY_WAIT == 90.0
+    assert service.READY_WAIT == launch.wait_for_port.__defaults__[0]
+
+
+def test_plist_carries_autolabel_home_when_it_is_set(home, conf, monkeypatch):
+    """注册时把服务用的目录另指过，任务定义就得带上，否则后台读的是默认 ~/.autolabel。"""
+    backend = service.backend("launchd")
+    inst = read_conf_lines(conf)[0]
+    assert "AUTOLABEL_HOME" not in backend.render_unit(inst), "没设过就别凭空造一个"
+
+    monkeypatch.setenv("AUTOLABEL_HOME", str(home / "autolabel 数据"))
+    data = plistlib.loads(backend.render_unit(inst).encode("utf-8"))
+    assert data["EnvironmentVariables"]["AUTOLABEL_HOME"] == str(home / "autolabel 数据")
+    assert data["EnvironmentVariables"]["HOME"] == str(home)
+
+
+def test_windows_shim_carries_autolabel_home_too(home, conf, monkeypatch):
+    """任务计划程序不继承用户的环境变量：不设这一行，后台和前台就是两份配置。"""
+    backend = service.backend("taskscheduler")
+    inst = read_conf_lines(conf)[1]
+    assert "AUTOLABEL_HOME" not in backend.render_shim(inst, home / "Desktop" / "自动标注")
+
+    monkeypatch.setenv("AUTOLABEL_HOME", "D:\\autolabel")
+    shim = backend.render_shim(inst, home / "Desktop" / "自动标注")
+    assert 'set "AUTOLABEL_HOME=D:\\autolabel"' in shim
 
 
 def test_status_explains_a_tcc_failure_in_plain_words(home, conf, monkeypatch):

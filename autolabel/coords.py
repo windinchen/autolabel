@@ -17,10 +17,11 @@ import json
 import os
 import shutil
 import tempfile
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .dataset import label_path_for, load_index, now_str, source_missing
-from .export import MISSING_SOURCE_REASON, export_stem
+from .export import (MISSING_SOURCE_REASON, class_range_reason,
+                    export_stem)
 from .yolo_pose import COCO17_KEYPOINTS, COCO17_SKELETON, parse_label_file, person_sanity_flags
 
 WIDE_FILE = "coords.csv"
@@ -31,6 +32,8 @@ SUMMARY_FILE = "summary.json"
 
 DEFAULT_FORMATS = ("csv", "long", "jsonl")
 KNOWN_FORMATS = DEFAULT_FORMATS
+#: export --coords 时被导出端挑剩的帧，在坐标文件里的统一说法
+NOT_EXPORTED_REASON = "本次导出未包含该帧"
 
 # 宽表里关键点列之外的固定列
 BASE_COLUMNS = [
@@ -85,11 +88,13 @@ def collect_records(
     exclude_status: Sequence[str] = ("rejected",),
     require_label: bool = True,
     splits: Optional[Dict[str, str]] = None,
+    only: Optional[Set[str]] = None,
 ) -> Tuple[List[dict], dict]:
     """把标签解析成带像素坐标的记录。
 
     :param splits: 导出时算好的 train/val，按索引里的相对路径给（``{"a/f.jpg": "val"}``）；
                    认相对路径而不是认导出文件名，导出端加后缀改名也不会对不上
+    :param only: 只写这些相对路径（``export --coords`` 用它把坐标对齐到真正导出的帧）
     :return: (逐图记录, 数据集元信息)
     """
     idx = load_index(root)
@@ -106,6 +111,12 @@ def collect_records(
         if status in skip:
             skipped.append({"image": rel, "reason": f"status={status}"})
             continue
+        if only is not None and rel not in only:
+            # export --coords 只该写真正进了训练集的那些帧。以前坐标文件连被背景图
+            # 上限挤掉、缺标签的帧也一起写，split 空着又不解释，同一份 manifest 里
+            # "train+val=2" 和 "coords_counts.images=10" 并存，对账永远对不上。
+            skipped.append({"image": rel, "reason": NOT_EXPORTED_REASON})
+            continue
         if source_missing(root, rel):
             # 与 export 同一口径：图都不在了，坐标再准也是对空气标注。
             # 以前 export --coords 会给出"这一帧没导出、但 CSV 里有一行"的对不上账。
@@ -118,7 +129,21 @@ def collect_records(
                 continue
             persons: List = []
         else:
-            persons = parse_label_file(label, num_kpt)
+            try:
+                persons = parse_label_file(label, num_kpt)
+            except ValueError as exc:
+                # 与 export 同一口径：一张坏标签只跳这一帧，原因照实记下来。
+                # 以前这一行不接异常，坏行一路冒出 collect_records —— 一张坏标签
+                # 让整批坐标文件一个都不写，manifest.json 也留不下来，
+                # 界面上既看不到为什么没导、也看不到有这东西（只能反复重导堆目录）
+                skipped.append({"image": rel, "reason": f"标签解析失败：{exc}"})
+                continue
+        stray = sorted({int(person.cls) for person in persons} - set(class_names))
+        if stray:
+            # 与 export 同一口径：类别号不认识就跳这一帧。以前这里把类别号原样写成
+            # class_name="7"，既不标记也不跳过，下游按类别名统计时凭空多出一类。
+            skipped.append({"image": rel, "reason": class_range_reason(stray[0], class_names)})
+            continue
         width = int(item.get("width", 0) or 0)
         height = int(item.get("height", 0) or 0)
         # 与导出目录用同一套文件名规则，否则导出时带过来的 split 列会对不上
@@ -163,7 +188,8 @@ def collect_records(
         "skeleton": [list(s) for s in COCO17_SKELETON if max(s) < num_kpt],
         "source_dataset": os.path.abspath(root),
         "generated_at": now_str(),
-        "filter": {"exclude_status": sorted(skip), "require_label": require_label},
+        "filter": {"exclude_status": sorted(skip), "require_label": require_label,
+                   "only_frames": len(only) if only is not None else None},
         "columns": COLUMN_DOC,
         "skipped": skipped,
     }
@@ -241,10 +267,11 @@ def write_coordinate_files(
     require_label: bool = True,
     tag: Optional[str] = None,
     splits: Optional[Dict[str, str]] = None,
+    only: Optional[Set[str]] = None,
 ) -> dict:
     """生成坐标文件，返回 {out, files, images, persons}。"""
     records, meta = collect_records(root, exclude_status=exclude_status,
-                                    require_label=require_label, splits=splits)
+                                    require_label=require_label, splits=splits, only=only)
     out_root = os.path.abspath(out or os.path.join(coords_dir(root),
                                                    tag or now_str().replace(" ", "_").replace(":", "")))
     os.makedirs(out_root, exist_ok=True)
@@ -282,6 +309,7 @@ def write_coordinate_files(
         "images_empty": sum(1 for rec in records if not rec["objects"]),
         "persons": persons,
         "keypoints_written": persons * meta["num_keypoints"],
+        "no_data": not records,
         "status_counts": status_counts,
         "rows": {WIDE_FILE: rows_wide, LONG_FILE: rows_long, JSONL_FILE: len(records)},
         "filter": meta["filter"],
