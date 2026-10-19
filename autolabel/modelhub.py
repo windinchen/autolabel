@@ -547,6 +547,9 @@ def search(query: str = "", task: str = "") -> List[dict]:
 
 GITHUB_SEARCH_URL = "https://api.github.com/search/repositories?q="
 REMOTE_NOTE = "社区权重未经校验，下载前建议核对文件大小"
+NEEDS_QUERY_NOTE = "联网检索要先输入关键词，下面先是本地模型目录里的匹配结果"
+LOCAL_ONLY_NOTE = "只匹配了本地模型目录（未联网）"
+EMPTY_QUERY = "没有填写搜索关键词"
 REMOTE_LIMIT = 20
 REMOTE_HEADERS = {"Accept": "application/vnd.github+json", "User-Agent": "autolabel-modelhub"}
 
@@ -567,11 +570,30 @@ def _remote_failure(reason: str) -> str:
     return reason
 
 
+def _remote_outcome(query: str, timeout: float) -> Tuple[List[dict], str, str]:
+    """联网搜一次，并折算成（结果，错误原因，状态）。
+
+    状态只有三种：``needs_query`` 没填关键词（压根不该联网，不算失败）、``ok`` 真的
+    请求成功（命中 0 条也算）、``failed`` 断网/超时/限流这类真连不上。
+    """
+    results, error = _remote_fetch(query, timeout)
+    if error == EMPTY_QUERY:
+        return [], "", "needs_query"
+    return results, _remote_failure(error), ("failed" if error else "ok")
+
+
+def _remote_note(error: str, state: str = "") -> str:
+    """联网没成功时那句人话：只说原因，「下面是本地结果」由界面补一次，不重复两遍。"""
+    if state == "needs_query":
+        return NEEDS_QUERY_NOTE
+    return f"没连上 GitHub（{error}）" if error else REMOTE_NOTE
+
+
 def _remote_fetch(query: str, timeout: float) -> Tuple[List[dict], str]:
     """去 GitHub 搜仓库，返回（结果列表，错误原因）。任何异常都换成错误原因，不往外抛。"""
     term = github_query(query)
     if not term:
-        return [], "没有填写搜索关键词"
+        return [], EMPTY_QUERY
     url = GITHUB_SEARCH_URL + urllib.parse.quote(term)
     request = urllib.request.Request(url, headers=dict(REMOTE_HEADERS))
     try:
@@ -613,17 +635,15 @@ def _remote_fetch(query: str, timeout: float) -> Tuple[List[dict], str]:
 def search_remote(query: str, timeout: float = 6.0) -> dict:
     """联网搜社区里的 YOLO 权重仓库，附带本地目录里的匹配结果。
 
-    返回 ``{"ok","query","local","results","note","error"}``。GitHub 不可达、超时、限流、
-    返回看不懂都只把 ``ok`` 置为 ``False`` 并填 ``error``，``local`` 照常给出，绝不抛异常。
+    返回 ``{"ok","query","local","results","note","error","remote_state"}``。GitHub 不可达、
+    超时、限流、返回看不懂都只把 ``ok`` 置为 ``False`` 并填 ``error``，``local`` 照常给出，
+    绝不抛异常。没填关键词时根本不联网，``remote_state`` 为 ``needs_query`` 且不算失败。
     """
     text = str(query or "").strip()
-    out = {"ok": False, "query": text, "local": search(text), "results": [],
-           "note": REMOTE_NOTE, "error": ""}
-    results, error = _remote_fetch(text, timeout)
-    out["results"] = results
-    out["error"] = _remote_failure(error)
-    out["ok"] = not error
-    return out
+    results, error, state = _remote_outcome(text, timeout)
+    return {"ok": state != "failed", "query": text, "local": search(text),
+            "results": results, "note": _remote_note(error, state), "error": error,
+            "remote_state": state}
 
 
 def search_payload(q: str = "", task: str = "", remote: bool = False,
@@ -631,25 +651,22 @@ def search_payload(q: str = "", task: str = "", remote: bool = False,
     """搜索框的一次完整应答：``remote=False`` 时纯本地、一个网络请求都不发。
 
     ``local`` 是本地目录里的匹配项（字段界面可直接渲染），``results`` 是 GitHub 上的社区
-    仓库（只有 ``remote=True`` 时才有内容）。离线、超时、限流一律 ``ok=False`` 并在
-    ``note``/``error`` 里写清原因，不抛异常。``dataset_root`` 预留给调用方判兼容性，
-    这一层还不需要它。
+    仓库（只有 ``remote=True`` 时才有内容）。``remote_state`` 说明联网走到哪一步：
+    ``skipped`` 没开联网、``needs_query`` 没填关键词、``ok`` 联网成功、``failed`` 真连不上，
+    只有最后一种才 ``ok=False``。断网/超时/限流一律写进 ``note``/``error``，不抛异常。
+    ``dataset_root`` 预留给调用方判兼容性，这一层还不需要它。
     """
     query = str(q or "").strip()
     local = search(query, task)
+    shared = {"query": query, "task": str(task or "").strip().lower(), "local": local,
+              "dataset_root": str(dataset_root or "")}
     if not remote:
-        return {"ok": True, "query": query, "task": str(task or "").strip().lower(),
-                "local": local, "results": [], "note": "只匹配了本地模型目录（未联网）",
-                "error": "", "dataset_root": str(dataset_root or "")}
-    results, error = _remote_fetch(query, 6.0)
-    if error:
-        return {"ok": False, "query": query, "task": str(task or "").strip().lower(),
-                "local": local, "results": [],
-                "note": f"没连上 GitHub（{error}），下面是本地目录里的匹配结果",
-                "error": error, "dataset_root": str(dataset_root or "")}
-    return {"ok": True, "query": query, "task": str(task or "").strip().lower(),
-            "local": local, "results": results, "note": REMOTE_NOTE, "error": "",
-            "dataset_root": str(dataset_root or "")}
+        return dict(shared, ok=True, results=[], note=LOCAL_ONLY_NOTE, error="",
+                    remote_state="skipped")
+    results, error, state = _remote_outcome(query, 6.0)
+    return dict(shared, ok=state != "failed",
+                results=results if state == "ok" else [],
+                note=_remote_note(error, state), error=error, remote_state=state)
 
 
 # --------------------------------------------------------------------------- #

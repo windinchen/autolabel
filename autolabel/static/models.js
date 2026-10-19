@@ -10,7 +10,8 @@ const modelState = {
   // 目录搜索：query 只做本地模糊匹配；remote 打开后请求才带 remote=1 去搜 GitHub
   query: "", remote: false, searching: false, searchSeq: 0, searchTimer: null,
   // loaded：成功拿到过一次目录结果；没拿到之前只能退回本机登记表粗筛
-  hub: { ok: true, loaded: false, query: "", task: "", local: [], results: [], note: "", error: "" },
+  hub: { ok: true, loaded: false, query: "", task: "", local: [], results: [], note: "",
+         error: "", remote_state: "skipped" },
   // 目标检测库当前用的权重：存在数据集 .autolabel/detect/prefs.json，跟姿态默认是两件事
   detectPrefs: {},
 };
@@ -554,15 +555,22 @@ function renderSearchNote() {
     note.textContent = modelState.remote ? "联网检索中（可能要几秒）…" : "搜索中…";
     return;
   }
-  if (!modelState.hub.ok) {
+  const hub = modelState.hub;
+  // remote_state 才说得清联网走到哪一步：没开联网、没填关键词都不该喊「连不上」
+  const state = hub.remote_state || (hub.ok ? "ok" : "failed");
+  if (state === "failed") {
     note.classList.add("err");
-    note.textContent = "联网检索不可用：" + (modelState.hub.note || modelState.hub.error || "未知原因")
+    note.textContent = "联网检索不可用：" + (hub.note || hub.error || "未知原因")
       + "（下面仍是本地目录结果）";
     return;
   }
+  if (state === "needs_query") {
+    note.textContent = hub.note || "联网检索要先输入关键词，下面先是本地目录结果";
+    return;
+  }
   const bits = [];
-  if (modelState.remote) bits.push(`GitHub ${(modelState.hub.results || []).length} 条`);
-  if (String(modelState.query || "").trim()) bits.push(`本地 ${modelState.hub.local.length} 条`);
+  if (modelState.remote) bits.push(`GitHub ${(hub.results || []).length} 条`);
+  if (String(modelState.query || "").trim()) bits.push(`本地 ${(hub.local || []).length} 条`);
   note.textContent = bits.join(" · ");
 }
 
@@ -595,14 +603,14 @@ function hubSearch(options) {
       modelState.hub = {
         ok: Boolean(data.ok), loaded: true, query: data.query || "", task: data.task || "",
         local: data.local || [], results: data.results || [], note: data.note || "",
-        error: data.error || "",
+        error: data.error || "", remote_state: data.remote_state || (data.ok ? "ok" : "failed"),
       };
     } else {
       // 接口挂了不清空列表：沿用上次的目录按新关键词本地粗筛，只把提示换成红色
       const keep = refilterLocal(modelState.hub.local, modelState.query, modelState.filter);
       modelState.hub = { ok: false, loaded: modelState.hub.loaded, query: modelState.query,
         task: modelState.filter, local: keep, results: [], error: failure,
-        note: `模型搜索接口没响应（${failure}）` };
+        remote_state: "failed", note: `模型搜索接口没响应（${failure}）` };
     }
     renderCatalog();
   };

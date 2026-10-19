@@ -1,5 +1,12 @@
 # 自动标注系统（人体骨骼 · 提示词 · 目标检测 / 分割）
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](#环境)
+[![平台](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#环境)
+[![离线](https://img.shields.io/badge/数据不出本机-离线可用-success.svg)](#和别的标注工具比)
+
+**本地离线的半自动标注工具**：用 YOLO-pose 批量生成**人体骨骼关键点**，用一句中文描述（多模态大模型）或本机 YOLO 权重生成**目标检测框**，人工只在浏览器里改模型错的那几个点，直接导出 `yolo pose train` / `yolo detect train` 能吃的数据集。
+
 **开发者 [windinchen](https://github.com/windinchen)** · 源码与发布 <https://github.com/windinchen/autolabel> · 版本号看 `autolabel version`（界面顶栏右侧常驻显示）
 
 > 用 YOLO-pose 批量生成人体骨骼关键点标签，人工只在浏览器里改模型错的那几个点。
@@ -62,6 +69,22 @@ yolo detect train
 yolo detect train
 ```
 
+## 和别的标注工具比
+
+如果你在搜「labelImg 有没有自动标注」「CVAT 能不能先跑模型再改」，这一节就是答案。
+
+| | 这个项目 | labelImg / LabelMe | CVAT | Label Studio |
+| --- | --- | --- | --- | --- |
+| 先出结果、人只改错 | ✅ 模型先标，人工只动可疑帧 | ❌ 从零手画 | ⚠️ 要自己搭模型 + 服务 | ⚠️ 要自己接 ML backend |
+| 人体骨骼关键点 | ✅ 17 点，可见性三态，逐点拖 | ⚠️ LabelMe 能画点，无模型 | ✅ 有骨架模板，无自动 | ⚠️ 需自建 |
+| 目标检测 | ✅ 本机权重 / 一句中文描述 | ❌ 手画 | ✅ | ✅ |
+| 部署 | ✅ 一条命令起本地服务，无数据库、无 Docker | ✅ 单机 | ❌ Docker + 后端 + 数据库 | ❌ Docker + 后端 |
+| 数据出不出本机 | ✅ 默认全离线；联网只在你勾选时用于搜权重 | ✅ | ⚠️ 看部署 | ⚠️ 看部署 |
+| 直接产出 YOLO 训练集 | ✅ `images/labels + data.yaml`，含切分与去重 | ❌ 要自己转 | ⚠️ 导出格式要转换 | ⚠️ 要自己转 |
+| 适合的规模 | 几百到几万张、单人 / 小团队 | 几十张 | 团队标注流水线 | 通用标注平台 |
+
+一句话取舍：**你要的是「模型先干 90%，我改剩下 10%」，并且不想为标注这件事再维护一套 Docker 服务**，那就用这个。
+
 ## 环境
 
 已在本机验证：macOS（Apple M3 Ultra）+ Python 3.9.6 + `torch 2.8.0` + `ultralytics 8.4.24`，推理默认走 Apple Silicon 的 MPS，这台机器上不依赖 CUDA。
@@ -70,7 +93,7 @@ yolo detect train
 
 ```bash
 python3 -m pip install -r requirements.txt   # 已有 torch/ultralytics 可跳过
-python3 -m pytest tests -q                    # 766 项测试，约 2 分钟
+python3 -m pytest tests -q                    # 789 项测试，约 2 分钟
 # 其中 5 项端到端用例需要 models/yolo11n-pose.pt 与 models/bus.jpg，缺权重时会自动跳过（`-rs` 可看到原因）
 ```
 
@@ -319,7 +342,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 │   ├── image_utils.py    读图、dHash、骨架绘制
 │   └── static/           前端：portal 工作台 / app 姿态标注 / objects+detect 检测框标注（共用一份脚本）
 │                         / models 模型管理 / common 共用件
-├── tests/                766 项测试（含端到端与回归）
+├── tests/                789 项测试（含端到端与回归）
 ├── certs/                本地 HTTPS 证书与私钥（`autolabel ca` 生成，已 gitignore）
 ├── configs/default.yaml  参数模板
 ├── configs/vlm.json      多模态大模型配置（不含明文 Key，建议不入库）
@@ -363,6 +386,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 - **地址**：`https://localhost:8765/`。想用 `https://autolabel.local:8765/` 得自己在 `/etc/hosts` 加一行 `127.0.0.1 autolabel.local`（证书里已经带上这个名字了），不加也完全能用。
 - **不想敲命令**：双击项目根目录的 `运行工作台.command`，缺证书它自己补、起服务、开浏览器，一条都不用记。
 - **多卡机器开多个实例**：`PORT=8766 DEVICE=cuda ./运行工作台.command datasets/vidtest`，或命令行 `review --port 8766 --device cuda`。启动参数只喂给这一个实例，不去改家目录那份全局设置，两块卡各跑各的互不干扰。
+- **想让它常驻**：双击 `后台服务.command`，按 `configs/后台实例.conf` 的清单注册成开机自起、崩了自动拉起的后台任务（不占终端窗口）。`--status` 看谁在跑、`--restart` 改完代码重启、`--remove` 注销。项目放在 `~/Desktop` 下要先给「终端」桌面权限，卡住时脚本会把该点哪里打出来（详见 `demo_docs/07-常见问题.md`）。
 - **`--no-ssl` 退回 HTTP**：浏览、改标签都正常，只是录不了像；除非在排查证书问题，一般用不着。
 - **同网段设备访问**：`review --host 0.0.0.0` 之后手机能用 `https://这台机器的IP:8765/`，但得把 `certs/ca.pem` 装到那台设备上，否则浏览器照样拦。
 
@@ -408,3 +432,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 **想换成自定义骨架（比如只有 9 个点）？** 当前实现固定 COCO-17（`yolo_pose.py` 的 `COCO17_KEYPOINTS` / `COCO17_FLIP_IDX` / `COCO17_SKELETON` 是唯一事实来源），改这三个常量并同步 `init --num-keypoints` 即可，`export` 会自动写入对应的 `kpt_shape` 与 `flip_idx`。
 
 **MPS 报错或结果异常？** `autolabel settings --device cpu`（或界面 `⌥S` 系统设置里选「纯 CPU」）之后整批复核一遍；单次对照仍可用 `--device cpu`；A/B 对拍时可用 `--no-flip` 排除融合带来的差异。
+
+---
+
+<sub>**关键词**：自动标注 · 半自动标注 · 数据标注工具 · 人体骨骼关键点标注 · 姿态估计标注 · 目标检测标注 · 实例分割标注 · YOLO 训练集制作 · YOLO-pose · ultralytics · COCO 17 关键点 · 视频抽帧标注 · 本地离线部署 · 不用 Docker · labelImg 替代 · LabelMe 替代 · CVAT 替代 · Label Studio 替代 · macOS / Apple Silicon / MPS / CUDA</sub>

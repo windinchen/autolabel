@@ -1,8 +1,18 @@
 # 变更记录
 
-## 2026-10-19 04:10 — 第 11–35 轮体检：图不在了要有人说、框数账要对得上、提示里的命令必须真存在
+## 2026-10-19 09:30 — 后台常驻服务搬进项目：开机自起、崩溃自拉起，顺带挖出两个只有重启才暴露的坑
 
-接着上一轮的十个视角继续逐条实测，第 11 轮做到第 35 轮：每轮都在本机造数据集 / 起服务复现，抓到才动手，没抓到就在结论里写"查过、干净"。抓到 14 个，全改完。版本号仍记 `1.2.4`——这一版还没发布、没打 tag，体检结果直接并进来，不另占一号。
+需求是「把 `/tmp` 里那两份启动脚本挪进项目，不然重启就起不来」。顺着这条线把整条后台启动链路重做了一遍——查下去发现原来那套其实扛不过一次重启。
+
+- **启动脚本进项目**：新增 `后台服务.command`（注册 / 状态 / 重启 / 注销）和 `后台实例.command`（launchd 实际调用的无界面启动器）。实例清单 `configs/后台实例.conf` 是本机偏好、不进仓库（和 `运行工作台.command` 同一条策略）。清单一行一个实例：名字 端口 数据集 设备 半精度；删掉某一行，下次注册时对应的 launchd 任务自动注销，不会留个僵尸每 10 秒重试一个已经不存在的实例。
+- **坑一 launchd 传不了中文路径**：项目目录是 `~/Desktop/项目任务/自动标注`，把启动器的绝对路径直接写进 `ProgramArguments`，任务一起来就是 `/bin/zsh: can't open input file: /Users/windinchen/Desktop/项…注/…`，退出码 127，每 10 秒重来一次。现在 plist 里只写 `~/.autolabel/services/<实例名>.sh` 一根纯 ASCII 软链，实例名是唯一入参；端口、数据集、算力由启动器每次启动现读清单，改完清单 `--restart` 就生效，不用重新注册。启动器相应改成按 `${0:P:h}`（软链解析后的真实位置）定位项目——`dirname "$0"` 在这儿会指到 `~/.autolabel/services`。
+- **坑二 macOS 不让后台任务读桌面**：`cd` 进项目没问题，但 launchd 起的进程 `ls autolabel` 直接失败。项目在 `~/Desktop` 下就归「桌面文件夹」隐私管，而后台任务不弹窗问权限，只会闷头崩。脚本现在认得出这个特征（日志里的 `can't open input file`），`install` 与 `--status` 都把两条出路写清楚：给「终端」勾桌面权限后重跑，或把项目挪出桌面；办好之前双击 `运行工作台.command`（前台进程不受这条限制）照样能用。
+- **日志不再在启动时清空**：只把超过 2MB 的旧日志滚到 `.1`。崩溃重试时最需要看到的正是上一次留下的那几行，`>` 掉等于把线索擦了。
+- **新增 `tests/test_background_service.py`（18 条）**：脚本存在且可执行、`zsh -n` 语法、两份 `--help`、清单四类非法值（中文实例名 / 端口不是数字 / 数据集不存在 / 全是注释）各有专属中文报错、`print-env` 与清单一致、plist 能被 `plistlib` 解析且 `ProgramArguments` 路径纯 ASCII、`KeepAlive`/`RunAtLoad`/`ThrottleInterval` 在位、`--dry-run` 只落文件不碰 launchd、软链能找回项目目录。全部跑在临时 `HOME` + `AUTOLABEL_SERVICE_CONF` 里，不动真机的 `~/Library/LaunchAgents`。测试计数 770 → **788**。
+
+## 2026-10-19 04:10 — 第 11–36 轮体检：图不在了要有人说、框数账要对得上、提示里的命令必须真存在
+
+接着上一轮的十个视角继续逐条实测，第 11 轮做到第 36 轮：每轮都在本机造数据集 / 起服务复现，抓到才动手，没抓到就在结论里写"查过、干净"。抓到 15 个，全改完。版本号仍记 `1.2.4`——这一版还没发布、没打 tag，体检结果直接并进来，不另占一号。
 
 - **第 11 轮 状态名拼错不再"假装执行过"（`cli._review_statuses`）**：`reset --status aprovied` 以前回一句「已退回 0 张」+ 退出码 0，用户以为跑过了。现在解析阶段就报「不认识的状态「aprovied」，可选：unreviewed、edited、approved、rejected」并以 2 结束。
 - **第 12 轮 `reset --labels` 只删真被退回的那些**：以前它无差别删光整库标签——`--status rejected --labels` 会把**已接受**样本的标签一起删掉。现在只删这次真被退回的那批，并且把索引里由标签派生的计数一起抹掉，否则 `status` 继续报「这张有 1 个人」。
@@ -18,9 +28,10 @@
 - **第 32 轮 提示让你跑一条不存在的命令**：导出空库时提示「先跑一次自动标注（命令行 `autolabel auto / annotate`）」，而 `annotate` 从来没注册过——照着敲只会得到第二次 `invalid choice`。改成 `auto 或 label`，并加了 `tests/test_hint_commands.py`：把 `autolabel/**`（含前端 JS/HTML）里所有 `autolabel <子命令>` 形式的提法抓出来，逐个比对 `build_parser()` 的真实子命令表。
 - **第 33 轮 `batches --delete-images` 的默认值骗人**：`--lib` 的默认值是 `all`，可它一路被换成空串再落到 `pose`——**「三个库都摘掉这张图」实际只摘了姿态库**，还回一句「仅姿态标注」，检测库和提示词库里那张图照旧躺着。现在 `all` 就是三个库的引用一起摘（素材文件仍由 `--mode` 决定），播报按真正动过的库来；「这张图只在别的库」也不再误报「查无此图」。
 - **第 35 轮 可重复参数一次写完 + `--keep-status` 校验**：`--delete-images a.jpg,b.jpg`、`pool --add a.jpg,b.jpg`、`batches --delete x,y`、`--keep-status rejected,edited` 都支持逗号写法（与 `detect --classes` 早就有的写法统一）；`--keep-status` 同时接入状态校验——以前 `--keep-status aprieved` 谁都匹配不上，等于没写，用户以为多留了一批。顺手把 `cmd_export` 里那份和 `_exclude_from_args()` 重复的折算逻辑合并掉。
+- **第 36 轮 模型搜索框那句自相矛盾的话（`modelhub._remote_outcome()` / `_remote_note()`）**：开着「联网搜 GitHub」但关键词还空着时，后端把「没填关键词」当成了连不上，界面回一句「联网检索不可用：没连上 GitHub（没有填写搜索关键词），下面是本地目录里的匹配结果（下面仍是本地目录结果）」——既没连过网，「本地结果」还重复了两遍。现在联网状态分成 `skipped`（没开联网）/ `needs_query`（没填关键词，一个请求都不发，不算失败）/ `ok` / `failed` 四种并由 `remote_state` 回传，只有真连不上才报「联网检索不可用」并标红，「下面是本地结果」由界面补一次。
 - **第 36 轮 把"全路由终检"变成常驻测试（新增 `tests/test_route_sweep.py`）**：以前每次终检都是一次性脚本。现在 5 个页面、20 多个只读接口、5 个坐标下载、19 条写接口垃圾参数全部定居：任何一条回 5xx 就红，报错文案里必须带中文、不许出现 `Traceback`，坐标下载必须真带上标注（不许只有表头就回 200），空库下载也要有正确文件名。
 - **查过、干净的**：缩略图缓存键含 `(相对路径, mtime_ns, 大小)`，改图会刷新、坏图回退原图、`prune_thumbs` 有兜底；前端主题/字号读 `localStorage` 有 try/catch 加白名单，四个 HTML 的内联首屏脚本同样；上传同名不覆盖（`safe_upload_name` + uuid 前缀）、超限走 413 且把请求体读干净；缺文件之后 `/image/` 与 `/thumb/` 回 404 中文说明而不是 500；`settings.resolve()` 选了 `cuda` 但这台机器没卡会降级并带回说明，`describe()` 打「[降级]」；`collect_image_files` 跳过点文件与非图片后缀，EXIF 在 `_load_rgb` 里已经 `exif_transpose`。
-- **测试 665 → 766 条**（+101，跳过 1 项仍是缺 ffmpeg）：新增 `tests/test_missing_source.py`（15 条：三种导出模式一致、不再产悬空软链、`copy` 不再抛、manifest 计数、`status`/`validate`/`coords` 都点名、检测库导出同样生效、越界路径）；`tests/test_hint_commands.py`（16 条：文案里的命令名全部真实存在）；`tests/test_route_sweep.py`（7 条）；`tests/test_reset_validate.py` 重写并扩到 16 条；`tests/test_version.py` +6（六种坏缓存值）、`tests/test_modelhub.py` +5（中文整句 / 模糊句 / 无意义句仍空 / 短词仍精确 / 超长查询词）、`tests/test_fields.py` +3（删类别后索引同步、孤儿标签不造索引、`box_counts_by_image`）、`tests/test_resource_robustness.py` +2（同秒快照排序、看不懂的文件不被删）、`tests/test_upload.py` +3（界面与命令行后缀集一致、TIFF 转 JPEG 落库、`.pdf` 仍拒）、`tests/test_batches.py` +4（`all` 三库一起摘、只在别的库也删得掉、缺图仍报错、命令行播报）、`tests/test_cli_validation.py` +5（逗号写法与状态校验）、`tests/test_library_split.py` +1（只在检测库有数据时，`status` 不再刷一行姿态库全 0）。`ruff` 全绿，5 个 JS 文件 `node --check` 全过。
+- **测试 665 → 770 条**（+105，跳过 1 项仍是缺 ffmpeg）：新增 `tests/test_missing_source.py`（15 条：三种导出模式一致、不再产悬空软链、`copy` 不再抛、manifest 计数、`status`/`validate`/`coords` 都点名、检测库导出同样生效、越界路径）；`tests/test_hint_commands.py`（16 条：文案里的命令名全部真实存在）；`tests/test_route_sweep.py`（7 条）；`tests/test_reset_validate.py` 重写并扩到 16 条；`tests/test_version.py` +6（六种坏缓存值）、`tests/test_modelhub.py` +9（中文整句 / 模糊句 / 无意义句仍空 / 短词仍精确 / 超长查询词 / 空关键词不误报断网 / 联网四态 / 失败文案不重复本地提示）、`tests/test_fields.py` +3（删类别后索引同步、孤儿标签不造索引、`box_counts_by_image`）、`tests/test_resource_robustness.py` +2（同秒快照排序、看不懂的文件不被删）、`tests/test_upload.py` +3（界面与命令行后缀集一致、TIFF 转 JPEG 落库、`.pdf` 仍拒）、`tests/test_batches.py` +4（`all` 三库一起摘、只在别的库也删得掉、缺图仍报错、命令行播报）、`tests/test_cli_validation.py` +5（逗号写法与状态校验）、`tests/test_library_split.py` +1（只在检测库有数据时，`status` 不再刷一行姿态库全 0）。`ruff` 全绿，5 个 JS 文件 `node --check` 全过。
 
 ## 2026-10-19 01:20 — 十轮体检：并发落盘不再互相截断、导出不再悄悄少帧、下载不再自己截自己
 

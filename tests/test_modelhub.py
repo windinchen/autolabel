@@ -343,8 +343,8 @@ def test_search_remote_never_raises(weights, monkeypatch, exc):
     out = modelhub.search_remote("yolo11n-seg")
     assert out["ok"] is False
     assert out["error"] and type(exc).__name__ in out["error"]
-    assert out["results"] == []
-    assert out["note"] == modelhub.REMOTE_NOTE
+    assert out["results"] == [] and out["remote_state"] == "failed"
+    assert "没连上 GitHub" in out["note"] and type(exc).__name__ in out["note"]
     assert {row["filename"] for row in out["local"]} == {
         row["filename"] for row in modelhub.search("yolo11n-seg")}
 
@@ -392,9 +392,10 @@ def test_search_remote_without_usable_items_is_not_a_failure(weights, monkeypatc
 def test_search_remote_empty_query_skips_network(weights, monkeypatch):
     monkeypatch.setattr("urllib.request.urlopen", boom_factory(AssertionError("空关键词不该联网")))
     out = modelhub.search_remote("   ")
-    assert out["ok"] is False and out["results"] == []
-    assert len(out["local"]) == len(modelhub.catalog())      # 空关键词照样给本地目录
-    assert "关键词" in out["error"]
+    assert out["ok"] is True and out["results"] == [] and out["error"] == ""
+    assert out["remote_state"] == "needs_query"               # 没输关键词不算「连不上」
+    assert len(out["local"]) == len(modelhub.catalog())       # 空关键词照样给本地目录
+    assert "关键词" in out["note"] and "没连上" not in out["note"]
 
 
 def test_github_query_appends_yolo_only_when_missing():
@@ -440,6 +441,31 @@ def test_search_payload_remote_failure_explains_and_keeps_local(weights, monkeyp
     assert out["ok"] is False
     assert type(exc).__name__ in out["error"] and "没连上" in out["note"]
     assert out["results"] == [] and all(r["task"] == "segment" for r in out["local"])
+
+
+def test_search_payload_empty_query_with_remote_on_is_not_a_failure(weights, monkeypatch):
+    """开着联网开关却没输关键词：以前会回一句「没连上 GitHub（没有填写搜索关键词）」，自相矛盾。"""
+    monkeypatch.setattr("urllib.request.urlopen", boom_factory(AssertionError("空关键词不该联网")))
+    out = modelhub.search_payload("", remote=True)
+    assert out["ok"] is True and out["error"] == "" and out["results"] == []
+    assert out["remote_state"] == "needs_query" and "没连上" not in out["note"]
+    assert "关键词" in out["note"]
+    assert len(out["local"]) == len(modelhub.catalog())
+
+
+@pytest.mark.parametrize("remote", [False, True])
+def test_search_payload_always_exposes_remote_state(weights, monkeypatch, remote):
+    monkeypatch.setattr("urllib.request.urlopen", boom_factory(OSError("offline")))
+    out = modelhub.search_payload("分割", remote=remote)
+    assert out["remote_state"] == ("failed" if remote else "skipped")
+    assert out["ok"] is not remote
+
+
+def test_search_payload_failure_note_does_not_repeat_local_hint(weights, monkeypatch):
+    monkeypatch.setattr("urllib.request.urlopen", boom_factory(OSError("offline")))
+    out = modelhub.search_payload("pose", remote=True)
+    assert out["note"] == "没连上 GitHub（OSError: offline）"
+    assert "本地目录" not in out["note"]        # 「下面是本地结果」由界面补一次就够
 
 
 def test_search_payload_local_field_shape(weights, monkeypatch):
