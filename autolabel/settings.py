@@ -37,7 +37,22 @@ DEVICE_VALUES = tuple(item["value"] for item in DEVICE_CHOICES)
 DEVICE_ARGS = DEVICE_VALUES + ("0", "1", "cuda:0", "cuda:1")
 DEVICE_LABELS = {item["value"]: item["label"] for item in DEVICE_CHOICES}
 
-DEFAULTS = {"device": "auto", "half": False}
+DEFAULTS = {"device": "auto", "half": False, "imgsz": 640, "conf": 0.25}
+
+#: 输入分辨率档位。界面上只摆这三档（命令行允许 320–1920 之间任意整数）。
+#: 这一档对能不能出框的影响比想象中大：本机实测同一张白 T 恤棚拍照，
+#: 开放词表的 ``shirt`` 在 640 上只有 0.026 分，提到 1024 变成 0.553——
+#: 同一个模型、同一张图，一边是"一个框都没有"，一边是稳稳过默认阈值。
+IMGSZ_CHOICES: Tuple[Dict[str, object], ...] = (
+    {"value": 640, "label": "640（标准）", "hint": "最快，绝大多数场景够用"},
+    {"value": 1024, "label": "1024（更细）", "hint": "服装、小物件、开放词表更容易出框，约慢 2–3 倍"},
+    {"value": 1280, "label": "1280（最细）", "hint": "只为难标的类别开，耗时和显存都明显上涨"},
+)
+IMGSZ_VALUES = tuple(item["value"] for item in IMGSZ_CHOICES)
+IMGSZ_MIN, IMGSZ_MAX = 320, 1920
+
+#: 置信度上界收在 0.95：填 1.0 等于"只收满分"，实际会把所有框都丢光
+CONF_MIN, CONF_MAX = 0.01, 0.95
 
 #: 开关类字段的合法写法。``bool("false")`` 在 Python 里是 ``True``，
 #: 所以字符串绝不能直接 ``bool()``——见 :func:`as_bool`。
@@ -69,10 +84,44 @@ def as_bool(value: object, *, default: bool = False, strict: bool = False) -> bo
         raise ValueError(f'半精度只能选「开」或「关」，现在是「{value}」')
     return default
 
+
+def as_imgsz(value: object, *, strict: bool = False) -> int:
+    """把输入分辨率读成一个能用的整数：读不懂就退回默认值。
+
+    档位不必死守界面那三个——命令行 ``--imgsz 768`` 是合理需求，所以只卡
+    区间不卡枚举。但 320 以下模型基本啥都认不出，1920 以上显存容易炸，
+    超出区间就当填错了。
+    """
+    try:
+        number = int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        number = 0
+    if not IMGSZ_MIN <= number <= IMGSZ_MAX:
+        if strict:
+            raise ValueError(f"输入分辨率只能在 {IMGSZ_MIN}–{IMGSZ_MAX} 之间，现在是「{value}」")
+        return int(DEFAULTS["imgsz"])
+    return number
+
+
+def as_conf(value: object, *, strict: bool = False) -> float:
+    """把置信度阈值读成 (0, 1) 之间的小数，读不懂就退回默认值。"""
+    try:
+        number = float(str(value).strip())
+    except (TypeError, ValueError):
+        number = -1.0
+    if not CONF_MIN <= number <= CONF_MAX:
+        if strict:
+            raise ValueError(f"置信度阈值只能在 {CONF_MIN}–{CONF_MAX} 之间，现在是「{value}」"
+                             "（填太高的症状是所有框都被丢掉，界面上看着像模型没认出东西）")
+        return float(DEFAULTS["conf"])
+    return round(number, 4)
+
 #: 启动参数 / 环境变量覆盖：想"一个实例跑一块卡"就在起服务时带上 ``review --device cuda``，
 #: 它只影响这一个进程，不改家目录里那份设置，两个实例各用各的卡互不干扰。
 ENV_DEVICE = "AUTOLABEL_DEVICE"
 ENV_HALF = "AUTOLABEL_HALF"
+ENV_IMGSZ = "AUTOLABEL_IMGSZ"
+ENV_CONF = "AUTOLABEL_CONF"
 
 #: 同一次服务里只探测一次：import torch 不算便宜，每次开菜单都探测会白等。
 _probe_cache: Optional[dict] = None
@@ -92,7 +141,9 @@ def normalize(raw: Optional[dict]) -> dict:
     if device not in DEVICE_VALUES:
         device = DEFAULTS["device"]
     half = as_bool(raw.get("half", DEFAULTS["half"]), default=DEFAULTS["half"])
-    return {"device": device, "half": half}
+    imgsz = as_imgsz(raw.get("imgsz", DEFAULTS["imgsz"]))
+    conf = as_conf(raw.get("conf", DEFAULTS["conf"]))
+    return {"device": device, "half": half, "imgsz": imgsz, "conf": conf}
 
 
 def env_override() -> dict:
@@ -107,6 +158,12 @@ def env_override() -> dict:
     raw_half = os.environ.get(ENV_HALF, "").strip()
     if raw_half:
         out["half"] = as_bool(raw_half, default=DEFAULTS["half"])
+    raw_imgsz = os.environ.get(ENV_IMGSZ, "").strip()
+    if raw_imgsz:
+        out["imgsz"] = as_imgsz(raw_imgsz)
+    raw_conf = os.environ.get(ENV_CONF, "").strip()
+    if raw_conf:
+        out["conf"] = as_conf(raw_conf)
     return out
 
 
@@ -127,6 +184,8 @@ def load(*, ignore_env: bool = False) -> dict:
         if isinstance(data, dict):
             merged["device"] = data.get("device", merged["device"])
             merged["half"] = data.get("half", merged["half"])
+            merged["imgsz"] = data.get("imgsz", merged["imgsz"])
+            merged["conf"] = data.get("conf", merged["conf"])
         merged = normalize(merged)
     if not ignore_env:
         merged.update(env_override())
@@ -134,7 +193,7 @@ def load(*, ignore_env: bool = False) -> dict:
 
 
 def save(patch: Optional[dict] = None) -> dict:
-    """改几项存回去（只认 device / half），返回存好之后的完整设置。"""
+    """改几项存回去（只认 device / half / imgsz / conf），返回存好之后的完整设置。"""
     wanted = {k: v for k, v in (patch or {}).items() if v is not None}
     if "device" in wanted:
         asked = str(wanted["device"]).strip().lower()
@@ -143,6 +202,10 @@ def save(patch: Optional[dict] = None) -> dict:
     # 半精度也要挡住：填进来一个看不懂的词，静默按"开"存下去比报错难查得多
     if "half" in wanted:
         wanted["half"] = as_bool(wanted["half"], strict=True)
+    if "imgsz" in wanted:
+        wanted["imgsz"] = as_imgsz(wanted["imgsz"], strict=True)
+    if "conf" in wanted:
+        wanted["conf"] = as_conf(wanted["conf"], strict=True)
     next_settings = normalize({**load(ignore_env=True), **wanted})
     target = path()
     os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -284,9 +347,15 @@ def resolve(requested: str = "") -> Tuple[str, str]:
 
 
 def label_defaults() -> dict:
-    """给标注任务用的兜底参数：界面任务与命令行在没显式指定时都读这里。"""
+    """给标注任务用的兜底参数：界面任务与命令行在没显式指定时都读这里。
+
+    分辨率和置信度放这儿而不是各模块自己写死，是因为它们**经常要一起调**：
+    开放词表标服装类时"降阈值 + 提分辨率"才出得来框，两处各设一处就会
+    出现"界面上改了、命令行还在用旧值"。
+    """
     saved = load()
-    return {"device": saved["device"], "half": saved["half"]}
+    return {"device": saved["device"], "half": saved["half"],
+            "imgsz": saved["imgsz"], "conf": saved["conf"]}
 
 
 def payload(probe: bool = False) -> dict:
@@ -307,7 +376,9 @@ def payload(probe: bool = False) -> dict:
         "env": {k: DEVICE_LABELS.get(v, v) if k == "device" else v for k, v in override.items()},
         "devices": devices,
         "choices": [dict(item) for item in DEVICE_CHOICES],
+        "imgsz_choices": [dict(item) for item in IMGSZ_CHOICES],
         "effective": {"device": effective, "half": running["half"], "note": note,
+                      "imgsz": running["imgsz"], "conf": running["conf"],
                       "from_env": bool(override)},
         "path": path(),
     }
@@ -319,7 +390,8 @@ def describe(raw: Optional[dict] = None) -> str:
     saved, devices = data["saved"], data["devices"]
     lines = [f"系统设置文件 {data['path']}",
              f"推理设备 {DEVICE_LABELS[saved['device']]}（{saved['device']}）",
-             f"半精度 {'开' if saved['half'] else '关'}"]
+             f"半精度 {'开' if saved['half'] else '关'}",
+             f"输入分辨率 {saved['imgsz']} · 默认置信度 {saved['conf']}"]
     usable = [devices[v]["label"] for v in DEVICE_VALUES if v != "auto" and devices[v]["available"]]
     lines.append(f"这台机器可用 {' / '.join(usable) or '只有 CPU'}")
     if saved["device"] == "auto" and devices["auto"]["names"]:

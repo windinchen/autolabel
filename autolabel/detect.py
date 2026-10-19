@@ -67,6 +67,10 @@ LIB = LIB_DETECT
 VALID_DETECT_STATUS = {STATUS_UNREVIEWED, STATUS_APPROVED, STATUS_EDITED, STATUS_REJECTED}
 #: 界面上一次最多勾多少个类别：再多数框就没什么意义了，纯粹拖慢推理
 MAX_RUN_CLASSES = 200
+#: 回收"差一点就过阈值"的候选时往下探到多少：再低就只剩噪声，报出来只会误导人
+NEAR_MISS_FLOOR = 0.01
+#: 一次最多报几个候选类别
+NEAR_MISS_TOP = 6
 #: 用户没选权重时的兜底。不能沿用 ``BackendSettings.model``——那是 ``yolo11n-pose.pt``，
 #: 拿姿态权重跑检测要等加载完才报错，而且报错不会告诉用户该换成什么。
 DEFAULT_DETECT_MODEL = "yolo11n.pt"
@@ -140,9 +144,47 @@ def detectable_models(dir_: Optional[str] = None) -> List[dict]:
     return [row for row in local_models(dir_) if row["usable"]]
 
 
+def system_settings(**overrides) -> BackendSettings:
+    """按「系统设置」那一份兜底参数建推理参数，显式传进来的覆盖它。
+
+    分辨率和置信度以前是各调用点各写各的默认值（640 / 0.25），症状是
+    界面上把分辨率调高、命令行那条路还按 640 跑，同一条命令今天出框明天不出。
+    统一从这里取之后，"默认值"这台机器上只有一个地方能改。
+    """
+    from . import settings as system
+
+    saved = system.label_defaults()
+    payload = {"device": str(saved.get("device") or "auto"),
+               "imgsz": int(saved.get("imgsz") or 640),
+               "conf": float(saved.get("conf") or 0.25),
+               "half": bool(saved.get("half"))}
+    payload.update({key: value for key, value in overrides.items() if value not in (None, "")})
+    return BackendSettings(**payload)
+
+
+def near_miss_hint(stats: dict) -> str:
+    """把"一个框都没有"翻译成能照着做的下一步。
+
+    阈值挡掉的候选以前是完全看不见的：模型其实给出了 ``shirt`` 0.026 分，
+    界面只写一句"没找到"，用户既不知道该降阈值，也不知道该换词。
+    """
+    rows = [row for row in (stats.get("near_miss") or []) if isinstance(row, dict)]
+    if not rows:
+        return ""
+    parts = " · ".join(f"{row.get('name')} {float(row.get('score') or 0):.3f}" for row in rows[:3])
+    conf = stats.get("conf")
+    line = f"这些类别差一点就过阈值：{parts}" + (f"（当前阈值 {conf}）" if conf else "")
+    best = float(rows[0].get("score") or 0)
+    if conf and best < float(conf):
+        suggest = max(NEAR_MISS_FLOOR, round(best, 3) - 0.001)
+        line += (f"——把置信度降到 {suggest:g}，或把输入分辨率提到 1024 再跑一次；"
+                 "服装、配件这类目标本来就分低，词也尽量用 shirt / hat / shoes 这种常见英文名")
+    return line
+
+
 def model_profile(model: str, device: str = "", dir_: Optional[str] = None) -> dict:
     """加载权重并回报它是什么任务、认得出哪些类（第一次加载会下载权重，慢）。"""
-    settings = BackendSettings(model=resolve_model(model), device=device or "auto")
+    settings = system_settings(model=resolve_model(model), device=device or "auto")
     backend = _backend(settings, dir_)
     described = backend.describe()
     described["classes"] = [{"class_id": cid, "name": name, "label": zh_for(name) or name}
@@ -324,7 +366,8 @@ def save_prefs(root: str, *, model: str = "", classes: Optional[Sequence[str]] =
 # --------------------------------------------------------------------------- #
 
 def label_image(root: str, image_rel: str, backend: DetectionBackend,
-                pairs: Sequence[Tuple[dict, int]], conf: Optional[float] = None) -> dict:
+                pairs: Sequence[Tuple[dict, int]], conf: Optional[float] = None,
+                floor: Optional[float] = NEAR_MISS_FLOOR) -> dict:
     """跑一张图：模型出的类别号换成本库类别号，再打质量标记。"""
     from .dataset import resolve_image
 
@@ -334,10 +377,18 @@ def label_image(root: str, image_rel: str, backend: DetectionBackend,
     # _load_rgb 给的是 PIL 图，检测后端要的是 numpy（RGB），中间这步不能省
     image = np.asarray(_load_rgb(source), dtype=np.uint8)
     wanted = [int(model_id) for _row, model_id in pairs]
-    found = backend.predict(image, class_ids=wanted, conf=conf)
+    found = backend.predict(image, class_ids=wanted, conf=conf, floor=floor)
     # 模型类别号 -> 本库类别号（同名类别永不换号，全靠这张表）
     to_local = {int(model_id): int(row.get("class_id", -1)) for row, model_id in pairs}
     labels = {int(model_id): str(row.get("name", "")) for row, model_id in pairs}
+    # 没过阈值的候选不进标注，只留个"类别名 + 分数"给上层解释为什么没框
+    missed: Dict[str, float] = {}
+    for item in found:
+        if not getattr(item, "near_miss", False):
+            continue
+        name = labels.get(int(item.class_id)) or str(item.class_name)
+        missed[name] = max(missed.get(name, 0.0), float(item.score))
+    found = [item for item in found if not getattr(item, "near_miss", False)]
     detections: List[Detection] = []
     for item in found:
         cls = to_local.get(int(item.class_id), -1)
@@ -350,6 +401,8 @@ def label_image(root: str, image_rel: str, backend: DetectionBackend,
     return {"detections": detections, "model": os.path.basename(backend.model_name),
             "model_classes": sorted({labels.get(int(item.class_id), item.class_name)
                                      for item in found}),
+            "near_miss": [{"name": name, "score": round(score, 4)}
+                          for name, score in sorted(missed.items(), key=lambda kv: -kv[1])],
             "raw": len(found)}
 
 
@@ -363,6 +416,7 @@ def run_detect_labeling(
     overwrite: bool = False,
     device: str = "",
     conf: Optional[float] = None,
+    imgsz: Optional[int] = None,
     settings: Optional[BackendSettings] = None,
     progress: Optional[Callable[[int, int], None]] = None,
     should_stop: Optional[Callable[[], bool]] = None,
@@ -394,10 +448,10 @@ def run_detect_labeling(
                          f"先入库再标：autolabel import <数据集> --lib {LIB} <图片>，"
                          f"或在界面「{lib_name(LIB)}」里上传")
 
-    base = settings or BackendSettings()
+    base = settings or system_settings()
     resolved = BackendSettings(model=matched["model"], device=device or base.device,
-                               imgsz=base.imgsz, max_det=base.max_det, iou=base.iou,
-                               half=base.half,
+                               imgsz=int(imgsz) if imgsz else base.imgsz,
+                               max_det=base.max_det, iou=base.iou, half=base.half,
                                conf=float(conf) if conf is not None else base.conf)
     backend = _backend(resolved)
     if matched.get("open_vocab"):
@@ -440,11 +494,14 @@ def run_detect_labeling(
              "unknown_images": unknown,
              "classes": sorted(known_names), "model": matched["model"],
              "task": matched["task"], "task_name": matched["task_name"],
-             "device": matched["device"], "conf": resolved.conf, "last_error": "",
+             "device": matched["device"], "conf": resolved.conf, "imgsz": resolved.imgsz,
+             "near_miss": [], "last_error": "",
              "open_vocab": matched.get("open_vocab", ""), "vocab": matched.get("vocab", [])}
     if matched["missing"] and verbose:
         print(f"[warn] 这个模型认不出：{'、'.join(matched['missing'])}（这些类别本次不产出框）")
 
+    near_best: Dict[str, float] = {}
+    produced: set = set()
     for done, rel in enumerate(targets, start=1):
         if should_stop and should_stop():
             stats["skipped"] += len(targets) - done + 1
@@ -465,6 +522,11 @@ def run_detect_labeling(
                 progress(done, len(targets))
             continue
         detections = result["detections"]
+        produced.update(str(name) for name in (result.get("model_classes") or []))
+        for row in result.get("near_miss") or []:
+            name = str(row.get("name") or "")
+            if name:
+                near_best[name] = max(near_best.get(name, 0.0), float(row.get("score") or 0))
         per_box = box_flags(detections, int(item.get("width") or 0),
                             int(item.get("height") or 0), local_ids)
         write_detections(root, rel, detections, LIB)
@@ -496,6 +558,10 @@ def run_detect_labeling(
         if progress:
             progress(done, len(targets))
 
+    # 已经出过框的类别不算"差一点"：那说明词是对的，只是某些图上没有
+    stats["near_miss"] = [{"name": name, "score": round(score, 4)}
+                          for name, score in sorted(near_best.items(), key=lambda kv: -kv[1])
+                          if name not in produced][:NEAR_MISS_TOP]
     if stats["failed"] and stats["labeled"] == 0:
         raise RuntimeError(f"{stats['failed']} 张全部失败，最后一条错误：{stats['last_error'] or '未知'}")
     save_prefs(root, model=matched["model"], classes=stats["classes"], conf=resolved.conf)
@@ -554,6 +620,6 @@ __all__ = [
     "detectable_models", "export_detect_dataset", "label_image", "load_prefs",
     "DEFAULT_DETECT_MODEL", "local_models", "match_model_classes", "model_profile",
     "pick_classes", "prefs_path", "read_detect_detections", "render_detect_coords",
-    "resolve_model", "run_detect_labeling", "save_prefs",
+    "near_miss_hint", "resolve_model", "run_detect_labeling", "save_prefs", "system_settings",
     "signature_for", "task_of", "write_detect_coordinate_files",
 ]

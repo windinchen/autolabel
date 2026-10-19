@@ -77,7 +77,7 @@ def probe_off(monkeypatch):
 # --------------------------------------------------------------------------- //
 
 def test_missing_file_falls_back_to_defaults():
-    assert system.load() == {"device": "auto", "half": False}
+    assert system.load() == {"device": "auto", "half": False, "imgsz": 640, "conf": 0.25}
     assert not os.path.exists(system.path())
 
 
@@ -88,10 +88,11 @@ def test_settings_file_is_the_machine_one_not_the_dataset(tmp_path, monkeypatch)
     assert system.path() == os.path.join(str(tmp_path), ".autolabel", "settings.json")
 
 
-def test_save_writes_only_the_two_known_keys():
-    system.save({"device": "cpu", "half": True, "顺手塞进来的": "x"})
+def test_save_writes_only_the_known_keys():
+    system.save({"device": "cpu", "half": True, "imgsz": 1024, "conf": 0.05,
+                 "顺手塞进来的": "x"})
     with open(system.path(), encoding="utf-8") as fh:
-        assert json.load(fh) == {"device": "cpu", "half": True}
+        assert json.load(fh) == {"device": "cpu", "half": True, "imgsz": 1024, "conf": 0.05}
 
 
 def test_unknown_device_is_refused_with_the_choices_listed():
@@ -112,7 +113,7 @@ def test_broken_file_does_not_take_the_whole_ui_down(monkeypatch):
     os.makedirs(os.path.dirname(system.path()), exist_ok=True)
     with open(system.path(), "w", encoding="utf-8") as fh:
         fh.write("{这文件被谁改坏了")
-    assert system.load() == {"device": "auto", "half": False}
+    assert system.load() == {"device": "auto", "half": False, "imgsz": 640, "conf": 0.25}
 
 
 # --------------------------------------------------------------------------- //
@@ -316,8 +317,9 @@ def test_settings_api_round_trip(server, probe_off):
     base, _store = server
     status, data = get(base, "/api/settings")
     assert status == 200
-    assert data["saved"] == {"device": "auto", "half": False}
+    assert data["saved"] == {"device": "auto", "half": False, "imgsz": 640, "conf": 0.25}
     assert [c["value"] for c in data["choices"]] == ["auto", "cuda", "mps", "cpu"]
+    assert [c["value"] for c in data["imgsz_choices"]] == [640, 1024, 1280]
 
     status, data = post(base, "/api/settings", {"device": "cpu"})
     assert status == 200 and data["saved"]["device"] == "cpu"

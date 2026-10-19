@@ -823,7 +823,7 @@ footer #hint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; whi
 }
 
 /* -------------------------------------------------------------------------- */
-/* 系统设置（⌥S）：白天/夜晚、字号 + 推理算力。分段选择器外观、字号两处共用        */
+/* 系统设置（⌥S）：白天/夜晚、字号 + 推理参数。分段选择器外观、字号两处共用        */
 /* -------------------------------------------------------------------------- */
 #settings-modal .modal-card { width: min(760px, 94vw); }
 .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s3) var(--s5); }
@@ -846,6 +846,12 @@ footer #hint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; whi
   margin-top: var(--s3); }
 .set-name { display: flex; flex-direction: column; gap: 2px; font-size: calc(13px * var(--fs));
   color: var(--ink); min-width: 0; }
+.set-num {
+  flex: 0 0 auto; width: 88px; min-height: 28px; padding: 2px 8px;
+  font-size: calc(12px * var(--fs)); color: var(--ink);
+  background: var(--surface-2); border: 1px solid var(--hairline); border-radius: var(--r4);
+}
+.set-num:focus { outline: none; border-color: color-mix(in srgb, var(--amber) 48%, transparent); }
 .set-note { margin-top: var(--s2); line-height: 1.6; }
 .set-note.warn { color: var(--amber); }
 .set-note.ok { color: var(--jade); }

@@ -652,17 +652,20 @@ class JobStore:
         if isinstance(wanted, str):
             wanted = [item.strip() for item in wanted.split(",") if item.strip()]
         device = str(job.params.get("device") or "") or system.label_defaults().get("device", "")
-        conf = job.params.get("conf")
-        return model, [str(item) for item in wanted], device, (float(conf) if conf not in (None, "") else None)
+        conf, imgsz = job.params.get("conf"), job.params.get("imgsz")
+        return {"model": model, "classes": [str(item) for item in wanted], "device": device,
+                "conf": float(conf) if conf not in (None, "") else None,
+                # 没显式指定就留空：让检测层去读「系统设置」，别在这里替它写死 640
+                "imgsz": int(imgsz) if imgsz not in (None, "") else None}
 
-    def _detect_label(self, job: Job, model: str, classes: Sequence[str], device: str,
-                      conf: Optional[float], images: Optional[List[str]] = None) -> dict:
+    def _detect_label(self, job: Job, targets: dict, images: Optional[List[str]] = None) -> dict:
         from . import detect
 
-        targets = list(images) if images is not None else (list(job.files) or None)
+        files = list(images) if images is not None else (list(job.files) or None)
         return detect.run_detect_labeling(
-            self.root, model=model, classes=list(classes), images=targets,
-            overwrite=bool(job.params.get("overwrite")), device=device, conf=conf,
+            self.root, model=targets["model"], classes=list(targets["classes"]), images=files,
+            overwrite=bool(job.params.get("overwrite")), device=targets["device"],
+            conf=targets["conf"], imgsz=targets["imgsz"],
             progress=self._progress_writer(job),
             should_stop=lambda: bool(job.cancel_requested), verbose=False)
 
@@ -687,18 +690,24 @@ class JobStore:
             parts.append(f"{stats['failed']} 张推理失败")
         if stats.get("missing_classes"):
             parts.append(f"该权重认不出 {'、'.join(str(x) for x in stats['missing_classes'])}")
+        from . import detect as detect_module
+
+        hint = detect_module.near_miss_hint(stats)
+        if hint:
+            parts.append(hint)
         return "完成：" + "；".join(parts)
 
     def _run_detect(self, job: Job) -> None:
         """已入库的图批量跑目标检测：不导入、不跑姿态，产出只进 ``detect_labels/``。"""
-        model, classes, device, conf = self._detect_targets(job)
+        targets = self._detect_targets(job)
+        model, classes = targets["model"], targets["classes"]
         total = len(job.files)
         names = "、".join(classes) or "（本库类别表里全部）"
         job.set_stage("labeling",
                       f"用 {os.path.basename(model)} 标注【{names}】，共 {total} 张"
                       f"（本地推理，比多模态大模型快得多）0/{total}",
                       done=0, total=total)
-        stats = self._detect_label(job, model, classes, device, conf)
+        stats = self._detect_label(job, targets)
         self._check(job)
         job.set_stage("coords", "生成坐标文件")
         coords = self._detect_coords(job)
@@ -727,7 +736,8 @@ class JobStore:
 
         self._check(job)
         stats = {"labeled": 0, "boxes": 0, "failed": 0, "protected": 0, "missing_classes": []}
-        model, classes, device, conf = self._detect_targets(job)
+        targets = self._detect_targets(job)
+        model, classes = targets["model"], targets["classes"]
         names = "、".join(classes) or "（本库类别表里全部）"
         if job.params.get("label", True):
             def progress(done: int, total: int) -> None:
@@ -738,7 +748,7 @@ class JobStore:
                           f"用 {os.path.basename(model)} 标注【{names}】，共 {len(rels)} 张"
                           f"（本地推理，比多模态大模型快得多）0/{len(rels)}",
                           done=0, total=len(rels))
-            stats = self._detect_label(job, model, classes, device, conf, images=rels)
+            stats = self._detect_label(job, targets, images=rels)
             self._check(job)
 
         job.set_stage("coords", "生成检测框坐标文件")

@@ -264,8 +264,8 @@ def test_saving_from_the_review_page_keeps_the_polygon(seg_ds):
 class SegmentBackend(FakeBackend):
     """分割权重替身：每个框都带一个三角形轮廓。"""
 
-    def predict(self, image, class_ids=(), conf=None):
-        found = super().predict(image, class_ids=class_ids, conf=conf)
+    def predict(self, image, class_ids=(), conf=None, floor=None):
+        found = super().predict(image, class_ids=class_ids, conf=conf, floor=floor)
         for item in found:
             item.poly = [item.cx - 0.09, item.cy - 0.14, item.cx + 0.09, item.cy - 0.12,
                          item.cx, item.cy + 0.14]
@@ -317,8 +317,8 @@ def test_export_without_outlines_is_unchanged(seg_ds, monkeypatch):
 def test_mixed_export_labels_both_kinds(seg_ds, monkeypatch):
     """一半有轮廓一半没有：两种行都能进分割训练，但口径必须在结果里说清。"""
     class HalfBackend(SegmentBackend):
-        def predict(self, image, class_ids=(), conf=None):
-            found = super().predict(image, class_ids=class_ids, conf=conf)
+        def predict(self, image, class_ids=(), conf=None, floor=None):
+            found = super().predict(image, class_ids=class_ids, conf=conf, floor=floor)
             for position, item in enumerate(found):
                 if position % 2:
                     item.poly = []

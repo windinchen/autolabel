@@ -12,7 +12,7 @@ import unicodedata
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .backends import BackendSettings
-from .settings import DEVICE_ARGS
+from .settings import DEVICE_ARGS, IMGSZ_MIN, IMGSZ_VALUES
 from . import __version__
 from . import platform_utils
 from .dataset import (
@@ -375,6 +375,10 @@ def cmd_settings(args: argparse.Namespace) -> int:
         patch["device"] = args.device
     if args.half is not None:
         patch["half"] = args.half
+    if args.imgsz is not None:
+        patch["imgsz"] = args.imgsz
+    if args.conf is not None:
+        patch["conf"] = args.conf
     if args.reset:
         patch = dict(system.DEFAULTS)
     if patch:
@@ -385,6 +389,7 @@ def cmd_settings(args: argparse.Namespace) -> int:
             return 1
         print(f"[ok] 系统设置已存到 {system.path()}")
         print(f"     推理设备 {system.DEVICE_LABELS[saved['device']]} · 半精度 {'开' if saved['half'] else '关'}")
+        print(f"     输入分辨率 {saved['imgsz']} · 默认置信度 {saved['conf']}")
         print("     界面「系统设置」和命令行用的是同一份，改完即生效（正在跑的任务下次启动才算）")
         if args.device and args.device != "auto":
             facts = system.detect(force=True).get(args.device, {})
@@ -1268,8 +1273,8 @@ def cmd_detect(args: argparse.Namespace) -> int:
                                                            f"{len(registry)} 类"),
                          kind="detect", source="cli", lib=LIB_DETECT,
                          params={"model": os.path.basename(model), "detect_classes": classes,
-                                 "conf": args.conf, "overwrite": args.overwrite,
-                                 "targets": len(images)},
+                                 "conf": args.conf, "imgsz": args.imgsz,
+                                 "overwrite": args.overwrite, "targets": len(images)},
                          uploads=[os.path.basename(model)])
     print(f"[info] 用 {os.path.basename(model)} 标 {len(registry)} 个类别"
           f"（本地推理，不联网，比多模态大模型快得多）")
@@ -1277,13 +1282,17 @@ def cmd_detect(args: argparse.Namespace) -> int:
         stats = detector.run_detect_labeling(args.dataset, model=model, classes=classes,
                                             images=images or None, limit=args.limit or 0,
                                             overwrite=args.overwrite, device=args.device or "",
-                                            conf=args.conf, verbose=not args.quiet)
+                                            conf=args.conf, imgsz=args.imgsz,
+                                            verbose=not args.quiet)
     except Exception as exc:  # noqa: BLE001 批次要留下失败原因，界面里才看得见
         finish_batch(args.dataset, batch["id"], "failed", str(exc))
         raise
     if stats.get("missing_classes"):
         print(f"[warn] 该权重认不出 {'、'.join(stats['missing_classes'][:10])}："
               "这些类别本次不产出框，换权重或在类别表里改掉")
+    hint = detector.near_miss_hint(stats)
+    if hint:
+        print(f"[hint] {hint}")
     if args.coords:
         from .detect import write_detect_coordinate_files
 
@@ -1808,12 +1817,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="升版本号并写回，默认 patch（+0.01）")
     p.set_defaults(func=cmd_version)
 
-    p = sub.add_parser("settings", help="看/改系统设置：推理设备（CUDA / Apple 加速 / CPU）、半精度")
+    p = sub.add_parser("settings", help="看/改系统设置：推理设备（CUDA / Apple 加速 / CPU）、"
+                                        "半精度、输入分辨率、默认置信度")
     p.add_argument("--device", choices=list(DEVICE_ARGS), help="推理用哪块算力")
+    p.add_argument("--imgsz", type=_positive_int, metavar="分辨率",
+                   help=f"输入分辨率，界面给的是 {' / '.join(str(v) for v in IMGSZ_VALUES)}，"
+                        f"命令行允许 {IMGSZ_MIN} 以上的整数；提高它换的是更慢但更容易出框")
+    p.add_argument("--conf", type=_fraction, metavar="阈值",
+                   help="默认置信度阈值，标注任务没显式指定时用这一档")
     half_group = p.add_mutually_exclusive_group()
     half_group.add_argument("--half", action="store_true", default=None, help="开半精度（只有 NVIDIA 显卡提速）")
     half_group.add_argument("--no-half", dest="half", action="store_false", help="关半精度")
-    p.add_argument("--reset", action="store_true", help="恢复默认（自动选择 + 关半精度）")
+    p.add_argument("--reset", action="store_true",
+                   help="恢复默认（自动选择 + 关半精度 + 分辨率 640 + 置信度 0.25）")
     p.add_argument("--json", action="store_true", help="连探测结果一起打 JSON")
     p.set_defaults(func=cmd_settings)
 
@@ -1984,6 +2000,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", choices=list(DEVICE_ARGS), default="",
                    help="推理算力，默认用「系统设置」里那档；0、1 指定第几块 N 卡")
     p.add_argument("--conf", type=_fraction, default=None, help="置信度阈值，默认用系统设置里的值")
+    p.add_argument("--imgsz", type=_positive_int, default=None,
+                   help="输入分辨率，默认用「系统设置」里那档；开放词表标服装/小物件时提到 1024 更容易出框")
     p.add_argument("--limit", type=_non_negative_int, default=0, help="只标前 N 张，用于试跑")
     p.add_argument("--overwrite", action="store_true",
                    help="已经标过的也重标（默认跳过同参数已标的、人工接受过的、人工画过框的图）")

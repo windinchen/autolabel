@@ -192,7 +192,7 @@ class FakeWorldBackend:
         self.names = {index: word for index, word in enumerate(self.vocab)}
         return dict(self.names)
 
-    def predict(self, image, class_ids=(), conf=None):
+    def predict(self, image, class_ids=(), conf=None, floor=None):
         wanted = [int(value) for value in class_ids] if class_ids else sorted(self.names)
         self.requests.append((tuple(wanted), conf))
         return [Detection(class_id=value, class_name=self.names[value], score=0.7,

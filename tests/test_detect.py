@@ -40,16 +40,19 @@ class FakeBackend:
     def class_names(self):
         return dict(self.names)
 
-    def predict(self, image, class_ids=(), conf=None):
+    def predict(self, image, class_ids=(), conf=None, floor=None):
+        """``floor`` 与真实后端同口径：给了就把没过 ``conf`` 的候选一起交回去。"""
         wanted = [int(value) for value in class_ids] if class_ids else sorted(self.names)
         self.requests.append((tuple(wanted), conf))
+        missed = (floor is not None and conf is not None and self.score < conf)
         found = []
         for offset, class_id in enumerate(wanted):
             if class_id not in self.names:
                 continue
             found.append(Detection(class_id=class_id, class_name=self.names[class_id],
                                    score=self.score, cx=0.1 + 0.1 * offset, cy=0.5,
-                                   w=0.2, h=0.3, has_mask=(self.task == "segment")))
+                                   w=0.2, h=0.3, has_mask=(self.task == "segment"),
+                                   near_miss=missed))
         return found
 
 

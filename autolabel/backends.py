@@ -673,6 +673,8 @@ class Detection:
     has_mask: bool = False
     #: 分割权重的轮廓，归一化 ``[x1, y1, x2, y2, ...]``；普通检测框为空
     poly: List[float] = field(default_factory=list)
+    #: 差一点过阈值的候选（只在调用方给了 ``floor`` 时出现），不落盘、不进统计
+    near_miss: bool = False
 
     def as_row(self) -> List[float]:
         return [float(self.class_id), self.cx, self.cy, self.w, self.h]
@@ -872,13 +874,25 @@ class DetectionBackend:
 
     # --- 推理 ---
     def predict(self, image: np.ndarray, class_ids: Sequence[int] = (),
-                conf: Optional[float] = None) -> List[Detection]:
-        """跑一张图；``class_ids`` 非空时把筛选下推给模型（比事后丢弃省时间）。"""
+                conf: Optional[float] = None,
+                floor: Optional[float] = None) -> List[Detection]:
+        """跑一张图；``class_ids`` 非空时把筛选下推给模型（比事后丢弃省时间）。
+
+        ``floor`` 是"差一点就够"的下限：给了它，模型就按 ``min(conf, floor)`` 跑，
+        返回值里连没过 ``conf`` 的候选一起给回来（``near_miss=True``）。
+        阈值过滤挪到调用方，为的是能回答"为什么一个框都没有"——本机实测
+        开放词表在一张白 T 恤照上给了 ``shirt`` 0.026 分，只看最终结果的人
+        永远不知道该去降阈值或换词，界面只会冷冷写一句"没找到"。
+        过线的框与不传 ``floor`` 时完全一致：NMS 只用高分框压掉重叠的低分框，
+        多喂进来的低分候选不会反过来动摇高分框。
+        """
         model = self.load()
         wanted = [int(v) for v in class_ids] if class_ids else None
         if wanted == []:
             return []
-        kwargs = dict(imgsz=self.settings.imgsz, conf=self.settings.conf if conf is None else conf,
+        threshold = float(self.settings.conf if conf is None else conf)
+        run_conf = threshold if floor is None else min(threshold, max(0.001, float(floor)))
+        kwargs = dict(imgsz=self.settings.imgsz, conf=run_conf,
                       iou=self.settings.iou, max_det=self.settings.max_det,
                       device=self._device, verbose=False)
         # 8.4 起 predict 里传 half 会喊弃用：关着的时候干脆别传
@@ -916,13 +930,19 @@ class DetectionBackend:
                    max(0.0, x2 - x1) / max(1.0, width), max(0.0, y2 - y1) / max(1.0, height))
             rows.append(box)
             slots.append(i)
+            score = float(boxes.conf[i])
             out.append(Detection(
-                class_id=class_id, class_name=name, score=float(boxes.conf[i]),
-                cx=box[0], cy=box[1], w=box[2], h=box[3], has_mask=has_mask))
+                class_id=class_id, class_name=name, score=score,
+                cx=box[0], cy=box[1], w=box[2], h=box[3], has_mask=has_mask,
+                near_miss=score < threshold))
         if has_mask:
-            # 逐框贴轮廓：mask_polygons 的返回值与框一一对齐，对不上框的那几个留空
-            for position, points in enumerate(mask_polygons(result, slots, rows)):
-                if position < len(out):
+            # 逐框贴轮廓：mask_polygons 的返回值与框一一对齐，对不上框的那几个留空。
+            # 只为过线的框算——开放词表把阈值压到 0.01 时低分候选能有一大摞，
+            # 给它们逐个找轮廓纯属白烧算力
+            kept = [position for position, det in enumerate(out) if not det.near_miss]
+            if kept:
+                found = mask_polygons(result, [slots[i] for i in kept], [rows[i] for i in kept])
+                for position, points in zip(kept, found):
                     out[position].poly = points
         return out
 

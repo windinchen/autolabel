@@ -232,7 +232,7 @@ function buildSettingsModal() {
   wrap.className = "modal hidden";
   wrap.innerHTML = `
 <div class="modal-card">
-  <div class="modal-title">系统设置<span class="muted small"> · 界面外观存这台浏览器，推理算力存这台机器</span></div>
+  <div class="modal-title">系统设置<span class="muted small"> · 界面外观存这台浏览器，推理参数存这台机器</span></div>
   <div class="settings-grid">
     <section>
       <div class="panel-title">界面外观</div>
@@ -243,13 +243,19 @@ function buildSettingsModal() {
       <div class="set-note muted small">点一下就生效，不用保存；只影响这个浏览器，不会写进数据集。</div>
     </section>
     <section>
-      <div class="panel-title">推理算力</div>
+      <div class="panel-title">推理参数</div>
       <div class="set-note muted small">标注跑在哪块卡上。选了这台机器没有的设备不会报错，跑的时候自动降级并说明原因。</div>
       <div class="set-note muted small" id="set-env" hidden></div>
       <div id="set-devices"></div>
       <div class="set-row">
         <span class="set-name">半精度加速<span class="muted small">只有 NVIDIA 显卡提速，CPU 上会自动按普通精度跑</span></span>
         <button class="switch" id="set-half" type="button" role="switch" aria-checked="false"><span></span></button>
+      </div>
+      <div class="set-row"><span class="set-name">输入分辨率<span class="muted small">越大越容易检出小目标与服装类，代价是更慢</span></span></div>
+      <div class="seg" id="set-imgsz"></div>
+      <div class="set-row">
+        <span class="set-name">默认置信度<span class="muted small">低于这个分数的框直接丢掉，标服装/配件时调低它</span></span>
+        <input class="set-num mono" id="set-conf" type="number" min="0.01" max="0.95" step="0.01" inputmode="decimal">
       </div>
       <div class="set-note muted small" id="set-openvocab" hidden></div>
       <div class="set-note muted small" id="set-status">读取中…</div>
@@ -263,6 +269,10 @@ function buildSettingsModal() {
   $("set-close").onclick = () => openSettings(false);
   $("set-refresh").onclick = () => loadSettings(true);
   $("set-half").onclick = () => saveSettings({ half: !settingsSaved().half });
+  // 置信度是打字输入的：失焦或回车才存，边打字边存会每敲一位就发一次请求
+  const confInput = $("set-conf");
+  confInput.onchange = () => saveSettings({ conf: confInput.value });
+  confInput.onkeydown = (e) => { if (e.key === "Enter") { confInput.blur(); } };
   wrap.addEventListener("click", (e) => { if (e.target === wrap) { openSettings(false); } });
   return wrap;
 }
@@ -273,6 +283,15 @@ function setSettingsStatus(text, kind) {
   el.textContent = text;
   el.classList.toggle("warn", kind === "warn");
   el.classList.toggle("ok", kind === "ok");
+}
+
+/** 推理参数的一行摘要：分辨率与置信度是"为什么没框"的第一现场，得常驻显示。 */
+function inferenceSummary(saved) {
+  const data = saved || {};
+  const bits = [];
+  if (data.imgsz != null) { bits.push("分辨率 " + data.imgsz); }
+  if (data.conf != null) { bits.push("置信度 " + data.conf); }
+  return bits.length ? " · " + bits.join(" · ") : "";
 }
 
 /** 分段选择器（外观 / 字号）与设备清单一并刷新；面板没建就直接跳过。 */
@@ -295,6 +314,13 @@ function renderSettingsPanel() {
   };
   seg("set-theme", THEME_CHOICES, appearance.theme, setThemePref);
   seg("set-font", FONT_CHOICES, appearance.fs, setFontStep);
+  seg("set-imgsz", (settingsState.data || {}).imgsz_choices || [], settingsSaved().imgsz,
+    (value) => saveSettings({ imgsz: value }));
+  const confBox = $("set-conf");
+  // 正在这个框里打字时别把用户刚敲的数字盖回去
+  if (confBox && document.activeElement !== confBox) {
+    confBox.value = settingsSaved().conf == null ? "" : settingsSaved().conf;
+  }
   renderDeviceRows();
   const half = $("set-half");
   if (half) {
@@ -338,6 +364,8 @@ function renderDeviceRows() {
     const parts = [];
     if (env.device) { parts.push(`推理设备被启动参数指定为「${env.device}」`); }
     if (typeof env.half === "boolean") { parts.push(`半精度被指定为「${env.half ? "开" : "关"}」`); }
+    if (env.imgsz) { parts.push(`输入分辨率被指定为「${env.imgsz}」`); }
+    if (typeof env.conf === "number") { parts.push(`默认置信度被指定为「${env.conf}」`); }
     envNote.hidden = !parts.length;
     envNote.textContent = parts.length
       ? `${parts.join("，")}：这个实例以它为准，在这里改动只对其它实例生效`
@@ -388,7 +416,7 @@ async function saveSettings(patch) {
       toast(data.note, true);
     } else {
       setSettingsStatus("已保存 · " + deviceLabel(saved.device)
-        + " · 半精度" + (saved.half ? "开" : "关"), "ok");
+        + " · 半精度" + (saved.half ? "开" : "关") + inferenceSummary(saved), "ok");
     }
   } catch (err) {
     setSettingsStatus("保存失败：" + err.message, "warn");
@@ -408,7 +436,7 @@ async function loadSettings(probe) {
     const saved = settingsSaved();
     const note = ((settingsState.data || {}).effective || {}).note || "";
     setSettingsStatus("当前：" + deviceLabel(saved.device) + " · 半精度" + (saved.half ? "开" : "关")
-      + (note ? " · " + note : ""), note ? "warn" : "");
+      + inferenceSummary(saved) + (note ? " · " + note : ""), note ? "warn" : "");
   } catch (err) {
     setSettingsStatus("读不到系统设置：" + err.message, "warn");
   } finally {
@@ -440,7 +468,7 @@ function appearanceCommands() {
     { label: "字号放大一档", tag: "字号", key: "⌥=", run: () => said("字号「" + stepFont(1).label + "」") }
       ,
     { label: "字号缩小一档", tag: "字号", key: "⌥-", run: () => said("字号「" + stepFont(-1).label + "」") },
-    { label: "打开系统设置（外观 / 推理算力）", tag: "设置", key: "⌥S", run: () => openSettings(true) },
+    { label: "打开系统设置（外观 / 推理参数）", tag: "设置", key: "⌥S", run: () => openSettings(true) },
     { label: "推理设备：改用 Apple 加速（MPS）", tag: "设置", run: () => saveSettings({ device: "mps" }) },
     { label: "推理设备：改用 NVIDIA 显卡（CUDA）", tag: "设置", run: () => saveSettings({ device: "cuda" }) },
     { label: "推理设备：改用纯 CPU", tag: "设置", run: () => saveSettings({ device: "cpu" }) },

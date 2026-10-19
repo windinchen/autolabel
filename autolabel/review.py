@@ -828,6 +828,12 @@ class ReviewStore:
         conf = None
         if payload.get("conf") not in (None, ""):
             conf = self._number(payload, "conf", 0.25, 0.0, 1.0, "置信度阈值")
+        # 分辨率不在这个面板上，由「系统设置」统一管；这里只接受显式传来的值，
+        # 并且按系统设置同一套区间校验，免得界面与命令行两套口径
+        from . import settings as system
+
+        imgsz = (system.as_imgsz(payload.get("imgsz"), strict=True)
+                 if payload.get("imgsz") not in (None, "") else None)
         if limit > 0:
             images = images[:limit]
         if not images:
@@ -837,6 +843,8 @@ class ReviewStore:
                   "batch_name": str(payload.get("batch_name") or "")[:80]}
         if conf is not None:
             params["conf"] = conf
+        if imgsz is not None:
+            params["imgsz"] = imgsz
         if payload.get("device"):
             params["device"] = str(payload.get("device"))
         job = self.jobs.submit("detect", images, params)
@@ -930,7 +938,8 @@ class ReviewStore:
         """存系统设置，并把「选了但用不了」当场说清楚，别等跑任务才发现。"""
         from . import settings as system
 
-        saved = system.save({k: payload.get(k) for k in ("device", "half") if k in payload})
+        saved = system.save({k: payload.get(k)
+                             for k in ("device", "half", "imgsz", "conf") if k in payload})
         facts = system.detect().get(saved["device"], {})
         note = ""
         if saved["device"] not in ("auto", "cpu") and facts and not facts.get("available"):
