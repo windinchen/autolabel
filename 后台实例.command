@@ -11,8 +11,8 @@
 # 为什么 plist 里不直接写本脚本的路径：这个项目目录带中文，而 launchd 把
 # ProgramArguments 里的非 ASCII 路径传成乱码（/bin/zsh: can't open input file:
 # /Users/…/项…注/…），任务会每 10 秒崩一次。所以 plist 只写 ~/.autolabel/services/
-# <名字>.sh 这根纯 ASCII 软链，由它指回本脚本——因此下面必须按"软链解析后的真实
-# 位置"定位项目目录（${0:P:h}），dirname "$0" 在这儿会指到 ~/.autolabel/services。
+# <名字>.sh 这个纯 ASCII 启动片，由它再交给本脚本——所以本脚本不管被软链还是
+# 副本调起来，都得按"解析后的真实位置"定位项目（${0:P:h}），dirname "$0" 会指错。
 export PATH="$HOME/Library/Python/3.9/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 cd -- "${0:P:h}" || exit 1
 ROOT="$PWD"
@@ -60,16 +60,27 @@ DEPS=(--with numpy --with pillow --with pyyaml --with requests)
 LIGHT=(run --offline --quiet "${DEPS[@]}" --python 3.11)
 FULL=(run --offline --quiet "${DEPS[@]}" --with ultralytics --python 3.11)
 
+# 端口已经有人听着就别硬上：多半是用户自己双击开了工作台。后台这个实例再起只会
+# 撞端口、非正常退出，然后被 launchd 每 10 秒拉起来撞一次，日志全是没用的报错
+if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+  print -P "%F{yellow}!%f 端口 $PORT 已经有程序在听了（多半是工作台已经开着），这个后台实例先不起。"
+  print -P "  想让后台接管：先关掉那个终端窗口，再跑 ./后台服务.command。"
+  exit 0
+fi
+
 [[ -x "$UV_BIN" ]] || fail "没找到 uv（$UV_BIN），后台服务起不来。装一次：curl -LsSf https://astral.sh/uv/install.sh | sh"
 [[ -d autolabel ]] || fail "脚本所在目录里没有 autolabel 代码：$ROOT"
-[[ -r autolabel/version.py ]] || {
+# access() 被隐私拦截时照样回"可读"，只有真读一次才知道读不读得到
+head -1 autolabel/version.py >/dev/null 2>&1 || {
   # 项目在 ~/Desktop 下时，macOS 的隐私设置可能不让后台任务读它，而且不弹窗问权限。
   # 这时候报清楚原因再正常退出（exit 0），launchd 就不会每 10 秒空转重试一次
   print -P "%F{red}✗%f 这个进程读不到项目目录：$ROOT"
-  print -P "  项目放在 ~/Desktop 下时，macOS 默认不让后台任务读桌面，也不会弹窗问你要权限。"
-  print -P "  两条路：① 系统设置 → 隐私与安全性 → 文件与文件夹（或「完全磁盘访问权限」）里"
-  print -P "           给「终端」勾上桌面，再重跑 ./后台服务.command；"
-  print -P "           ② 把整个项目挪出 ~/Desktop（比如 ~/autolabel）。"
+  print -P "  macOS 不让后台任务读「桌面 / 文稿 / 下载」这三个文件夹，也不会弹窗问你要权限。"
+  print -P "  两条路，第一条实测可靠："
+  print -P "  ① 把整个项目挪出这三个文件夹（比如 ~/work/自动标注），再跑 ./后台服务.command；"
+  print -P "  ② 或「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里按 + 加入 /bin/zsh"
+  print -P "     （列表里默认没有它，按 ⌘⇧G 手输路径）。给「终端」授权多半没用——"
+  print -P "     后台任务是 launchd 直接起的，不是终端的子进程。"
   print -P "  在此之前双击 运行工作台.command 照样能用——前台进程不受这条限制。"
   exit 0
 }

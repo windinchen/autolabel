@@ -93,7 +93,7 @@ yolo detect train
 
 ```bash
 python3 -m pip install -r requirements.txt   # 已有 torch/ultralytics 可跳过
-python3 -m pytest tests -q                    # 789 项测试，约 2 分钟
+python3 -m pytest tests -q                    # 792 项测试，约 2 分钟
 # 其中 5 项端到端用例需要 models/yolo11n-pose.pt 与 models/bus.jpg，缺权重时会自动跳过（`-rs` 可看到原因）
 ```
 
@@ -342,7 +342,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 │   ├── image_utils.py    读图、dHash、骨架绘制
 │   └── static/           前端：portal 工作台 / app 姿态标注 / objects+detect 检测框标注（共用一份脚本）
 │                         / models 模型管理 / common 共用件
-├── tests/                789 项测试（含端到端与回归）
+├── tests/                792 项测试（含端到端与回归）
 ├── certs/                本地 HTTPS 证书与私钥（`autolabel ca` 生成，已 gitignore）
 ├── configs/default.yaml  参数模板
 ├── configs/vlm.json      多模态大模型配置（不含明文 Key，建议不入库）
@@ -386,7 +386,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 - **地址**：`https://localhost:8765/`。想用 `https://autolabel.local:8765/` 得自己在 `/etc/hosts` 加一行 `127.0.0.1 autolabel.local`（证书里已经带上这个名字了），不加也完全能用。
 - **不想敲命令**：双击项目根目录的 `运行工作台.command`，缺证书它自己补、起服务、开浏览器，一条都不用记。
 - **多卡机器开多个实例**：`PORT=8766 DEVICE=cuda ./运行工作台.command datasets/vidtest`，或命令行 `review --port 8766 --device cuda`。启动参数只喂给这一个实例，不去改家目录那份全局设置，两块卡各跑各的互不干扰。
-- **想让它常驻**：双击 `后台服务.command`，按 `configs/后台实例.conf` 的清单注册成开机自起、崩了自动拉起的后台任务（不占终端窗口）。`--status` 看谁在跑、`--restart` 改完代码重启、`--remove` 注销。项目放在 `~/Desktop` 下要先给「终端」桌面权限，卡住时脚本会把该点哪里打出来（详见 `demo_docs/07-常见问题.md`）。
+- **想让它常驻**：双击 `后台服务.command`，按 `configs/后台实例.conf` 的清单注册成开机自起、崩了自动拉起的后台任务（不占终端窗口）。`--status` 看谁在跑、`--restart` 改完代码重启、`--remove` 注销。项目放在桌面 / 文稿 / 下载里要先解决一条 macOS 权限（后台任务读不到这三个文件夹），脚本会把该点哪里直接打出来——实测最省事的是把项目挪到这三个文件夹之外（详见 `demo_docs/07-常见问题.md`）。
 - **`--no-ssl` 退回 HTTP**：浏览、改标签都正常，只是录不了像；除非在排查证书问题，一般用不着。
 - **同网段设备访问**：`review --host 0.0.0.0` 之后手机能用 `https://这台机器的IP:8765/`，但得把 `certs/ca.pem` 装到那台设备上，否则浏览器照样拦。
 

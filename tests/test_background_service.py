@@ -5,7 +5,10 @@
 1. 启动脚本以前写在 ``/tmp``，重启就被清掉，服务第二天起不来——现在文件必须在项目里；
 2. 项目路径带中文，直接写进 launchd 的 ``ProgramArguments`` 会被传成乱码，
    任务每 10 秒崩一次——所以 plist 里只能出现纯 ASCII 路径；
-3. 软链启动器必须按"解析后的真实位置"找项目目录，``dirname "$0"`` 在这儿会指错。
+3. 启动片（``~/.autolabel/services/<名字>.sh``）得先真读一次项目里的文件——被
+   「桌面文件夹」权限挡住时 ``-r`` / ``-e`` 这类判断照样说"可读"，只有真读才知道；
+   说清原因后 ``exit 0``，launchd 才不会每 10 秒空转重试。启动器本身也必须按
+   "解析后的真实位置"找项目目录，``dirname "$0"`` 在这儿会指错。
 
 清单默认是 ``configs/后台实例.conf``（本机偏好，不进仓库），测试一律用
 ``AUTOLABEL_SERVICE_CONF`` 指到临时文件，并把 ``HOME`` 也换掉，绝不碰真机上的
@@ -13,6 +16,7 @@
 """
 import os
 import plistlib
+import socket
 import shutil
 import stat
 import subprocess
@@ -30,7 +34,7 @@ pytestmark = pytest.mark.skipif(ZSH is None, reason="这台机器上没有 zsh�
 
 @pytest.fixture()
 def service_env(tmp_path):
-    """临时清单 + 临时 HOME：脚本写 plist / 建软链都落在 tmp_path 里。"""
+    """临时清单 + 临时 HOME：脚本写 plist / 生成启动片都落在 tmp_path 里。"""
     dataset = tmp_path / "datasets" / "svc"
     dataset.mkdir(parents=True)
     conf = tmp_path / "instances.conf"
@@ -98,7 +102,7 @@ def test_print_env_names_the_missing_instance_in_chinese(service_env, name, keyw
 
 
 def test_conf_rejects_non_ascii_instance_name(tmp_path):
-    """实例名要写进 launchd 标签和软链文件名，带中文等于埋一颗雷。"""
+    """实例名要写进 launchd 标签和启动片文件名，带中文等于埋一颗雷。"""
     conf = tmp_path / "bad.conf"
     conf.write_text("姿态 8765 . - no\n", encoding="utf-8")
     result = run([MANAGER, "--status"], env=dict(os.environ, AUTOLABEL_SERVICE_CONF=str(conf)))
@@ -157,7 +161,11 @@ def test_dry_run_lands_plist_and_shim_without_launchd(service_env):
     plists = sorted(p.name for p in agent_dir.glob("*.plist"))
     assert len(plists) == 2 and all(p.endswith(".plist") for p in plists)
     shim = service_env["tmp"] / "home" / ".autolabel" / "services" / "mps.sh"
-    assert shim.is_symlink() and os.path.realpath(shim) == os.path.realpath(RUNNER)
+    body = shim.read_text(encoding="utf-8")
+    assert RUNNER in body, "启动片没有指向项目里的启动器"
+    assert "head -1" in body, "启动片没有先真读一次项目文件"
+    assert os.access(shim, os.X_OK), "启动片没有执行权限，launchd 起不来"
+    assert subprocess.run([ZSH, "-n", str(shim)]).returncode == 0
     assert "--dry-run" in texts(result)
 
 
@@ -171,9 +179,9 @@ def test_plist_written_by_dry_run_is_the_one_launchd_will_read(service_env):
 
 
 def test_runner_finds_the_project_through_a_symlink(tmp_path):
-    """plist 里写的是 ~/.autolabel/services/<名字>.sh，靠软链指回项目。
+    """启动器可能被软链调起来（launchd 只认纯 ASCII 路径，指路方式说不准）。
 
-    所以启动器必须按解析后的真实位置定位项目目录——测试直接跑这根软链，
+    所以它必须按解析后的真实位置定位项目目录——测试直接跑一根指向它的软链，
     能打印用法就说明 ``${0:P:h}`` 生效了。
     """
     link = tmp_path / "mps.sh"
@@ -181,6 +189,59 @@ def test_runner_finds_the_project_through_a_symlink(tmp_path):
     result = run([str(link), "--help"])
     assert result.returncode == 0, texts(result)
     assert "用法" in texts(result)
+
+
+def test_runner_steps_aside_when_the_port_is_taken(service_env):
+    """后台实例撞上用户自己开着的工作台时，得体面让路。
+
+    非正常退出会被 launchd 每 10 秒拉起来再撞一次端口，日志里全是没用的报错，
+    所以这里必须是 exit 0 + 一句人话。
+    """
+    with socket.socket() as placeholder:
+        placeholder.bind(("127.0.0.1", 0))
+        placeholder.listen(1)
+        port = placeholder.getsockname()[1]
+        result = run([RUNNER, "--port", str(port)], env=service_env["env"])
+    assert result.returncode == 0, texts(result)
+    assert "已经有程序在听" in texts(result)
+
+
+def test_shim_explains_and_exits_clean_when_project_is_unreadable(service_env):
+    """权限没给时启动片要说明原因并 ``exit 0``。
+
+    非正常退出会被 launchd 每 10 秒重试一次，日志被同样的报错刷满，而用户真正
+    需要看到的是"该去哪儿点允许"。这里把启动片里的项目路径换成一个空目录来复现。
+    """
+    run([MANAGER, "--dry-run"], env=service_env["env"])
+    shim = service_env["tmp"] / "home" / ".autolabel" / "services" / "mps.sh"
+    body = shim.read_text(encoding="utf-8").replace(
+        "PROJECT='%s'" % ROOT, "PROJECT='%s'" % (service_env["tmp"] / "nope"))
+    fake = service_env["tmp"] / "fake-shim.sh"
+    fake.write_text(body, encoding="utf-8")
+    result = run([str(fake)])
+    assert result.returncode == 0, texts(result)
+    assert "读不到项目里的文件" in texts(result)
+    assert "桌面" in texts(result)
+
+
+def test_status_distinguishes_unwritten_plist_from_unloaded_one(service_env):
+    """`--dry-run` 之后 plist 在磁盘上但 launchd 没加载，这跟"从没注册过"不是一回事。
+
+    两种情况的处理动作完全不同，状态页必须分开说，否则用户不知道该等下次登录
+    还是该重新跑一遍注册。
+
+    这里另写一份清单，实例名用开发者机器上不可能存在的：``job_loaded`` 查的是真机
+    launchd（临时 HOME 挡不住它），换成 ``mps`` 就会因为开发者自己注册过而时好时坏。
+    """
+    conf = service_env["tmp"] / "solo.conf"
+    conf.write_text("pytestonly 8791 %s - no\n" % (service_env["tmp"] / "datasets" / "svc"),
+                    encoding="utf-8")
+    env = dict(service_env["env"], AUTOLABEL_SERVICE_CONF=str(conf))
+    assert "未注册" in texts(run([MANAGER, "--status"], env=env))
+    run([MANAGER, "--dry-run"], env=env)
+    after = texts(run([MANAGER, "--status"], env=env))
+    assert "launchd 还没加载" in after and "下次登录会自己加载" in after
+    assert "未注册" not in after
 
 
 def test_runner_rejects_unknown_flag_with_usage_hint(service_env):

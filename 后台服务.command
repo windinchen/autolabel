@@ -5,7 +5,7 @@
 #   ./后台服务.command                    注册并启动清单里的全部实例
 #   ./后台服务.command --status           谁在跑、端口、退出原因、日志尾几行
 #   ./后台服务.command --restart [名字]    改完代码重启（不给名字就全部重启）
-#   ./后台服务.command --remove [名字]     注销并删掉生成的 plist 与软链
+#   ./后台服务.command --remove [名字]     注销并删掉生成的 plist 与启动片
 #   ./后台服务.command plist <名字>        只打印这个实例的 plist（排查用）
 #   ./后台服务.command print-env <名字>    只打印这个实例的参数（启动器自己用）
 #   ./后台服务.command --dry-run          只把 plist 写出来，不碰 launchd
@@ -13,7 +13,7 @@
 # 实例清单在 configs/后台实例.conf，一行一个：名字 端口 数据集 设备 半精度。
 # 每个实例生成一个 ~/Library/LaunchAgents/com.<开发者>.autolabel.<名字>.plist，
 # 登录后由 launchd 自己加载；启动命令指向 ~/.autolabel/services/<名字>.sh，
-# 它是一根指回项目里 后台实例.command 的软链。这样绕开两个坑：启动脚本以前躺在
+# 它是个纯 ASCII 的小启动片（每次注册重新生成），由它再交给 后台实例.command。
 # /tmp，重启就被清掉，服务第二天起不来；而项目路径带中文，直接写进 plist 会被
 # launchd 传成乱码，任务每 10 秒崩一次。项目放在 ~/Desktop 下还有一道 macOS
 # 权限要过（默认不让后台任务读桌面），卡住时脚本会把该点哪里直接写出来。
@@ -54,6 +54,8 @@ label_of() { print -- "$BASE.autolabel.$1"; }
 
 port_busy() { lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1; }
 
+listen_pid() { lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null | head -1; }
+
 job_loaded() { launchctl list "$1" >/dev/null 2>&1; }
 
 job_pid() { launchctl list "$1" 2>/dev/null | sed -n 's/^[[:space:]]*"PID" = \([0-9]*\);/\1/p'; }
@@ -79,7 +81,7 @@ load_conf() {
     [[ -z "$name" || "$name" == \#* ]] && continue
     [[ "$name" =~ '^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$' ]] \
       || bail "$CONF 第 $lineno 行的实例名不合规：$name" \
-              "只能用字母、数字、- 和 _——它要写进 launchd 标签和软链文件名，不能带中文"
+              "只能用字母、数字、- 和 _——它要写进 launchd 标签和启动片文件名，不能带中文"
     [[ -z "$PORT_OF[$name]" ]] || bail "$CONF 第 $lineno 行实例名重复：$name"
     [[ "$port" =~ '^[0-9]{2,5}$' ]] \
       || bail "$CONF 第 $lineno 行端口不是数字：$port（实例 $name）"
@@ -125,7 +127,26 @@ render_plist() {
   print -r -- '</plist>'
 }
 
-# 软链 + plist 一起落盘，返回 plist 路径
+render_shim() {  # launchd 只认纯 ASCII 路径，所以给它这个小启动片，由它再交给项目里的启动器
+  print -r -- '#!/bin/zsh'
+  print -r -- '# 由 ./后台服务.command 生成，别手改——下次注册会覆盖它。'
+  print -r -- '# 项目路径带中文，直接写进 launchd 会被传成乱码，所以先落在这儿。'
+  print -r -- "PROJECT='$ROOT'"
+  print -r -- "RUNNER='$RUNNER'"
+  print -r -- '# 被「桌面文件夹」权限挡住时，-r / -e 这类判断照样说"可读"，只有真读一次才知道。'
+  print -r -- '# 说清原因再 exit 0，launchd 就不会每 10 秒空转重试一次。'
+  print -r -- 'if ! head -1 "$PROJECT/autolabel/version.py" >/dev/null 2>&1; then'
+  print -r -- '  print -P "%F{red}✗%f 后台任务读不到项目里的文件：$PROJECT"'
+  print -r -- '  print -P "  macOS 不让后台任务读「桌面 / 文稿 / 下载」这三个文件夹，也不会弹窗问你要权限。"'
+  print -r -- '  print -P "  ① 实测可靠：把整个项目挪出这三个文件夹（比如 ~/work/自动标注），再跑 ./后台服务.command；"'
+  print -r -- '  print -P "  ② 或「完全磁盘访问权限」里按 +（⌘⇧G 手输路径）加入 /bin/zsh。给「终端」授权多半没用——"'
+  print -r -- '  print -P "     后台任务是 launchd 直接起的，不是终端的子进程。"'
+  print -r -- '  exit 0'
+  print -r -- 'fi'
+  print -r -- 'exec /bin/zsh "$RUNNER" "$@"'
+}
+
+# 启动片 + plist 一起落盘，返回 plist 路径
 write_files() {
   local name="$1"
   local label="$(label_of "$name")"
@@ -134,7 +155,9 @@ write_files() {
     "launchd 会把这种路径传成乱码，任务每 10 秒崩一次。" \
     "要么把家目录换成纯英文名，要么先别用后台服务，改双击 运行工作台.command。"
   mkdir -p "$SHIM_DIR" || bail "建不了目录：$SHIM_DIR"
-  ln -sfn "$RUNNER" "$shim" || bail "建软链失败：$shim → $RUNNER"
+  render_shim >"$shim.tmp" || { rm -f "$shim.tmp"; bail "生成启动片失败：$shim"; }
+  mv -f "$shim.tmp" "$shim"
+  chmod 755 "$shim"
   local tmp="$AGENT_DIR/$label.plist.tmp"
   mkdir -p "$AGENT_DIR" || bail "建不了目录：$AGENT_DIR"
   render_plist "$name" >"$tmp" 2>&1 || { rm -f "$tmp"; bail "生成 plist 失败：$label"; }
@@ -147,13 +170,14 @@ explain_down() {  # 实例没起来时把最可能的原因翻成人话，别只
   local port="$1"
   local log="/tmp/autolabel-$port.log"
   tail -8 "$log" 2>/dev/null | sed 's/^/    /'
-  if grep -q "can't open input file" "$log" 2>/dev/null; then
-    say "这不是端口被占：launchd 起的后台任务读不到 ~/Desktop 里的项目文件。"
-    say "macOS 默认不让后台任务访问「桌面文件夹」，而且这类任务不会弹窗问你要权限。"
-    say "两个办法，任选一个："
-    say "  ① 系统设置 → 隐私与安全性 → 文件与文件夹（或「完全磁盘访问权限」）里给"
-    say "     「终端」勾上「桌面文件夹」，然后在终端里重跑一次 ./后台服务.command；"
-    say "  ② 把整个项目挪出 ~/Desktop（比如 ~/autolabel），再跑一次 ./后台服务.command。"
+  if grep -qE "can't open input file|读不到项目" "$log" 2>/dev/null; then
+    say "这不是端口被占：launchd 起的后台任务读不到项目里的文件。"
+    say "macOS 不让后台任务读「桌面 / 文稿 / 下载」这三个文件夹，而且这类任务不会弹窗问你要权限。"
+    say "两个办法，第一条实测可靠："
+    say "  ① 把整个项目挪出这三个文件夹（比如 ~/work/自动标注），再跑一次 ./后台服务.command；"
+    say "  ② 「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里按 + 加入 /bin/zsh"
+    say "     （列表里默认没有它，按 ⌘⇧G 手输路径）。给「终端」授权多半没用——后台任务是"
+    say "     launchd 直接起的，不是终端的子进程。"
     say "权限办好之前想先用界面：双击 运行工作台.command，终端里的前台进程不受这条限制。"
   fi
 }
@@ -181,7 +205,7 @@ prune_stale() {  # 清单里删掉的实例，别让 launchd 按旧 plist 反复
       launchctl bootout "$DOMAIN/$(label_of "$nm")" 2>/dev/null
       rm -f "$f" "$SHIM_DIR/$nm.sh"
     fi
-    warn "清单里已经没有 $nm，注销并清掉它留下的 plist 和软链"
+    warn "清单里已经没有 $nm，注销并清掉它留下的 plist 和启动片"
   done
   return 0
 }
@@ -195,7 +219,7 @@ cmd_install() {
     port="${PORT_OF[$name]}"
     plist="$(write_files "$name")" || return 1
     if [[ -n "$dry" ]]; then
-      ok "$name · 端口 $port · plist 与软链已写出（没碰 launchd）"
+      ok "$name · 端口 $port · plist 与启动片已写出（没碰 launchd）"
       say "$plist"
       continue
     fi
@@ -212,6 +236,8 @@ cmd_install() {
       say "要么把 $CONF 里这一行的端口换一个。"
       continue
     fi
+    # 显式注册就是一次全新的开始：旧日志里上次失败的原因会把人带偏，先滚存一份再启
+    [[ -f "/tmp/autolabel-$port.log" ]] && mv -f "/tmp/autolabel-$port.log" "/tmp/autolabel-$port.log.1"
     launchctl bootstrap "$DOMAIN" "$plist" \
       || bail "$name · 注册失败（$label）" "launchd 拒绝了 $plist" "看看属主是不是你：ls -l $plist"
     ok "$name · 端口 $port · 已注册（登录/开机自动加载）"
@@ -226,16 +252,27 @@ cmd_install() {
   step "等服务起来"
   local failed=0
   for name in "${NAMES[@]}"; do
+    label="$(label_of "$name")"
     port="${PORT_OF[$name]}"
     if wait_ready "$port" 40; then
-      ok "$name → https://localhost:$port/（数据集 ${SET_OF[$name]}）"
+      # 端口有人在听不等于这个后台实例起来了：多半是用户自己开的工作台在听，
+      # 那个窗口一关服务就没了。所以只认「在听的 PID 就是 launchd 起的那个」。
+      local lpid="$(listen_pid "$port")" jpid="$(job_pid "$label")"
+      if [[ -n "$jpid" && "$lpid" == "$jpid" ]]; then
+        ok "$name → https://localhost:$port/（数据集 ${SET_OF[$name]} · PID $jpid）"
+      else
+        skipped=$((skipped + 1))
+        warn "$name · 端口 $port 有人在听，但不是这个后台实例（PID ${lpid:-未知}）"
+        say "多半是你自己双击过 运行工作台.command，那个窗口一关服务就断。"
+        say "想让后台接管：关掉那个窗口，再跑 ./后台服务.command --restart $name。"
+      fi
     elif job_loaded "$(label_of "$name")"; then
       failed=$((failed + 1))
       warn "$name · 注册上了但 40 秒没监听："
       explain_down "$port"
     else
       failed=$((failed + 1))
-      warn "$name · launchd 没接这个任务，见 $plist"
+      warn "$name · launchd 没接这个任务，见 $AGENT_DIR/$label.plist"
     fi
   done
   print
@@ -256,8 +293,15 @@ cmd_status() {
     extra="算力跟系统设置"
     [[ -n "${DEV_OF[$name]}" ]] && extra="算力指定为 ${DEV_OF[$name]}"
     if ! job_loaded "$label"; then
-      bad "$name 未注册 · https://localhost:$port/"
-      say "跑一次 ./后台服务.command 就注册上了"
+      if [[ -f "$AGENT_DIR/$label.plist" ]]; then
+        warn "$name 的 plist 已写好，但 launchd 还没加载 · https://localhost:$port/"
+        local other="$(listen_pid "$port")"
+        [[ -n "$other" ]] && say "  端口 $port 现在是 PID $other 在听——多半是你自己开着的工作台，窗口一关就断"
+        say "下次登录会自己加载；现在就想跑：./后台服务.command --restart $name"
+      else
+        bad "$name 未注册 · https://localhost:$port/"
+        say "跑一次 ./后台服务.command 就注册上了"
+      fi
       continue
     fi
     pid="$(job_pid "$label")"
@@ -265,6 +309,8 @@ cmd_status() {
       ok "$name 在跑 · PID $pid · https://localhost:$port/ · 数据集 ${SET_OF[$name]}"
     else
       bad "$name 已注册但没在跑 · https://localhost:$port/"
+      local other="$(listen_pid "$port")"
+      [[ -n "$other" ]] && say "端口 $port 上是 PID $other 在听——多半是你自己开着的工作台，不是这个后台实例"
     fi
     say "$extra · 日志 /tmp/autolabel-$port.log"
     if [[ -z "$pid" ]]; then explain_down "$port"; print; fi
@@ -277,6 +323,13 @@ cmd_restart() {
     [[ -n "$target" && "$name" != "$target" ]] && continue
     label="$(label_of "$name")"
     if ! job_loaded "$label"; then
+      # 注册时端口被占会跳过 bootstrap，plist 其实已经写好——这里顺手把它加载上
+      if [[ -f "$AGENT_DIR/$label.plist" ]] &&
+         launchctl bootstrap "$DOMAIN" "$AGENT_DIR/$label.plist" 2>/dev/null; then
+        ok "$name 已加载并启动（端口 ${PORT_OF[$name]}）"
+        done=$((done + 1))
+        continue
+      fi
       bad "$name 还没注册，先跑 ./后台服务.command"
       continue
     fi
@@ -293,10 +346,16 @@ cmd_restart() {
     [[ -n "$target" && "$name" != "$target" ]] && continue
     port="${PORT_OF[$name]}"
     if wait_ready "$port" 40; then
-      ok "$name → https://localhost:$port/ 已就绪"
+      local lpid="$(listen_pid "$port")" jpid="$(job_pid "$(label_of "$name")")"
+      if [[ -n "$jpid" && "$lpid" == "$jpid" ]]; then
+        ok "$name → https://localhost:$port/ 已就绪（PID $jpid）"
+      else
+        warn "$name · 端口 $port 有人在听，但不是刚重启的这个实例（PID ${lpid:-未知}）"
+        say "多半是你自己开着的工作台——想让后台接管，先关掉那个窗口再跑 --restart $name。"
+      fi
     else
       warn "$name · 40 秒没监听，日志最后几行："
-      tail -8 "/tmp/autolabel-$port.log" 2>/dev/null | sed 's/^/    /'
+      explain_down "$port"
       failed=$((failed + 1))
     fi
   done
