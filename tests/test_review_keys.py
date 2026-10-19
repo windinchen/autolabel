@@ -20,6 +20,17 @@ def keydown_body(name):
     return source[start:end]
 
 
+def post(base, path, payload):
+    req = urllib.request.Request(
+        base + path, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as res:
+            return res.status, json.loads(res.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
 def get(base, path):
     try:
         with urllib.request.urlopen(base + path, timeout=10) as res:
@@ -68,9 +79,34 @@ def test_boot_says_why_the_dataset_did_not_load():
     assert "数据集读不出来" in source, "首屏拉不到数据集时静默白屏"
 
 
-def test_unknown_object_error_has_no_python_quotes(server):
-    """后端早就回了 404 + 中文，但 KeyError 会把路径带着引号吐出来，界面上一看就是程序报错。"""
+def test_missing_image_error_says_where_it_went(server):
+    """后端早就回了 404 + 中文，但读标注那条路径只剩「未知对象: ghost.jpg」。
+
+    图在另一个标签页被删是常事，界面上这句话得说清图去哪了、该怎么办，
+    而不是留一句像程序内部报错的半截英文。
+    """
     base, _store = server
     status, body = get(base, "/api/item?image=ghost.jpg")
     assert status == 404
-    assert body["error"] == "未知对象: ghost.jpg", body
+    message = body["error"]
+    assert "未知对象" not in message and "'" not in message, message
+    assert "已不在" in message and "刷新页面" in message, message
+    assert "ghost.jpg" in message, message
+
+
+def test_saving_boxes_reports_the_library_by_name(server):
+    """存框时图已经不在：要说「已不在目标检测标注里」，画完才发现比翻页更早撞上。"""
+    base, _store = server
+    status, body = post(base, "/api/prompt/item",
+                        {"image": "ghost.jpg", "lib": "detect",
+                         "objects": [{"cls": 0, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.2}]})
+    assert status == 404, body
+    assert "目标检测标注" in body["error"] and "未知对象" not in body["error"], body
+
+
+def test_download_poll_without_a_record_reads_as_a_sentence(server):
+    """查下载进度查不到记录：以前抛 KeyError，界面拼成「未知对象: 没有 x.pt 的下载记录」。"""
+    base, _store = server
+    status, body = post(base, "/api/models/download", {"name": "从没下载过.pt"})
+    assert status == 404, body
+    assert "下载记录" in body["error"] and "未知对象" not in body["error"], body

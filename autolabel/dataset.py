@@ -118,6 +118,25 @@ def missing_sources(root: str, rels: Iterable[str]) -> List[str]:
     return [rel for rel in rels if source_missing(root, rel)]
 
 
+def pool_relative(root: str, path: str) -> str:
+    """源文件本来就在素材池目录里时返回它的相对路径，否则空串。
+
+    把数据集自己的 ``images/`` 再喂回导入口是常事（搬库、拿导出目录回灌、脚本里
+    图省事直接喂 images 下的文件）。这种文件已经在池里了，再走一遍"规范化 + 落盘"
+    只会得到 ``xxx_1.jpg`` 这种双胞胎：盘上凭空多一半，界面上满屏一样的缩略图，
+    去重统计还照样好看。认出来直接登记进本库，一个字节都不再复制。
+    """
+    base = os.path.abspath(images_dir(root))
+    target = os.path.abspath(str(path))
+    try:
+        rel = os.path.relpath(target, base)
+    except ValueError:      # Windows 上跨盘符（C:\\ 与 D:\\）会直接抛
+        return ""
+    if rel in (".", "") or rel.startswith(".." + os.sep) or rel == "..":
+        return ""
+    return rel.replace("\\", "/") if os.path.isfile(target) else ""
+
+
 def unknown_images(index: "DatasetIndex", rels: Iterable[str]) -> List[str]:
     """点名的图片里哪些压根不在本库索引，保持点名的先后并去重。
 
@@ -335,8 +354,31 @@ def _load_rgb(path: str, max_side: Optional[int] = None):
         return im.copy()
 
 
+#: 落盘字节的哈希单独记一笔的字段名（``sha256`` 记的是导入时那张**原图**）
+STORED_SHA_KEY = "stored_sha256"
+
 #: 复用素材池时从另一个库带过来的素材元信息（谁导入的、多大、什么尺寸）
-POOL_KEYS = ("width", "height", "sha256", "bytes", "dhash", "imported_at", "source", "video")
+POOL_KEYS = ("width", "height", "sha256", STORED_SHA_KEY, "bytes", "dhash",
+             "imported_at", "source", "video")
+
+
+def _exact_index(pool: Dict[str, dict]) -> Dict[str, str]:
+    """把池里每张图的哈希收成 ``哈希 -> 相对路径``，两种哈希都收。
+
+    ``sha256`` 是导入时那张原图的字节，``stored_sha256`` 是规范化之后真正落在
+    ``images/`` 里的字节——同一个尺寸的原图重存一遍字节就变了，两者对不上。
+    只认前者会有这么一个洞：把数据集自己的 ``images/`` 再指回导入口
+    （换机器搬库、拿一份导出目录回灌、脚本里图省事直接喂 images 下的文件），
+    一张都认不出是重复，整批原样再复制一遍 ``xxx_1.jpg``——盘上凭空多一半，
+    界面上满屏双胞胎缩略图，去重数还对得上，谁都不知道图是被自己复制的。
+    """
+    seen: Dict[str, str] = {}
+    for rel, item in pool.items():
+        for name in ("sha256", STORED_SHA_KEY):
+            digest = str(item.get(name) or "")
+            if digest:
+                seen.setdefault(digest, rel)
+    return seen
 
 
 def _entry_defaults(lib: str) -> dict:
@@ -514,7 +556,7 @@ def import_images(
     os.makedirs(dst_root, exist_ok=True)
 
     files = collect_image_files(sources, recursive=recursive)
-    exact_seen: Dict[str, str] = {v.get("sha256", ""): k for k, v in pool.items() if v.get("sha256")}
+    exact_seen: Dict[str, str] = _exact_index(pool)
     phash_seen: List[Tuple[int, str]] = []
     if dedupe == "perceptual":
         for rel, item in pool.items():
@@ -524,6 +566,7 @@ def import_images(
 
     stats = {"scanned": len(files), "imported": 0, "reused": 0, "skipped_exact": 0,
              "skipped_similar": 0, "failed": 0, "imported_files": [], "lib": lib}
+    pool_pending: Dict[str, dict] = {}  # 只进池不入库的素材：素材层字段攒着一次写账
 
     def _reuse(rel: str) -> str:
         """命中池里已有的同一帧：复用文件，本库新增条目。"""
@@ -536,6 +579,18 @@ def import_images(
 
     for src in files:
         try:
+            # 源文件就在池目录里：这张图本来就是池里的素材，认回来登记进本库就完事，
+            # 落一份 xxx_1.jpg 出来是把自己复制给自己（只进池时也不动任何库索引）
+            inside = pool_relative(root, src) if dedupe in ("exact", "perceptual") else ""
+            if inside and register and pool.get(inside) is not None:
+                if _reuse(inside):
+                    stats["reused"] += 1
+                    stats["imported_files"].append((src, inside))
+                    if on_progress:
+                        on_progress(inside, stats)
+                else:
+                    stats["skipped_exact"] += 1
+                continue
             digest = file_sha256(src)
             if dedupe in ("exact", "perceptual") and digest in exact_seen:
                 rel = exact_seen[digest]
@@ -578,16 +633,17 @@ def import_images(
             w, h = im.size
             fields = dict(width=w, height=h, sha256=digest, bytes=os.path.getsize(abs_dst),
                           imported_at=now_str(), source=os.path.abspath(src))
+            # 以后能被"认出来是同一张"的是这份落盘字节，不是手里那张原图
+            fields[STORED_SHA_KEY] = file_sha256(abs_dst)
             fields.update(_entry_defaults(lib))
             if ph is not None:
                 fields["dhash"] = ph
             if register:
                 idx.upsert(rel, **fields)
             else:
-                from . import pool as pool_catalog
-
-                pool_catalog.record_file(root, rel, fields)
+                pool_pending[rel] = fields  # 攒到最后一次写账，见 pool.record_files
             exact_seen[digest] = rel
+            exact_seen.setdefault(fields[STORED_SHA_KEY], rel)
             if ph is not None:
                 phash_seen.append((ph, rel))
             stats["imported"] += 1
@@ -599,6 +655,10 @@ def import_images(
             print(f"[warn] 导入失败 {src}: {type(exc).__name__}: {exc}")
     if register:
         idx.save()
+    if pool_pending:
+        from . import pool as pool_catalog
+
+        pool_catalog.record_files(root, list(pool_pending.items()))
     stats["register"] = bool(register)
     return stats
 
@@ -668,11 +728,12 @@ def import_prepared(
     ensure_lib(os.path.abspath(root), lib)
     dst_root = os.path.join(images_dir(root), subdir) if subdir else images_dir(root)
     os.makedirs(dst_root, exist_ok=True)
-    exact_seen = {v.get("sha256"): k for k, v in pool.items() if v.get("sha256")}
+    exact_seen = _exact_index(pool)
     phash_seen = [(int(v["dhash"]), k) for k, v in pool.items() if v.get("dhash") is not None]
 
     stats = {"scanned": len(prepared), "imported": 0, "reused": 0, "skipped_exact": 0,
              "skipped_similar": 0, "failed": 0, "imported_files": [], "lib": lib}
+    pool_pending: Dict[str, dict] = {}  # 同 import_images：只进池的素材攒着一次写账
 
     def _reuse(rel: str) -> str:
         if not register:
@@ -725,6 +786,8 @@ def import_prepared(
             w, h = im.size
             fields = dict(width=w, height=h, sha256=digest, bytes=os.path.getsize(abs_dst),
                           imported_at=now_str(), source=os.path.abspath(src))
+            # 以后能被"认出来是同一张"的是这份落盘字节，不是手里那张原图
+            fields[STORED_SHA_KEY] = file_sha256(abs_dst)
             fields.update(_entry_defaults(lib))
             if ph is not None:
                 fields["dhash"] = ph
@@ -732,10 +795,9 @@ def import_prepared(
             if register:
                 idx.upsert(rel, **fields)
             else:
-                from . import pool as pool_catalog
-
-                pool_catalog.record_file(root, rel, fields)
+                pool_pending[rel] = fields  # 攒到最后一次写账，见 pool.record_files
             exact_seen[digest] = rel
+            exact_seen.setdefault(fields[STORED_SHA_KEY], rel)
             if ph is not None:
                 phash_seen.append((ph, rel))
             stats["imported"] += 1
@@ -745,6 +807,10 @@ def import_prepared(
             print(f"[warn] 导入失败 {src}: {type(exc).__name__}: {exc}")
     if register:
         idx.save()
+    if pool_pending:
+        from . import pool as pool_catalog
+
+        pool_catalog.record_files(root, list(pool_pending.items()))
     stats["register"] = bool(register)
     return stats
 

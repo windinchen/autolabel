@@ -29,7 +29,8 @@ from __future__ import annotations
 import json
 import os
 import uuid
-from typing import Dict, List, Optional, Sequence, Tuple
+from contextlib import contextmanager
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .atomic import atomic_write_json
 from .dataset import image_size, images_dir, now_str
@@ -56,7 +57,8 @@ IMPORT_KINDS = ("pool", "image", "video", "prompt_upload", "detect_upload")
 
 #: 素材层可以从池账本补进"素材池视角"的字段。别把 ``status`` 之类标注意义的值放进来，
 #: 那会串库（同一张图在姿态库已复核、在检测库还没标，谁也不该覆盖谁）
-POOL_ITEM_KEYS = ("sha256", "bytes", "width", "height", "dhash", "imported_at", "source", "video")
+POOL_ITEM_KEYS = ("sha256", "stored_sha256", "bytes", "width", "height",
+                  "dhash", "imported_at", "source", "video")
 
 
 def catalog_path(root: str) -> str:
@@ -104,6 +106,37 @@ def save_catalog(root: str, catalog: dict) -> dict:
     return _save(root, catalog)
 
 
+@contextmanager
+def _ledger_lock(root: str) -> Iterator[None]:
+    """池账本写入的串行锁（跨进程，同线程可重入）。
+
+    池账本每次改动都是「读全表 → 改 → 写全表」，而写它的人不止一个：素材池页点分类、
+    后台导入任务逐张记账、删批次、启动对账。两个写者撞上时后写的会把先写的整表盖掉，
+    表现就是「刚导入的素材整批不见了」——文件还留在 ``images/``，下次启动对账又把它们
+    当孤儿图抢进姿态库，用户完全不知道发生了什么。
+
+    锁与批次表共用一把（``.autolabel/batches.lock``）：删批次本来就是池账本和批次表
+    一起改，同一把锁省掉「先拿 A 再拿 B」的顺序问题。
+    """
+    from .batches import _file_lock  # 延迟导入：batches 模块级就 import 了 pool
+
+    with _file_lock(root):
+        yield
+
+
+def mutate_catalog(root: str, edit: Callable[[dict], object]) -> object:
+    """在锁里完成一次「读全表 → 改 → 写全表」，返回 ``edit(catalog)`` 的结果。
+
+    给外部模块（``batches`` / ``review``）用：它们自己 ``load_catalog`` 之后再
+    ``save_catalog``，读写之间照样会被别的写者插队，统一走这里才真的安全。
+    """
+    with _ledger_lock(root):
+        catalog = load_catalog(root)
+        out = edit(catalog)
+        _save(root, catalog)
+    return out
+
+
 def _key(rel: str) -> str:
     text = str(rel or "").replace("\\", "/").strip()
     return text[len("images/"):] if text.startswith("images/") else text
@@ -133,85 +166,88 @@ def _clean_name(name: str) -> str:
 def save_category(root: str, name: str, note: str = "", icon: str = "",
                   category_id: str = "") -> dict:
     """新建 / 改名一个分类。给了 ``category_id`` 就改那一条，否则新建。"""
-    text = _clean_name(name)
-    catalog = load_catalog(root)
-    rows = catalog["categories"]
-    wanted = str(category_id or "").strip()
-    if wanted:
-        target = next((row for row in rows if str(row["id"]) == wanted), None)
-        if target is None:
-            raise ValueError(f"没有这个分类（可能刚被删掉）：{wanted}")
-        if any(str(row.get("name")) == text and str(row["id"]) != wanted for row in rows):
-            raise ValueError(f"已经有叫「{text}」的分类了")
-        target["name"] = text
-        target["note"] = str(note or "").strip()[:NOTE_MAX]
-        if icon in CATEGORY_ICONS:
-            target["icon"] = icon
-        target["updated_at"] = now_str()
-        row = target
-    else:
-        if any(str(row.get("name")) == text for row in rows):
-            raise ValueError(f"已经有叫「{text}」的分类了")
-        if len(rows) >= CATEGORY_MAX:
-            raise ValueError(f"分类最多 {CATEGORY_MAX} 个，先删几个再建")
-        used = {str(row["id"]) for row in rows}
-        row = {"id": "c" + uuid.uuid4().hex[:8], "name": text,
-               "note": str(note or "").strip()[:NOTE_MAX],
-               "icon": icon if icon in CATEGORY_ICONS else "ic-tag",
-               "created_at": now_str()}
-        while row["id"] in used:  # 极小概率撞 id，换一个
-            row["id"] = "c" + uuid.uuid4().hex[:8]
-        rows.append(row)
-    _save(root, catalog)
-    return {"ok": True, "category": row, "categories": rows}
+    with _ledger_lock(root):
+        text = _clean_name(name)
+        catalog = load_catalog(root)
+        rows = catalog["categories"]
+        wanted = str(category_id or "").strip()
+        if wanted:
+            target = next((row for row in rows if str(row["id"]) == wanted), None)
+            if target is None:
+                raise ValueError(f"没有这个分类（可能刚被删掉）：{wanted}")
+            if any(str(row.get("name")) == text and str(row["id"]) != wanted for row in rows):
+                raise ValueError(f"已经有叫「{text}」的分类了")
+            target["name"] = text
+            target["note"] = str(note or "").strip()[:NOTE_MAX]
+            if icon in CATEGORY_ICONS:
+                target["icon"] = icon
+            target["updated_at"] = now_str()
+            row = target
+        else:
+            if any(str(row.get("name")) == text for row in rows):
+                raise ValueError(f"已经有叫「{text}」的分类了")
+            if len(rows) >= CATEGORY_MAX:
+                raise ValueError(f"分类最多 {CATEGORY_MAX} 个，先删几个再建")
+            used = {str(row["id"]) for row in rows}
+            row = {"id": "c" + uuid.uuid4().hex[:8], "name": text,
+                   "note": str(note or "").strip()[:NOTE_MAX],
+                   "icon": icon if icon in CATEGORY_ICONS else "ic-tag",
+                   "created_at": now_str()}
+            while row["id"] in used:  # 极小概率撞 id，换一个
+                row["id"] = "c" + uuid.uuid4().hex[:8]
+            rows.append(row)
+        _save(root, catalog)
+        return {"ok": True, "category": row, "categories": rows}
 
 
 def delete_category(root: str, category_id: str) -> dict:
     """删分类；底下的素材退回「未分类」，素材文件一张都不动。"""
-    wanted = str(category_id or "").strip()
-    catalog = load_catalog(root)
-    rows = catalog["categories"]
-    target = next((row for row in rows if str(row["id"]) == wanted), None)
-    if target is None:
-        raise ValueError(f"没有这个分类（可能刚被删掉）：{wanted}")
-    catalog["categories"] = [row for row in rows if str(row["id"]) != wanted]
-    moved = 0
-    for item in catalog["items"].values():
-        if str(item.get("category") or "") == wanted:
-            item.pop("category", None)
-            moved += 1
-    _save(root, catalog)
-    return {"ok": True, "deleted": target, "uncategorized": moved,
-            "categories": catalog["categories"]}
+    with _ledger_lock(root):
+        wanted = str(category_id or "").strip()
+        catalog = load_catalog(root)
+        rows = catalog["categories"]
+        target = next((row for row in rows if str(row["id"]) == wanted), None)
+        if target is None:
+            raise ValueError(f"没有这个分类（可能刚被删掉）：{wanted}")
+        catalog["categories"] = [row for row in rows if str(row["id"]) != wanted]
+        moved = 0
+        for item in catalog["items"].values():
+            if str(item.get("category") or "") == wanted:
+                item.pop("category", None)
+                moved += 1
+        _save(root, catalog)
+        return {"ok": True, "deleted": target, "uncategorized": moved,
+                "categories": catalog["categories"]}
 
 
 def assign(root: str, image_rels: Sequence[str], category_id: str = "") -> dict:
     """给一批素材设分类；``category_id`` 为空表示取消分类。"""
-    wanted = str(category_id or "").strip()
-    catalog = load_catalog(root)
-    if wanted and not any(str(row["id"]) == wanted for row in catalog["categories"]):
-        raise ValueError(f"没有这个分类（可能刚被删掉）：{wanted}")
-    stamp = now_str()
-    set_count = cleared = 0
-    for rel in image_rels:
-        key = _key(rel)
-        if not key:
-            continue
-        item = catalog["items"].setdefault(key, {})
-        if wanted:
-            item["category"] = wanted
-            set_count += 1
-        else:
-            item.pop("category", None)
-            item.pop("assigned_at", None)
-            cleared += 1
-            if not item:
-                catalog["items"].pop(key, None)
+    with _ledger_lock(root):
+        wanted = str(category_id or "").strip()
+        catalog = load_catalog(root)
+        if wanted and not any(str(row["id"]) == wanted for row in catalog["categories"]):
+            raise ValueError(f"没有这个分类（可能刚被删掉）：{wanted}")
+        stamp = now_str()
+        set_count = cleared = 0
+        for rel in image_rels:
+            key = _key(rel)
+            if not key:
                 continue
-        item["assigned_at"] = stamp
-    _save(root, catalog)
-    return {"ok": True, "category": wanted, "set": set_count, "cleared": cleared,
-            "requested": len([rel for rel in image_rels if str(rel).strip()])}
+            item = catalog["items"].setdefault(key, {})
+            if wanted:
+                item["category"] = wanted
+                set_count += 1
+            else:
+                item.pop("category", None)
+                item.pop("assigned_at", None)
+                cleared += 1
+                if not item:
+                    catalog["items"].pop(key, None)
+                    continue
+            item["assigned_at"] = stamp
+        _save(root, catalog)
+        return {"ok": True, "category": wanted, "set": set_count, "cleared": cleared,
+                "requested": len([rel for rel in image_rels if str(rel).strip()])}
 
 
 # --------------------------------------------------------------------------- #
@@ -233,62 +269,65 @@ def batch_map(root: str) -> Dict[str, str]:
 def create_batch(root: str, *, name: str, kind: str = "pool", source: str = "ui",
                  uploads: Optional[Sequence[str]] = None) -> dict:
     """记一次进池（上传 / 抽帧 / 命令行导入）。"""
-    batch = {
-        "id": POOL_BATCH_PREFIX + uuid.uuid4().hex[:10],
-        "name": str(name or "素材导入")[:60], "kind": kind, "source": source,
-        "created_at": now_str(), "finished_at": None, "status": STATUS_RUNNING,
-        "uploads": [str(u) for u in (uploads or [])][:30],
-        "items": [], "message": "",
-    }
-    catalog = load_catalog(root)
-    catalog["batches"].append(batch)
-    catalog["batches"] = catalog["batches"][-300:]
-    _save(root, catalog)
-    return batch
+    with _ledger_lock(root):
+        batch = {
+            "id": POOL_BATCH_PREFIX + uuid.uuid4().hex[:10],
+            "name": str(name or "素材导入")[:60], "kind": kind, "source": source,
+            "created_at": now_str(), "finished_at": None, "status": STATUS_RUNNING,
+            "uploads": [str(u) for u in (uploads or [])][:30],
+            "items": [], "message": "",
+        }
+        catalog = load_catalog(root)
+        catalog["batches"].append(batch)
+        catalog["batches"] = catalog["batches"][-300:]
+        _save(root, catalog)
+        return batch
 
 
 def attach_items(root: str, batch_id: str, image_rels: Sequence[str]) -> int:
     """把进池成功的素材挂到批次上（只进池的图靠这里记来处，库索引里没有它们）。"""
-    rels = [_key(rel) for rel in image_rels if str(rel).strip()]
-    rels = [rel for rel in rels if rel]
-    if not rels:
-        return 0
-    catalog = load_catalog(root)
-    batch = next((row for row in catalog["batches"] if str(row.get("id")) == str(batch_id)), None)
-    if batch is not None:
-        known = set(batch.get("items") or [])
-        batch.setdefault("items", []).extend(rel for rel in rels if rel not in known)
-    for rel in rels:
-        item = catalog["items"].setdefault(rel, {})
-        # 来处认第一次：同一帧后来被别的模块再导一次（去重命中 reused）不该把
-        # "它从哪个文件抽出来" 改成后面那次，素材池页按批次筛就会对不上
-        if not item.get("batch"):
-            item["batch"] = str(batch_id)
-        if item.get("bytes") is None and item.get("width") is None:
-            # 素材本来只在某个库的索引里（池账本还没它）：就地按磁盘把素材层字段补齐，
-            # 只记一个批次号会让素材池页这张卡片写「尺寸未知 · 0 KB」
-            path = os.path.join(images_dir(root), rel)
-            try:
-                item["bytes"] = os.path.getsize(path)
-            except OSError:
-                continue
-            width, height = image_size(path)
-            item["width"], item["height"] = width or None, height or None
-            item.setdefault("imported_at", now_str())
-    _save(root, catalog)
-    return len(rels)
+    with _ledger_lock(root):
+        rels = [_key(rel) for rel in image_rels if str(rel).strip()]
+        rels = [rel for rel in rels if rel]
+        if not rels:
+            return 0
+        catalog = load_catalog(root)
+        batch = next((row for row in catalog["batches"] if str(row.get("id")) == str(batch_id)), None)
+        if batch is not None:
+            known = set(batch.get("items") or [])
+            batch.setdefault("items", []).extend(rel for rel in rels if rel not in known)
+        for rel in rels:
+            item = catalog["items"].setdefault(rel, {})
+            # 来处认第一次：同一帧后来被别的模块再导一次（去重命中 reused）不该把
+            # "它从哪个文件抽出来" 改成后面那次，素材池页按批次筛就会对不上
+            if not item.get("batch"):
+                item["batch"] = str(batch_id)
+            if item.get("bytes") is None and item.get("width") is None:
+                # 素材本来只在某个库的索引里（池账本还没它）：就地按磁盘把素材层字段补齐，
+                # 只记一个批次号会让素材池页这张卡片写「尺寸未知 · 0 KB」
+                path = os.path.join(images_dir(root), rel)
+                try:
+                    item["bytes"] = os.path.getsize(path)
+                except OSError:
+                    continue
+                width, height = image_size(path)
+                item["width"], item["height"] = width or None, height or None
+                item.setdefault("imported_at", now_str())
+        _save(root, catalog)
+        return len(rels)
 
 
 def finish_batch(root: str, batch_id: str, status: str = STATUS_DONE, message: str = "") -> None:
-    catalog = load_catalog(root)
-    batch = next((row for row in catalog["batches"] if str(row.get("id")) == str(batch_id)), None)
-    if batch is None:
-        return
-    batch["status"] = status
-    batch["finished_at"] = now_str()
-    if message:
-        batch["message"] = str(message)[:200]
-    _save(root, catalog)
+    with _ledger_lock(root):
+        catalog = load_catalog(root)
+        batch = next((row for row in catalog["batches"] if str(row.get("id")) == str(batch_id)), None)
+        if batch is None:
+            return
+        batch["status"] = status
+        batch["finished_at"] = now_str()
+        if message:
+            batch["message"] = str(message)[:200]
+        _save(root, catalog)
 
 
 def import_records(root: str, rows: Optional[List[dict]] = None) -> List[dict]:
@@ -394,35 +433,37 @@ def batch_file_rows(root: str, batch_id: str) -> List[dict]:
 
 def detach_batch(root: str, image_rels: Sequence[str]) -> int:
     """抹掉这些素材身上的来处章（连原图一起删时才调用，只摘引用得留着）。"""
-    catalog = load_catalog(root)
-    detached = 0
-    for rel in image_rels:
-        key = _key(rel)
-        item = catalog["items"].get(key)
-        if item and item.pop("batch", None):
-            detached += 1
-            if not item:
-                catalog["items"].pop(key, None)
-    if detached:
-        _save(root, catalog)
-    return detached
+    with _ledger_lock(root):
+        catalog = load_catalog(root)
+        detached = 0
+        for rel in image_rels:
+            key = _key(rel)
+            item = catalog["items"].get(key)
+            if item and item.pop("batch", None):
+                detached += 1
+                if not item:
+                    catalog["items"].pop(key, None)
+        if detached:
+            _save(root, catalog)
+        return detached
 
 
 def forget_batch(root: str, batch_id: str) -> dict:
     """批次记录随素材一起删掉时调用（素材文件已删，不再留空批次行）。"""
-    catalog = load_catalog(root)
-    before = len(catalog["batches"])
-    catalog["batches"] = [row for row in catalog["batches"] if str(row.get("id")) != str(batch_id)]
-    removed = before - len(catalog["batches"])
-    detached = 0
-    if removed:
-        # 素材上的「来处」也要一起忘掉：指着一个已经不存在的批次，按批次筛就永远筛不到它
-        for item in catalog["items"].values():
-            if str(item.get("batch") or "") == str(batch_id):
-                item.pop("batch", None)
-                detached += 1
-        _save(root, catalog)
-    return {"ok": bool(removed), "removed": removed, "detached": detached}
+    with _ledger_lock(root):
+        catalog = load_catalog(root)
+        before = len(catalog["batches"])
+        catalog["batches"] = [row for row in catalog["batches"] if str(row.get("id")) != str(batch_id)]
+        removed = before - len(catalog["batches"])
+        detached = 0
+        if removed:
+            # 素材上的「来处」也要一起忘掉：指着一个已经不存在的批次，按批次筛就永远筛不到它
+            for item in catalog["items"].values():
+                if str(item.get("batch") or "") == str(batch_id):
+                    item.pop("batch", None)
+                    detached += 1
+            _save(root, catalog)
+        return {"ok": bool(removed), "removed": removed, "detached": detached}
 
 
 # --------------------------------------------------------------------------- #
@@ -431,18 +472,41 @@ def forget_batch(root: str, batch_id: str) -> dict:
 
 def record_file(root: str, image_rel: str, fields: dict, batch_id: str = "") -> dict:
     """只进池的素材在池账本里记一笔（库索引里没有它，靠这笔认重复、认来处）。"""
-    key = _key(image_rel)
-    if not key:
-        raise ValueError("素材路径为空")
-    catalog = load_catalog(root)
-    item = catalog["items"].setdefault(key, {})
-    for name in POOL_ITEM_KEYS:
-        if fields.get(name) is not None:
-            item[name] = fields[name]
-    if batch_id:
-        item["batch"] = str(batch_id)
-    _save(root, catalog)
-    return item
+    with _ledger_lock(root):
+        key = _key(image_rel)
+        if not key:
+            raise ValueError("素材路径为空")
+        catalog = load_catalog(root)
+        item = catalog["items"].setdefault(key, {})
+        for name in POOL_ITEM_KEYS:
+            if fields.get(name) is not None:
+                item[name] = fields[name]
+        if batch_id:
+            item["batch"] = str(batch_id)
+        _save(root, catalog)
+        return item
+
+
+def record_files(root: str, entries: Sequence[Tuple[str, dict]], batch_id: str = "") -> int:
+    """一次记一批进池素材。
+
+    逐张调 :func:`record_file` 会把整本账本重写 N 遍——255 张就是 255 次整本落盘，
+    导入任务的时间全花在写账上。这里合成一次写，顺带把锁也只取一次。
+    """
+    pairs = [(_key(rel), fields) for rel, fields in (entries or []) if _key(rel)]
+    if not pairs:
+        return 0
+    with _ledger_lock(root):
+        catalog = load_catalog(root)
+        for rel, fields in pairs:
+            item = catalog["items"].setdefault(rel, {})
+            for name in POOL_ITEM_KEYS:
+                if fields.get(name) is not None:
+                    item[name] = fields[name]
+            if batch_id:
+                item.setdefault("batch", str(batch_id))
+        _save(root, catalog)
+    return len(pairs)
 
 
 def pool_items_map(root: str) -> Dict[str, dict]:
@@ -468,34 +532,35 @@ def prune(root: str, image_rels: Sequence[str]) -> dict:
     否则素材池页「按来处」会留一排点进去空白的 0 张批次，让人以为素材还在。
     正在导入、还没挂上素材的批次不动（它 ``items`` 本来就是空的）。
     """
-    catalog = load_catalog(root)
-    gone = set()
-    removed = 0
-    for rel in image_rels:
-        key = _key(rel)
-        if not key:
-            continue
-        gone.add(key)
-        if catalog["items"].pop(key, None) is not None:
-            removed += 1
-    emptied = 0
-    if gone:
-        keep: List[dict] = []
-        for row in catalog["batches"]:
-            had = list(row.get("items") or [])
-            left = [rel for rel in had if _key(rel) not in gone]
-            if len(left) == len(had):
-                keep.append(row)
+    with _ledger_lock(root):
+        catalog = load_catalog(root)
+        gone = set()
+        removed = 0
+        for rel in image_rels:
+            key = _key(rel)
+            if not key:
                 continue
-            if left:
-                row["items"] = left
-                keep.append(row)
-            else:
-                emptied += 1  # 这批的素材全没了，批次行留着只会误导
-        catalog["batches"] = keep
-    if removed or emptied:
-        _save(root, catalog)
-    return {"ok": True, "removed": removed, "batches_emptied": emptied}
+            gone.add(key)
+            if catalog["items"].pop(key, None) is not None:
+                removed += 1
+        emptied = 0
+        if gone:
+            keep: List[dict] = []
+            for row in catalog["batches"]:
+                had = list(row.get("items") or [])
+                left = [rel for rel in had if _key(rel) not in gone]
+                if len(left) == len(had):
+                    keep.append(row)
+                    continue
+                if left:
+                    row["items"] = left
+                    keep.append(row)
+                else:
+                    emptied += 1  # 这批的素材全没了，批次行留着只会误导
+            catalog["batches"] = keep
+        if removed or emptied:
+            _save(root, catalog)
+        return {"ok": True, "removed": removed, "batches_emptied": emptied}
 
 
 def reconcile(root: str) -> dict:

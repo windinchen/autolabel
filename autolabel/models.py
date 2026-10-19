@@ -64,6 +64,26 @@ CAPABILITY_LABELS = {
     CAPABILITY_CUSTOM: "自定义任务（自带关键点定义）",
 }
 
+class UnknownModel(KeyError):
+    """按 ID / 文件名在模型目录里找不到这一项。
+
+    继承 ``KeyError``：命令行那侧现成的 ``except KeyError`` 与既有测试照旧生效。
+    句子在这里一次说完整，别留给上层再拼一层前缀——以前这条异常从接口出去，
+    界面上是「未知对象: 未知模型: xxx（用 models --browse 看完整目录）」，
+    两层前缀套一句只有敲命令行的人才懂的命令。``__str__`` 也要盖掉：
+    ``KeyError`` 默认会把整句话套进引号里，一看就是程序在甩内部报错。
+    """
+
+    def __init__(self, model_id: object = ""):
+        self.model_id = str(model_id or "")
+        super().__init__(f"模型目录里没有「{self.model_id or '（没写名字）'}」："
+                         "到「模型管理」页重新挑一个，"
+                         "或命令行 autolabel models --browse 看完整目录")
+
+    def __str__(self) -> str:
+        return str(self.args[0]) if self.args else ""
+
+
 SOURCE_PRESET = "preset"          # 在内置目录里，本地还没有文件
 SOURCE_LOCAL = "local"            # 用户自己登记的本地文件 / 本地服务
 SOURCE_DOWNLOADED = "downloaded"  # 由本工具经镜像下载落盘
@@ -1433,7 +1453,7 @@ class ModelRegistry:
                     row["url"] = weights_url(str(row["filename"]))
                     row["mirror"] = _mirror_label()
                 return row
-        raise KeyError(f"未知模型: {model_id}（用 models --browse 看完整目录）")
+        raise UnknownModel(model_id)
 
     def weight_overlay(self, name: str, dataset_kps: int = 0) -> dict:
         """给权重行补分层字段；目录里没有的自定义权重也给一份默认值。"""
@@ -1476,7 +1496,7 @@ class ModelRegistry:
     def set_default(self, model_id: str, capability: str = "") -> dict:
         entry = self.get_any(model_id)
         if entry is None:
-            raise KeyError(f"未知模型: {model_id}（用 models --browse 看完整目录）")
+            raise UnknownModel(model_id)
         cap = str(capability or entry.get("capability") or "")
         if cap not in CAPABILITIES:
             raise ValueError(f"能力只能是 {'/'.join(CAPABILITIES)}，收到 {cap}")

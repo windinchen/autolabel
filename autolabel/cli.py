@@ -1751,7 +1751,10 @@ def _port(text: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="autolabel", description="人体骨骼自动标注系统（YOLO pose）")
+    parser = argparse.ArgumentParser(
+        prog="autolabel",
+        description="自动标注工作台：素材池统一收图，姿态 / 提示词 / 目标检测三库批量标注"
+                    " + 人工复核 + 训练集导出")
     parser.add_argument("--version", action="version", version=f"autolabel {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 

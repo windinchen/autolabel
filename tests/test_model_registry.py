@@ -192,7 +192,7 @@ def test_default_model_rejects_wrong_capability_and_unknown_id(workspace):
         models.set_model_default("yolo11n-pose", models.CAPABILITY_VLM)
     with pytest.raises(ValueError, match="能力只能是"):
         models.set_model_default("yolo11n-pose", "magic")
-    with pytest.raises(KeyError, match="未知模型"):
+    with pytest.raises(KeyError, match="模型目录里没有"):
         models.set_model_default("nope")
 
 
@@ -218,7 +218,7 @@ def test_register_local_model_records_path_without_moving_file(workspace, tmp_pa
     assert models.forget_model("gym-pose")["forgotten"] is True
     assert os.path.isfile(str(source))          # 取消登记只删记录，不动文件
     assert read_json(workspace["model_config"])["local"] == []
-    with pytest.raises(KeyError, match="未知模型"):
+    with pytest.raises(KeyError, match="模型目录里没有"):
         models.describe_model("gym-pose")
 
 
@@ -498,6 +498,21 @@ def test_api_note_default_local_add_and_forget(server, workspace, tmp_path):
 
     status, body = post(base, "/api/models/local/forget", {"id": ident})
     assert status == 404 and "未知对象" in body["error"]
+
+
+def test_unknown_model_error_reaches_the_page_as_one_sentence(server, workspace):
+    """设默认模型点了个目录里没有的 ID：界面上只能是一句话，不能两层前缀。
+
+    以前是「未知对象: 未知模型: nope（用 models --browse 看完整目录）」——
+    外层是接口兜底文案，内层是模型目录文案，最后还跟一句命令行。
+    """
+    base, _store = server
+    status, body = post(base, "/api/models/default", {"id": "从没见过的权重"})
+    assert status == 404, body
+    message = body["error"]
+    assert "未知对象" not in message and "未知模型" not in message, message
+    assert message.count("：") <= 1, message
+    assert "模型目录里没有" in message, message
 
 
 def test_api_model_note_endpoint_is_gone(server, workspace):

@@ -186,7 +186,8 @@ def test_probe_api_route_is_wired_and_answers_in_chinese(server):
     code, body, _ = post(base, "/api/detect/probe", {})
     assert code == 400 and "哪张图" in body["error"], body
     code, body, _ = post(base, "/api/detect/probe", {"image": "ghost.jpg", "words": "person"})
-    assert code == 400 and "已不在" in body["error"], body
+    # 图不在本库统一按 404 回（和读标注 / 存框 / 改状态一个口径），句子照样是中文
+    assert code == 404 and "已不在" in body["error"], body
 
 
 def test_probe_store_validates_before_touching_the_model(detect_ds, monkeypatch):

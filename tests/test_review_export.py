@@ -125,12 +125,14 @@ def test_undo_recomputes_the_pose_flags_and_score(dataset):
 
     back = ds.load_index(dataset).get(first)
     restored = rv.parse_label_file(ds.label_path_for(dataset, first))
-    wanted = round(sum(person.score for person in restored) / len(restored), 4)
     assert back["status"] == ds.STATUS_UNREVIEWED
     assert back["visible_ratio"] == pytest.approx(rv._visible_ratio(restored))
     assert back["objects"] == len(restored)
-    assert back["score"] == pytest.approx(wanted), "分数要按撤销回来的那份框重算，别留旧的"
-    assert back["score"] != 0.77, "0.77 是 seed 写的假分数，说明这里根本没重算"
+    # 分数这一项和标记不同口径：YOLO 标签里根本不存置信度，按"撤销回来的那份"重算
+    # 永远是 0 分。写成 0 会让这张刚撤销的图凭空变成「低置信待复核」还跳到队列最前面，
+    # 所以沿用索引里的历史分值——与 write_item 同一条规矩（见那里那段注释）。
+    assert back["score"] == pytest.approx(0.77), \
+        "撤销不该把模型分值清成 0：那等于凭空给刚撤销的图安一个待确认问题"
 
 
 def test_status_validation_and_unknown_image(dataset):
@@ -139,7 +141,7 @@ def test_status_validation_and_unknown_image(dataset):
     assert store.set_status(first, "rejected")["status"] == "rejected"
     with pytest.raises(ValueError):
         store.set_status(first, "weird")
-    with pytest.raises(KeyError):
+    with pytest.raises(ValueError, match="已不在.*刷新页面"):
         store.read_item("nope.jpg")
 
 
@@ -740,3 +742,27 @@ def test_score_map_does_not_accumulate_boxes_that_are_gone(dataset):
     # 撤销最远能回到「当前标签 + 原始备份 + HISTORY_LIMIT 份快照」，分数表就只留这些
     assert len(stored) <= rv.HISTORY_LIMIT + 2, sorted(stored)
     assert round(max(stored.values()), 2) == 0.5
+
+
+def test_undo_keeps_the_score_of_the_pose_item(server):
+    """撤销不该把图踢进「低置信待复核」：标签里没有分值就沿用索引那份。
+
+    YOLO 姿态标签不存置信度，撤销回来的那份永远一个分值都没有。写成 0 的后果是这张
+    刚撤销的图立刻变成「低置信待复核」并跳到复核队列最前面——用户只是把误改退回去，
+    系统却像新冒出一个问题。保存那条路早就防了这手，撤销得同一口径。
+    """
+    base, store = server
+    image = seed(store.root, first_only=True)[0]
+    item = store.read_item(image)
+    payload = item["objects"]
+    payload[0]["keypoints"][0]["x"] = 0.99
+    status, saved, _ = post(base, "/api/item", {"image": image, "objects": payload})
+    assert status == 200, saved
+    before = float(ds.load_index(store.root).get(image)["score"])
+    assert before >= qc.LOW_SCORE, before
+
+    status, undone, _ = post(base, "/api/undo", {"image": image})
+    assert status == 200, undone
+    after = ds.load_index(store.root).get(image)
+    assert float(after["score"]) == before, f"撤销把置信度写成了 {after['score']}"
+    assert not qc.needs_review(after, "pose"), "撤销过的图不该因为 0 分被当成待确认"

@@ -42,6 +42,71 @@ def test_exact_dedupe_skips_same_bytes(dataset, tmp_path):
     assert len(ds.load_index(dataset).items) == 2
 
 
+def test_reimporting_the_pool_folder_reuses_instead_of_copying(dataset):
+    """把 ``images/`` 自己再喂回导入口：认出是同一张，不许再复制一份双胞胎。
+
+    搬库、拿导出目录回灌、脚本里图省事直接喂 images 下的文件都会撞上这个。
+    账上 ``sha256`` 记的是导入时那张原图，盘上躺的是规范化副本，两份字节不同——
+    过去只比原图哈希，整张批认不出重复，原样再落一遍 ``xxx_1.jpg``，
+    盘上凭空多一半，去重统计还照样好看，谁都不知道图是被自己复制的。
+    """
+    from autolabel import dataset as ds
+
+    before = sorted(os.listdir(ds.images_dir(dataset)))
+    assert before
+    sources = [os.path.join(ds.images_dir(dataset), rel) for rel in before]
+    stats = ds.import_images(dataset, sources, dedupe="exact", lib="detect")
+    assert stats["imported"] == 0, stats
+    assert stats["reused"] == len(before), stats
+    assert sorted(os.listdir(ds.images_dir(dataset))) == before, "不该多出一份副本"
+    assert len(ds.load_index(dataset, "detect").items) == len(before)
+
+
+def test_old_ledger_recognises_its_own_files_by_path(dataset):
+    """老库账本里只有原图哈希：把 ``images/`` 喂回来照样不许复制——认路径，不只看哈希。
+
+    新字段 ``stored_sha256`` 只在新导入时才有，已经建好的库（比如手上那个两百多张的）
+    账本里补不出来，所以认自己人这件事不能只靠哈希表。
+    """
+    from autolabel import dataset as ds
+    from autolabel import pool as pool_catalog
+
+    before = sorted(os.listdir(ds.images_dir(dataset)))
+    assert before
+    catalog = pool_catalog.load_catalog(dataset)
+    for item in catalog["items"].values():
+        item.pop(ds.STORED_SHA_KEY, None)
+    pool_catalog.save_catalog(dataset, catalog)
+    index = ds.load_index(dataset, "pose")
+    for item in index.items.values():
+        item.pop(ds.STORED_SHA_KEY, None)
+    index.save()
+
+    sources = [os.path.join(ds.images_dir(dataset), rel) for rel in before]
+    stats = ds.import_images(dataset, sources, dedupe="exact", lib="detect")
+    assert stats["imported"] == 0, stats
+    assert stats["reused"] == len(before), stats
+    assert sorted(os.listdir(ds.images_dir(dataset))) == before, "老库也不该复制出双胞胎"
+
+
+def test_pool_only_item_records_the_bytes_actually_stored(dataset, tmp_path):
+    """只进池的素材要把「落盘字节」的哈希也记一笔，否则下一轮回灌认不出它。"""
+    from autolabel import dataset as ds
+    from autolabel import pool as pool_catalog
+
+    source = tmp_path / "只进池.jpg"
+    Image.new("RGB", (40, 30), "white").save(source)
+    stats = ds.import_images(dataset, [str(source)], lib="pose", register=False)
+    assert stats["imported"] == 1, stats
+    rel = stats["imported_files"][0][1]
+    item = pool_catalog.load_catalog(dataset)["items"][rel]
+    stored = ds.file_sha256(os.path.join(ds.images_dir(dataset), rel))
+    assert item["stored_sha256"] == stored, "记的要是盘上这份字节"
+    assert item["sha256"] == ds.file_sha256(str(source)), "原图哈希还得留着，重传原件靠它"
+    # 只进池的素材不进任何库索引：各模块看不到它，但去重要认得
+    assert rel not in ds.load_index(dataset, "pose").items
+
+
 def test_perceptual_dedupe_catches_near_duplicate(dataset, tmp_path):
     import numpy as np
 

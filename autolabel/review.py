@@ -50,6 +50,7 @@ from .library import (
     normalize,
 )
 from .models import (
+    UnknownModel,
     delete_profile,
     delete_weight,
     download_state,
@@ -400,9 +401,8 @@ class ReviewStore:
         }
 
     def read_item(self, image_rel: str) -> dict:
+        self._require_item(self.index, image_rel, LIB_POSE)
         item = self.index.get(image_rel)
-        if item is None:
-            raise KeyError(image_rel)
         label = label_path_for(self.root, image_rel)
         persons = parse_label_file(label) if os.path.exists(label) else []
         return {
@@ -429,10 +429,8 @@ class ReviewStore:
     def write_item(self, image_rel: str, objects: List[dict], status: Optional[str] = None) -> dict:
         # 后台标注可能刚写入新图/新字段，锁内先对齐磁盘状态再改
         with self._mutate():
-            item = self.index.get(image_rel)
-            if item is None:
-                raise KeyError(image_rel)
-            item = dict(item)
+            self._require_item(self.index, image_rel, LIB_POSE)
+            item = dict(self.index.get(image_rel))
             h = int(item.get("height") or 0)
             w = int(item.get("width") or 0)
             persons = persons_from_payload(objects, w, h)
@@ -471,8 +469,8 @@ class ReviewStore:
         永远打不开的图，张数、未标注数、缩略图列表全都对不上（实测 1 张变 2 张）。
         """
         if index.get(image_rel) is None:
-            raise ValueError(f"这张图已不在{LIB_NAMES[lib]}里（可能刚被另一个页面删除），"
-                             f"刷新页面就好：{image_rel}")
+            raise MissingImage(f"这张图已不在{LIB_NAMES[lib]}里（可能刚被另一个页面删除），"
+                               f"刷新页面就好：{image_rel}")
 
     def set_status(self, image_rel: str, status: str) -> dict:
         if status not in VALID_STATUS:
@@ -698,9 +696,8 @@ class ReviewStore:
         """
         lib = normalize(lib)
         index = self.index_for(lib)
+        self._require_item(index, image_rel, lib)
         item = index.get(image_rel)
-        if item is None:
-            raise KeyError(image_rel)
         key = lambda name: field_key(lib, name)          # noqa: E731 只在这个小函数里用
         stale_flag = "model_stale" if lib == LIB_DETECT else "prompt_stale"
         width = int(item.get("width") or 0)
@@ -737,9 +734,8 @@ class ReviewStore:
             # 新对象，锁外拿到的那份写回去会盖掉刚同步进来的状态（实测：写完框
             # 接口返回 1 个框，/api/dataset 里却又是未标注）。
             index = self.index_for(lib)
+            self._require_item(index, image_rel, lib)
             item = index.get(image_rel)
-            if item is None:
-                raise KeyError(image_rel)
             width = int(item.get("width") or 0)
             height = int(item.get("height") or 0)
             registry = {int(field.get("class_id", -1)): field
@@ -1236,7 +1232,10 @@ class ReviewStore:
     def weight_download_state(self, name: str) -> dict:
         state = download_state(name)
         if state is None:
-            raise KeyError(f"没有 {name} 的下载记录")
+            # 轮询下载进度走这里：以前抛 KeyError，界面上拼成
+            # 「未知对象: 没有 yolov8n.pt 的下载记录」，读起来像程序内部报错
+            raise MissingImage(f"没有 {name or '这个权重'} 的下载记录"
+                               "（下载记录可能已被清除），刷新页面看最新状态")
         return state
 
     def save_vlm_profile(self, profile: dict) -> dict:
@@ -1303,8 +1302,13 @@ class ReviewStore:
             width, height = int(item.get("width") or 0), int(item.get("height") or 0)
             flags = image_level_flags(height, width, persons)
             scores = [person.score for person in persons if person.score]
+            # YOLO 标签本来就不存模型置信度，撤销回来的那份永远一个分值都没有。
+            # 这里写成 0 会让刚撤销的图当场被判成「低置信待复核」、跳到复核队列最前面，
+            # 明明只是把误改退回去却像多冒出一个问题——沿用索引里的历史分值，
+            # 与 write_item 同一条规矩。
+            score = round(sum(scores) / len(scores), 4) if scores else float(item.get("score") or 0.0)
             self.index.upsert(image_rel, status=STATUS_UNREVIEWED, objects=len(persons),
-                              score=round(sum(scores) / len(scores), 4) if scores else 0.0,
+                              score=score,
                               visible_ratio=_visible_ratio(persons),
                               flags=[flag for flag in flags if not flag.startswith("obj:")],
                               object_flags=sorted({flag for person in persons
@@ -1481,6 +1485,16 @@ def _clamp01(value: float) -> float:
 # --------------------------------------------------------------------------- #
 # HTTP
 # --------------------------------------------------------------------------- #
+
+class MissingImage(ValueError):
+    """要点名的那张图已经不在本库了（多半是另一个标签页刚删掉）。
+
+    单独一个异常类：这句话天然是「按 404 回」的语义，但又要带上中文原因。
+    以前这些路径直接 ``raise KeyError(图片名)``，界面上弹出来的是
+    「未知对象: c3.jpg」——既没说图去了哪，也没说该干什么，
+    而同一个页面上「接受」「撤销」两处早就在说人话了，三种口径并存。
+    """
+
 
 class UnknownEndpoint(ValueError):
     """界面打了一个服务端没有的接口。
@@ -1681,6 +1695,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, status=404)
         except FileNotFoundError as exc:
             self._send_json({"error": f"文件不存在: {exc}"}, status=404)
+        except MissingImage as exc:
+            # 图不在本库：状态码照旧 404，但要说清「图去哪了、该怎么办」
+            self._send_json({"error": str(exc)}, status=404)
+        except UnknownModel as exc:
+            # 模型找不到：句子由抛的地方说完整，这里只负责状态码
+            self._send_json({"error": str(exc)}, status=404)
         except KeyError as exc:
             self._send_json({"error": f"未知对象: {exc.args[0] if exc.args else ''}"}, status=404)
         except ValueError as exc:
@@ -1898,6 +1918,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
             # 于是同一个不存在的地址 GET 给 404、POST 给 400——前端按状态码分支就懵了。
             self._send_json({"error": str(exc)}, status=404)
         except FileNotFoundError as exc:
+            self._send_json({"error": str(exc)}, status=404)
+        except MissingImage as exc:
+            # 图不在本库：状态码照旧 404，但要说清「图去哪了、该怎么办」
+            self._send_json({"error": str(exc)}, status=404)
+        except UnknownModel as exc:
+            # 模型找不到：句子由抛的地方说完整，这里只负责状态码
             self._send_json({"error": str(exc)}, status=404)
         except KeyError as exc:
             self._send_json({"error": f"未知对象: {exc.args[0] if exc.args else ''}"}, status=404)

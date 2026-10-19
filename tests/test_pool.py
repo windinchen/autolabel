@@ -662,3 +662,54 @@ def test_pool_job_reports_which_files_were_dropped(server, dataset):
     job = wait_job(base, json.loads(body)["id"])
     assert job["ok"] and job["result"]["imported"] == 0, job
     assert "与已有素材内容相同" in job["message"], job["message"]
+
+
+# --------------------------------------------------------------------------- //
+# 账本写入必须串行：两个写者撞上时，后写的会把先写的整本盖掉
+# --------------------------------------------------------------------------- //
+def test_pool_writes_wait_for_the_dataset_lock(dataset):
+    """改分类 / 记账要等批次锁，否则导入任务与界面操作会互相盖账。
+
+    盖账的后果比界面卡一下严重得多：只进池的素材在账本上消失了，文件还留在
+    ``images/``，下次启动对账就把它们当孤儿图抢进姿态库——用户完全看不出发生过什么。
+    """
+    import threading
+
+    from autolabel import batches as bt
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def keeper():
+        with bt._file_lock(dataset):
+            holding.set()
+            release.wait(10)
+
+    keeper_thread = threading.Thread(target=keeper, daemon=True)
+    keeper_thread.start()
+    assert holding.wait(10), "锁没拿起来"
+
+    written = threading.Event()
+
+    def writer():
+        pool_catalog.save_category(dataset, "等锁的分类")
+        written.set()
+
+    writer_thread = threading.Thread(target=writer, daemon=True)
+    writer_thread.start()
+    assert not written.wait(0.4), "改分类没等批次锁：两个写者会互相盖掉整本账"
+    release.set()
+    writer_thread.join(10)
+    keeper_thread.join(10)
+    assert written.is_set(), "放开锁之后分类要写进去"
+    assert "等锁的分类" in pool_catalog.category_map(dataset).values()
+
+
+def test_record_files_writes_the_whole_batch_in_one_pass(dataset, fresh_dir):
+    """只进池的素材一次写账：一张重写一遍整本账本，255 张就是 255 次整本落盘。"""
+    imported, _stats = import_only(dataset, fresh_dir)
+    book = ledger(dataset)
+    assert set(imported) <= set(book), "整批导入后账本里就该有这些素材"
+    for rel in imported:
+        assert book[rel].get("sha256"), f"{rel} 缺哈希，下次导入认不出重复"
+        assert book[rel].get("bytes"), f"{rel} 缺体积，素材池卡片会写 0 KB"

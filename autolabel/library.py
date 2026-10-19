@@ -261,7 +261,7 @@ def split_legacy_index(root: str) -> Tuple[int, int]:
 
     pose_batch_ids = {str(row.get("id")) for row in load_batches(root, LIB_POSE)}
     objects_batch_ids = {str(row.get("id")) for row in load_batches(root, LIB_OBJECTS)}
-    pool_keys = ("width", "height", "sha256", "bytes", "dhash", "imported_at",
+    pool_keys = ("width", "height", "sha256", "stored_sha256", "bytes", "dhash", "imported_at",
                  "source", "video", "batch_id")
     objects_items: Dict[str, dict] = {}
     stripped = 0

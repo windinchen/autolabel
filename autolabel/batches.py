@@ -716,25 +716,30 @@ def delete_pool_batches(root: str, batch_ids: Sequence[str], *, keep_files: bool
         items += int(out.get("items") or 0)
         files += int(out.get("files_removed") or 0)
 
-    catalog = pool_catalog.load_catalog(root)
     wanted = set(ids)
-    detached = 0
-    if keep_files:
-        # 素材还在池里，来处就得留着：批次行只标成「已退回模块外」。连着批次行一起删，
-        # 这 43 个素材就变成了「没有批次」——素材池页既看不出它们从哪来，
-        # 也没法再按这一批筛出来删（用户报的「导入的没有批次、也没法删除」就是这么来的）
-        for row in catalog["batches"]:
-            if str(row.get("id")) in wanted:
-                row["status"] = POOL_STATUS_RETIRED
-                row["message"] = "整批退回模块外，素材仍在池里"
-    else:
-        catalog["batches"] = [row for row in catalog["batches"]
-                              if str(row.get("id")) not in wanted]
-        for item in list(catalog["items"].values()):
-            if str(item.get("batch") or "") in wanted:
-                item.pop("batch", None)
-                detached += 1
-    pool_catalog.save_catalog(root, catalog)
+
+    def _settle(catalog: dict) -> int:
+        """收尾池账本：只摘引用就留行改状态，真删才删行并摘掉素材上的来处章。"""
+        settled = 0
+        if keep_files:
+            # 素材还在池里，来处就得留着：批次行只标成「已退回模块外」。连着批次行一起删，
+            # 这 43 个素材就变成了「没有批次」——素材池页既看不出它们从哪来，
+            # 也没法再按这一批筛出来删（用户报的「导入的没有批次、也没法删除」就是这么来的）
+            for row in catalog["batches"]:
+                if str(row.get("id")) in wanted:
+                    row["status"] = POOL_STATUS_RETIRED
+                    row["message"] = "整批退回模块外，素材仍在池里"
+        else:
+            catalog["batches"] = [row for row in catalog["batches"]
+                                  if str(row.get("id")) not in wanted]
+            for item in list(catalog["items"].values()):
+                if str(item.get("batch") or "") in wanted:
+                    item.pop("batch", None)
+                    settled += 1
+        return settled
+
+    # 读→改→写整段要在锁里：这段跑在删文件之后，中间插进来一次分类操作就会被盖掉
+    detached = int(pool_catalog.mutate_catalog(root, _settle) or 0)
     return {"batches": sorted(wanted), "items": items, "removals": removals,
             "files_removed": files, "snapshot": snapshot, "keep_files": keep_files,
             "mode": "pool_batch", "lib": "pool", "libs": sorted(set(libs)),
@@ -753,6 +758,7 @@ def keep_tracked_in_pool(root: str, image_rels: Sequence[str]) -> List[str]:
     root = os.path.abspath(root)
     ledger = pool_catalog.pool_items_map(root)
     recorded: List[str] = []
+    pending: Dict[str, dict] = {}
     for rel in image_rels:
         rel = str(rel).replace("\\", "/")
         if not rel or libs_holding_image(root, rel):
@@ -767,8 +773,11 @@ def keep_tracked_in_pool(root: str, image_rels: Sequence[str]) -> List[str]:
         if not known.get("sha256"):
             # 哈希是去重的唯一依据：漏一次，同一个视频抽两遍就落双份
             fields["sha256"] = file_sha256(path)
-        pool_catalog.record_file(root, rel, fields)
+        pending[rel] = fields
         recorded.append(rel)
+    if pending:
+        # 整批只写一次账：删一批素材要补记的就是这一整批
+        pool_catalog.record_files(root, list(pending.items()))
     return recorded
 
 
