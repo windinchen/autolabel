@@ -649,3 +649,94 @@ def test_export_note_ui_ships_reveal_and_copy_buttons():
         assert "revealExport(info.out" in script, page
         assert "openedSuffix(opened)" in script, page
 
+
+
+# --------------------------------------------------------------------------- //
+# 检测框的置信度（两个框类库共用一套）
+# --------------------------------------------------------------------------- //
+def test_box_confidence_survives_reopening_the_page(dataset):
+    """检测页每个框的置信度以前全是 ``0.00``。
+
+    根因不在前端：YOLO detection 的 5 列标签不落置信度，重读磁盘每个框都「失忆」
+    成 0，反倒人工框被补成 1.0 更显眼——最该看分数的模型框恰恰看不见。
+    """
+    add_fields(dataset, "bottle", "backpack")
+    rv.ReviewStore(dataset).write_prompt_item(
+        sorted(ds.load_index(dataset, "objects").items)[0],
+        [{"cls": 0, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.4, "score": 0.83},
+         {"cls": 1, "cx": 0.2, "cy": 0.3, "w": 0.15, "h": 0.15, "score": 0.42}],
+        status="edited")
+
+    again = rv.ReviewStore(dataset).read_prompt_item(
+        sorted(ds.load_index(dataset, "objects").items)[0], "objects")
+
+    assert [box["score"] for box in again["objects"]] == [0.83, 0.42]
+    assert again["score"] == pytest.approx(0.625)
+
+
+def test_saving_a_box_does_not_flatten_the_average_to_zero(dataset):
+    """在检测页挪一下框再保存，整图平均置信度不能变成 0。
+
+    ``0.00`` 在复核排序里等于「最该先看」，抹平成 0 等于凭空造出一批假急件。
+    框挪过位置之后签名对不上，认不回来就保留原值，而不是写 0。
+    """
+    add_fields(dataset, "bottle")
+    image = sorted(ds.load_index(dataset, "objects").items)[0]
+    rv.ReviewStore(dataset).write_prompt_item(
+        image, [{"cls": 0, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.4, "score": 0.9}],
+        status="edited")
+
+    moved = rv.ReviewStore(dataset).read_prompt_item(image, "objects")["objects"]
+    moved[0]["cx"] = 0.61
+    moved[0]["score"] = None            # 前端手上那份也可能没有分数
+    saved = rv.ReviewStore(dataset).write_prompt_item(image, moved, status="edited")
+
+    assert saved["prompt_score"] == pytest.approx(0.9), "认不回分数就保留原值，别写 0"
+
+    moved_back = rv.ReviewStore(dataset).read_prompt_item(image, "objects")["objects"][0]
+    assert moved_back["score"] is None, "挪过位置的框认不回分数，界面要显示 —，不是假的 0.00"
+
+    rv.ReviewStore(dataset).undo_prompt(image, "objects")
+    restored = rv.ReviewStore(dataset).read_prompt_item(image, "objects")["objects"]
+    assert [box["score"] for box in restored] == [pytest.approx(0.9)], \
+        "撤销回来的那个框要连当年的分数一起认回来"
+
+
+def test_deleting_every_box_does_report_zero_confidence(dataset):
+    """框全删光时 ``0.00`` 是**真话**，必须落回 0，不能抱着上一个版本的分数不放。"""
+    add_fields(dataset, "bottle")
+    image = sorted(ds.load_index(dataset, "objects").items)[0]
+    store = rv.ReviewStore(dataset)
+    store.write_prompt_item(image, [{"cls": 0, "cx": 0.5, "cy": 0.5, "w": 0.2, "h": 0.4,
+                                     "score": 0.95}], status="edited")
+
+    emptied = rv.ReviewStore(dataset).write_prompt_item(image, [], status="edited")
+
+    assert emptied["prompt_score"] == 0.0
+    assert "none_found" in emptied["prompt_flags"]
+
+    rv.ReviewStore(dataset).undo_prompt(image, "objects")
+    restored = rv.ReviewStore(dataset).read_prompt_item(image, "objects")
+    assert restored["objects"][0]["score"] == pytest.approx(0.95), \
+        "分数表要留着，撤销才能连分数一起认回来"
+    assert restored["score"] == pytest.approx(0.95)
+
+
+def test_score_map_does_not_accumulate_boxes_that_are_gone(dataset):
+    """反复改框会在分数表里攒下一堆早就消失的签名。
+
+    上限就是撤销能回到的那几个版本（当前标签 + 原始备份 + 至多 ``HISTORY_LIMIT``
+    份快照），再老的签名留着也没人再认得到，白白把索引撑大。
+    """
+    add_fields(dataset, "bottle")
+    image = sorted(ds.load_index(dataset, "objects").items)[0]
+    for step in range(14):
+        rv.ReviewStore(dataset).write_prompt_item(
+            image, [{"cls": 0, "cx": round(0.1 + step * 0.05, 6), "cy": 0.5,
+                     "w": 0.1, "h": 0.2, "score": 0.5}], status="edited")
+
+    stored = ds.load_index(dataset, "objects").get(image)["prompt_scores"]
+
+    # 撤销最远能回到「当前标签 + 原始备份 + HISTORY_LIMIT 份快照」，分数表就只留这些
+    assert len(stored) <= rv.HISTORY_LIMIT + 2, sorted(stored)
+    assert round(max(stored.values()), 2) == 0.5

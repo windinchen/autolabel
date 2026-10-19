@@ -152,7 +152,9 @@ class Detection:
     def payload(self, width: int, height: int) -> dict:
         x1, y1, x2, y2 = self.xyxy(width, height)
         return {"cls": int(self.cls), "cx": round(self.cx, 6), "cy": round(self.cy, 6),
-                "w": round(self.w, 6), "h": round(self.h, 6), "score": round(self.score, 4),
+                "w": round(self.w, 6), "h": round(self.h, 6),
+                # 0 分是"没拿到分数"，不是"模型很有把握地给了 0 分"：交给界面显示 —
+                "score": round(self.score, 4) if self.score > 0 else None,
                 "flags": list(self.flags),
                 "xyxy": [round(v, 2) for v in (x1, y1, x2, y2)]}
 
@@ -179,6 +181,52 @@ def apply_manual_marks(detections: List[Detection], indices: Sequence[int]) -> L
             detection.flags = sorted(set(list(detection.flags) + ["manual"]))
             if detection.score <= 0:
                 detection.score = 1.0
+    return detections
+
+
+def signature_from_row(row: Sequence[float]) -> str:
+    """一个框的「身份」：类别号 + 归一化几何，精度与标签文件完全一致。
+
+    为什么不拿框的顺序下标当身份：用户删一个框、补画一个框，后面所有下标统统
+    错位——``*_manual_boxes`` 就是这么把模型框说成人工框的。几何不会骗人，
+    同一个框不管排在第几行，签名都是同一个。
+    """
+    cls = int(float(row[0]))
+    shape = "|".join("%.6f" % min(1.0, max(0.0, float(value))) for value in row[1:5])
+    return "%d|%s" % (cls, shape)
+
+
+def box_signature(item: Detection) -> str:
+    return signature_from_row((item.cls, item.cx, item.cy, item.w, item.h))
+
+
+def score_map(detections: Sequence[Detection]) -> Dict[str, float]:
+    """把逐框置信度按几何签名收成一张表，交给索引落盘。
+
+    置信度只有标注那一刻拿得到：5 列标签不落这一列，重读磁盘全是 0，于是检测页
+    每个模型框都显示 ``0.00``，反倒是人工框（被补成 1.0）更显眼——最该看分数的
+    那批框恰恰看不见。
+    """
+    return {box_signature(item): round(float(item.score), 4)
+            for item in detections if float(item.score) > 0}
+
+
+def apply_scores(detections: List[Detection], stored: object) -> List[Detection]:
+    """按签名把分数贴回刚从磁盘读出来的框；认不出的原样留着 0（界面显示 ``—``）。
+
+    只填没有分数的框，人工框在 :func:`apply_manual_marks` 里已经是 1.0。
+    """
+    table = stored if isinstance(stored, dict) else {}
+    for item in detections:
+        if item.score > 0:
+            continue
+        value = table.get(box_signature(item))
+        try:
+            number = float(value)     # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            item.score = number
     return detections
 
 
@@ -626,6 +674,9 @@ def run_prompt_labeling(
                    prompt_flags=flags, prompt_signature=signature, prompt_error="",
                    prompt_score=round(sum(scores) / len(scores), 4), prompt_labeled_at=now_str(),
                    prompt_profile=profile.get("name", ""),
+                   # 逐框置信度单独存一张表：5 列标签不落这一列，不落盘的话
+                   # 下次打开界面每个模型框都变成 0.00
+                   prompt_scores=score_map(detections),
                    # 这批框全部出自模型：人工标记与类别号都要跟着重写，否则索引里会
                    # 留下指向不存在框的人工标记（撤销与导出都会被带偏）
                    prompt_manual=0, prompt_manual_boxes=[],

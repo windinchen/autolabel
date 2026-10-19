@@ -55,6 +55,7 @@ from .prompt import (
     image_flags,
     read_detections,
     render_object_coords,
+    score_map,
     write_detections,
     write_object_coordinate_files,
 )
@@ -409,6 +410,9 @@ def run_detect_labeling(
                    detect_flags=flags, detect_signature=signature, detect_error="",
                    detect_score=round(sum(scores) / len(scores), 4),
                    detect_labeled_at=now_str(), detect_model=matched["model"],
+                   # 逐框置信度单独存一张表：5 列标签不落这一列，不落盘的话
+                   # 下次打开界面每个模型框都变成 0.00
+                   detect_scores=score_map(detections),
                    # 这批框全部出自模型：人工标记与类别号都要跟着重写，
                    # 否则索引里会留下指向不存在框的人工标记（撤销与导出会被带偏）
                    detect_manual=0, detect_manual_boxes=[],

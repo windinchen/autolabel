@@ -82,6 +82,7 @@ from .fields import (
     delete_field,
     fields_payload as fields_payload_for,
     list_fields,
+    read_label_rows,
     resolve_fields as resolve_prompt_fields,
     upsert_field,
 )
@@ -89,16 +90,52 @@ from .prompt import (
     PROMPT_FLAG_HINTS,
     Detection,
     apply_manual_marks,
+    apply_scores,
     box_flags,
     image_flags,
     prompt_priority,
     prompt_summary,
     read_detections,
     resolve_profile,
+    score_map,
+    signature_from_row,
     write_detections,
 )
 
 VALID_STATUS = set(ALL_STATUSES)
+
+
+def average_score(detections: Sequence[Detection], previous: object) -> float:
+    """整图平均置信度：没框就是 0；有框但分数认不回来就保留原值。
+
+    detection 标签不落分数、重读磁盘全是 0，照着 0 平均会把模型给的 0.83 抹成
+    ``0.00``；而 ``0.00`` 在复核排序里等于「最该先看」，等于凭空造出一批假急件。
+
+    反过来，一个框都没有时 ``0.00`` 是**真话**（这张确实没有框），此时必须落回 0，
+    不能抱着上一个版本的分数不放——否则删空的图还挂着「平均置信度 0.8」。
+    """
+    if not detections:
+        return 0.0
+    scores = [item.score for item in detections if item.score > 0]
+    if scores:
+        return round(sum(scores) / len(scores), 4)
+    if previous is None or previous == "":
+        return 0.0
+    try:
+        return float(previous)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def prune_score_map(stored: Dict[str, float], paths: Sequence[str]) -> Dict[str, float]:
+    """只留「撤销还得回来」的那些框的分数。
+
+    分数表按几何签名存，改来改去会攒下一堆早就不在标签里的签名；上限就是撤销
+    能回到的那几个版本（当前标签 + 原始备份 + 至多 ``HISTORY_LIMIT`` 份快照），
+    再老的签名留着也没人再认得到。
+    """
+    wanted = {signature_from_row(row) for path in paths for row in read_label_rows(path)}
+    return {key: value for key, value in stored.items() if key in wanted}
 
 
 def status_argument(value: object) -> str:
@@ -590,8 +627,10 @@ class ReviewStore:
         stale_flag = "model_stale" if lib == LIB_DETECT else "prompt_stale"
         width = int(item.get("width") or 0)
         height = int(item.get("height") or 0)
-        detections = apply_manual_marks(read_detections(self.root, image_rel, lib),
-                                       item.get(key("manual_boxes")) or [])
+        detections = apply_scores(
+            apply_manual_marks(read_detections(self.root, image_rel, lib),
+                               item.get(key("manual_boxes")) or []),
+            item.get(key("scores")) or {})
         known = [int(field.get("class_id", -1)) for field in list_fields(self.root, lib)]
         per_box = box_flags(detections, width, height, known)
         return {
@@ -642,14 +681,18 @@ class ReviewStore:
                 if detection.w <= 0 or detection.h <= 0:
                     raise ValueError("框的宽高必须大于 0")
                 detections.append(detection)
+            # 前端没带分数的框（手画的、或它自己也是从磁盘读来的）按几何签名认回来
+            apply_scores(detections, item.get(key("scores")) or {})
             per_box = box_flags(detections, width, height, list(registry))
             manual_indices = [index for index, raw in enumerate(objects or [])
                               if "manual" in (raw.get("flags") or [])]
-            scores = [detection.score for detection in detections]
             self._backup(image_rel, label_path_for(self.root, image_rel, lib),
                          backup_path=self._box_backup_path(image_rel, lib),
                          history_dir=self._box_history_dir(image_rel, lib))
             write_detections(self.root, image_rel, detections, lib)
+            merged = dict(item.get(key("scores")) or {})
+            merged.update(score_map(detections))
+            stored_scores = prune_score_map(merged, self._restorable_labels(image_rel, lib))
             flags = image_flags(detections, per_box,
                                 stale_flag=stale_flag,
                                 failed_flag="model_failed" if lib == LIB_DETECT else "vlm_failed")
@@ -661,7 +704,8 @@ class ReviewStore:
             fields_written = {key("objects"): len(detections), key("status"): new_status,
                               key("flags"): flags, key("manual"): len(manual_indices),
                               key("manual_boxes"): manual_indices, key("error"): "",
-                              key("score"): round(sum(scores) / len(scores), 4) if scores else 0.0,
+                              key("score"): average_score(detections, item.get(key("score"))),
+                              key("scores"): stored_scores,
                               key("classes"): sorted({detection.cls for detection in detections}),
                               key("reviewed_at"): now_str()}
             index.upsert(image_rel, **fields_written)
@@ -1121,6 +1165,8 @@ class ReviewStore:
             count = len(detections)
             index = self.index_for(lib)
             item = index.get(image_rel) or {}
+            # 撤销回来的那批框要靠签名重新认回分数：它们在标注那一刻是有的
+            apply_scores(detections, item.get(key("scores")) or {})
             width, height = int(item.get("width") or 0), int(item.get("height") or 0)
             stale_flag = "model_stale" if lib == LIB_DETECT else "prompt_stale"
             per_box = box_flags(detections, width, height,
@@ -1130,15 +1176,14 @@ class ReviewStore:
                                 failed_flag="model_failed" if lib == LIB_DETECT else "vlm_failed")
             if stale_flag in (item.get(key("flags")) or []):
                 flags = sorted(set(flags) | {stale_flag})
-            scores = [detection.score for detection in detections]
             # ``manual_boxes`` 存的是「第几个框是人工画的」下标：框换成旧的那份之后
             # 下标全错位，留着就会把模型框说成人工框、把 score 抬到 1.0，
             # 还顺带改变复核排序。撤销之后人工标记认不回来了，只能清空
             index.upsert(image_rel, **{key("status"): STATUS_UNREVIEWED, key("objects"): count,
                                        key("flags"): flags,
                                        key("manual"): 0, key("manual_boxes"): [],
-                                       key("score"): round(sum(scores) / len(scores), 4)
-                                       if scores else 0.0,
+                                       key("score"): average_score(detections,
+                                                                   item.get(key("score"))),
                                        key("classes"): sorted({detection.cls
                                                                for detection in detections}),
                                        key("reviewed_at"): now_str()})
@@ -1201,6 +1246,17 @@ class ReviewStore:
 
     def _box_history_dir(self, image_rel: str, lib: str = LIB_OBJECTS) -> str:
         return os.path.join(history_root(self.root, lib), self._stem(image_rel))
+
+    def _restorable_labels(self, image_rel: str, lib: str = LIB_OBJECTS) -> List[str]:
+        """撤销能回到的那几份标签：当前标签 + 原始备份 + 还在的历史快照。
+
+        逐框分数表按它裁剪，才不会攒一堆永远认不回来的签名。
+        """
+        history = self._box_history_dir(image_rel, lib)
+        paths = [label_path_for(self.root, image_rel, lib), self._box_backup_path(image_rel, lib)]
+        if os.path.isdir(history):
+            paths += [os.path.join(history, name) for name in sorted(os.listdir(history))]
+        return paths
 
     def _prompt_backup_path(self, image_rel: str) -> str:
         return self._box_backup_path(image_rel, LIB_OBJECTS)

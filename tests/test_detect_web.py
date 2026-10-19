@@ -7,6 +7,8 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -316,6 +318,77 @@ def test_detect_models_lists_usable_and_explains_the_rest(server, weights):
     assert "检测库用不了" in note and "姿态" in note
     assert set(payload["prefs"]) <= {"model", "classes", "conf", "updated_at"}
     assert payload["device"]
+
+
+def run_static_function(name, argument):
+    """把 objects.js 里的一个纯函数抠出来交给 node 求值。
+
+    归并/截断这类文案逻辑写在 JS 里，隔正则是猜不出结果的；node 不在就跳过，
+    不为一个提示语把测试绑死在某个运行时上。
+    """
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("本机没有 node，跳过前端纯函数求值")
+    source = read_static("objects.js")
+    params, body = source.split("function %s(" % name, 1)[1].split(") {", 1)
+    body = body.split("\n}", 1)[0]
+    script = ("const arg = JSON.parse(process.argv[1]);"
+              "const fn = Function(...JSON.parse(process.argv[2]), process.argv[3]);"
+              "process.stdout.write(JSON.stringify(fn(arg)));")
+    done = subprocess.run([node, "-e", script, json.dumps(argument),
+                           json.dumps([item.strip() for item in params.split(",")]), body],
+                          capture_output=True, text=True, timeout=60)
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+POSE_NOTE = "这是「人体姿态」权重，检测库用不了；人体骨骼请回姿态标注"
+
+
+def test_unusable_weight_note_says_each_reason_once():
+    """一排姿态权重不能把同一句话刷十几遍。
+
+    实测：本机摆了 13 个 ``*-pose.pt``，「用不了的权重」就刷出 13 模一样的
+    「这是「人体姿态」权重，检测库用不了；人体骨骼请回姿态标注」，真正要看的
+    那句被埋在最底下。归并是展示层的事——接口照旧按文件逐条回 ``note``，
+    那份还要给「设为默认」的报错用。
+    """
+    pose = [{"name": "yolo%s-pose.pt" % tag, "note": POSE_NOTE}
+            for tag in ("11n", "11s", "11m", "11l", "11x", "8n", "8s", "8m", "8l", "8x",
+                        "26n", "26s", "26m")]
+    got = run_static_function("unusableWeightsNote", pose)
+
+    assert got["text"].count("人体骨骼请回姿态标注") == 1, got["text"]
+    assert "等 13 个" in got["text"], got["text"]
+    assert "yolo11n-pose.pt" in got["text"] and "yolo26m-pose.pt" not in got["text"], \
+        "正文只留前三个，其余收进悬停提示"
+    for row in pose:
+        assert row["name"] in got["title"], "悬停提示要能找回每一个权重"
+
+
+def test_unusable_weight_note_keeps_single_and_mixed_cases():
+    """归并不能把「只有一副用不了」这种最常见的情况写成复数，也不能把不同原因并掉。"""
+    only = [{"name": "yolo11n-cls.pt", "note": "这是「图像分类」权重，检测库用不了"}]
+    assert run_static_function("unusableWeightsNote", only)["text"] == \
+        "用不了的权重 · yolo11n-cls.pt：这是「图像分类」权重，检测库用不了"
+
+    mixed = run_static_function("unusableWeightsNote", [
+        {"name": "a-pose.pt", "note": POSE_NOTE},
+        {"name": "b-pose.pt", "note": POSE_NOTE},
+        {"name": "c-cls.pt", "note": "这是「图像分类」权重，检测库用不了"},
+        {"name": "d.pt"},                                  # 后端没给原因
+    ])
+    assert mixed["text"].count("人体骨骼请回姿态标注") == 1, mixed["text"]
+    assert "c-cls.pt" in mixed["text"] and "d.pt" in mixed["text"], mixed["text"]
+    assert run_static_function("unusableWeightsNote", [])["text"] == ""
+
+
+def test_unusable_weight_note_is_rendered_through_the_grouping():
+    """三个面板必须都走归并后的文案，别留一处还在逐个拼。"""
+    source = read_static("objects.js")
+    assert "unusableWeightsNote(modelState.unusable)" in source
+    assert "modelState.unusable.map(" not in source, "还有一处逐个拼「名字：原因」"
+    assert 'el.title = unusable.title' in source, "完整清单得有地方放"
 
 
 def test_detect_model_classes_and_import_roundtrip(server, dataset, weights):

@@ -107,8 +107,9 @@ def label_field_keys(lib: Optional[str] = LIB_POSE) -> Tuple[str, ...]:
     姿态库历史上把参数指纹写成不带前缀的 ``label_signature``，单独补进来。
     """
     name = normalize(lib)
-    fields = ["objects", "score", "classes", "flags", "object_flags", "visible_ratio",
-              "signature", "labeled_at", "error"]
+    # ``scores`` 是框类库的逐框置信度表（按几何签名存），标签没了它也就没人认得了
+    fields = ["objects", "score", "scores", "classes", "flags", "object_flags",
+              "visible_ratio", "signature", "labeled_at", "error"]
     keys = [field_key(name, item) for item in fields]
     if name == LIB_POSE:
         keys.append("label_signature")

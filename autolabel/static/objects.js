@@ -364,6 +364,13 @@ const toScreen = (x, y) => [x * state.view.scale + state.view.ox, y * state.view
 
 window.addEventListener("appearancechange", () => { draw(); });
 
+/** 框上的置信度：没拿到分数就显示 —，别拿 0.00 冒充「模型很有把握地给了 0 分」。
+ *
+ *  detection 标签只有 5 列，不落这一列；分数靠索引里按几何签名存的那张表认回来，
+ *  认不到就是真没有（老数据、或框被挪过位置）。
+ */
+const boxScore = (v) => (v === null || v === undefined || v === "" ? "—" : Number(v).toFixed(2));
+
 async function draw() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
   if (!state.img) return;
@@ -390,7 +397,7 @@ async function draw() {
     if (!showLabels) return;
     const small = (box.flags || []).includes("small_box") ? " ⚠" : "";
     const edge = (box.flags || []).includes("edge_box") ? " ✂" : "";
-    const label = `${fieldName(box.cls)} · ${Number(box.score || 0).toFixed(2)}${small}${edge}`;
+    const label = `${fieldName(box.cls)} · ${boxScore(box.score)}${small}${edge}`;
     ctx.font = cfont(12);
     const w = ctx.measureText(label).width + 8;
     const top = Math.max(0, y1 - 16);
@@ -810,7 +817,7 @@ function renderBoxes() {
     dot.textContent = fieldName(boxItem.cls);
     name.append(dot);
     const chips = document.createElement("span");
-    chips.textContent = ` ${(Number(boxItem.score || 0)).toFixed(2)} `;
+    chips.textContent = ` ${boxScore(boxItem.score)} `;
     for (const flag of boxItem.flags || []) {
       const chip = document.createElement("span");
       chip.className = "chip" + (flag === "manual" ? "" : " warn");
@@ -1065,6 +1072,34 @@ async function loadModelChoices() {
   modelState.loading = false;
 }
 
+/** 把「用不了的权重」按原因归并：同一种原因只说一遍，文件名收成一行。
+ *
+ *  以前逐个拼「名字：原因」，本机一摆就是十一个姿态权重，屏幕上刷出十一模
+ *  一样的两句话，真正要看的「人体骨骼请回姿态标注」被埋在最底下。原因相同的
+ *  归成一条，名字最多列三个，完整清单挂在这行的悬停提示里。
+ */
+function unusableWeightsNote(rows) {
+  const groups = new Map();
+  for (const row of rows || []) {
+    const reason = row.note || "这个任务的产出不是检测框";
+    if (!groups.has(reason)) { groups.set(reason, []); }
+    groups.get(reason).push(String(row.name || "未命名权重"));
+  }
+  const parts = [];
+  const titles = [];
+  for (const [reason, names] of groups) {
+    const cut = names.length > 3;
+    const listed = cut ? `${names.slice(0, 3).join("、")} 等 ${names.length} 个（悬停看全部）`
+      : names.join("、");
+    parts.push(names.length === 1 ? `${names[0]}：${reason}` : `${reason} —— ${listed}`);
+    titles.push(`${names.join("、")}：${reason}`);
+  }
+  return {
+    text: parts.length ? "用不了的权重 · " + parts.join("；") : "",
+    title: titles.join("\n"),
+  };
+}
+
 /** 三个下拉框（类别管理 / 批量运行 / 导入素材）共用同一份权重清单与同一个选择。 */
 function renderModelChoices() {
   for (const id of ["cls-model", "run-model", "up-model"]) {
@@ -1094,13 +1129,12 @@ function renderModelChoices() {
   const active = ($("cls-model") || {}).value || ($("run-model") || {}).value || "";
   if (active) { modelState.model = active; }
   // 用不了的权重不许从界面上消失：摆在下拉框下面，说清它为什么不能用在检测库
-  const text = modelState.unusable.length
-    ? "用不了的权重 · " + modelState.unusable.map((row) => `${row.name}：${row.note
-      || "这个任务的产出不是检测框"}`).join("；")
-    : "";
+  const unusable = unusableWeightsNote(modelState.unusable);
   for (const id of ["cls-model-note", "run-model-note", "up-model-note"]) {
     const el = $(id);
-    if (el) { el.textContent = text; }
+    if (!el) { continue; }
+    el.textContent = unusable.text;
+    el.title = unusable.title;
   }
 }
 

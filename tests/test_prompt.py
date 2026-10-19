@@ -476,3 +476,62 @@ def test_edited_boxes_count_as_human_work_too(dataset, one_profile, monkeypatch)
                                    extra_hint="只标桌上的", verbose=False)
     assert stats["protected"] == 1 and stats["labeled"] == 1, stats
     assert len(calls) == 3, "只有没被人工碰过的那张该再问一次模型"
+
+
+# --------------------------------------------------------------------------- //
+# 逐框置信度：5 列标签不落这一列，靠签名表认回来
+# --------------------------------------------------------------------------- //
+def test_box_signature_is_stable_across_a_round_trip_through_the_label_file(dataset):
+    """签名是逐框分数的钥匙：同一个框不管排第几、读回来第几次，都得是同一把钥匙。
+
+    ``*_manual_boxes`` 按顺序下标记人工框，用户删一个框后面全错位；分数要是也这么
+    存，「模型给的 0.83」就会贴到别的框身上，比不贴更坏。
+    """
+    a = pr.Detection(cls=0, cx=0.5, cy=0.5, w=0.2, h=0.4, score=0.83)
+    b = pr.Detection(cls=1, cx=0.25, cy=0.3, w=0.1, h=0.2, score=0.5)
+    assert pr.box_signature(a) != pr.box_signature(b)
+    # 类别号不同就是两个框，几何完全一样也要分开
+    assert pr.box_signature(a) != pr.box_signature(
+        pr.Detection(cls=1, cx=0.5, cy=0.5, w=0.2, h=0.4))
+
+    pr.write_detections(dataset, "img0.jpg", [a, b])
+    again = pr.read_detections(dataset, "img0.jpg")
+
+    assert [pr.box_signature(d) for d in again] == [pr.box_signature(a), pr.box_signature(b)], \
+        "落盘再读回来签名变了，分数表就永久认不回这些框"
+    assert pr.box_signature(a) == pr.box_signature(
+        pr.Detection(cls=0, cx=0.5000001, cy=0.5, w=0.2, h=0.4)), "精度要和标签文件一致（6 位小数）"
+
+
+def test_scores_come_back_by_signature_not_by_position(dataset):
+    """读回来的框全是 0 分，只有靠签名才能把分数贴回**原来那个**框。"""
+    kept = pr.Detection(cls=0, cx=0.5, cy=0.5, w=0.2, h=0.4, score=0.83)
+    silent = pr.Detection(cls=1, cx=0.25, cy=0.3, w=0.1, h=0.2, score=0.0)
+    stored = pr.score_map([kept, silent])
+    assert stored == {pr.box_signature(kept): 0.83}, "没有分数的框不该往表里写 0"
+
+    pr.write_detections(dataset, "img0.jpg", [kept, silent])
+    back = pr.read_detections(dataset, "img0.jpg")
+    assert [d.score for d in back] == [0.0, 0.0], "标签不落分数，读回来必然全 0"
+
+    pr.apply_scores(back, stored)
+    assert back[0].score == pytest.approx(0.83)
+    assert back[1].score == 0.0
+
+    # 换了顺序也要贴对：贴错框比显示 — 坏得多
+    flipped = pr.read_detections(dataset, "img0.jpg")[::-1]
+    pr.apply_scores(flipped, stored)
+    assert [round(d.score, 2) for d in flipped] == [0.0, 0.83]
+
+    for junk in ("不是表", None, {"随便": "乱码"}, {"随便": 0}):
+        pr.apply_scores(back, junk)
+
+
+def test_manual_marks_beat_the_stored_score(dataset):
+    """人工框在索引里按 1.0 计，签名表不能把它改回模型当年给的分。"""
+    box = pr.Detection(cls=0, cx=0.5, cy=0.5, w=0.2, h=0.4, score=0.7)
+    stored = pr.score_map([box])
+    pr.write_detections(dataset, "img0.jpg", [box])
+    back = pr.apply_scores(pr.apply_manual_marks(pr.read_detections(dataset, "img0.jpg"), [0]),
+                          stored)
+    assert back[0].score == 1.0 and "manual" in back[0].flags
