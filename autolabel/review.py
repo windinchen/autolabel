@@ -1052,7 +1052,8 @@ class ReviewStore:
         val_ratio = self._number(payload, "val_ratio", 0.2, 0.0, 1.0, "验证集比例")
         seed = int(self._number(payload, "seed", 7, None, None, "随机种子", integer=True))
         max_empty_ratio = self._number(payload, "max_empty_ratio", 0.15, 0.0, 1.0, "背景图比例上限")
-        mode = str(payload.get("mode") or "symlink")
+        # 图片放法没写就取系统设置那一档（默认硬链接）：软链接的产物一压缩就变空壳
+        mode = payload.get("mode")
         ready = self.pose_labelled_count(table[scope])
         if not ready:
             raise ValueError(self.no_pose_label_hint())
@@ -1087,8 +1088,7 @@ class ReviewStore:
         """存系统设置，并把「选了但用不了」当场说清楚，别等跑任务才发现。"""
         from . import settings as system
 
-        saved = system.save({k: payload.get(k)
-                             for k in ("device", "half", "imgsz", "conf") if k in payload})
+        saved = system.save({k: payload.get(k) for k in system.SETTINGS_KEYS if k in payload})
         facts = system.detect().get(saved["device"], {})
         note = ""
         if saved["device"] not in ("auto", "cpu") and facts and not facts.get("available"):
@@ -1191,7 +1191,7 @@ class ReviewStore:
             val_ratio=val_ratio, seed=seed, exclude_status=table[scope],
             max_empty_ratio=max_empty_ratio,
             tag=str(payload.get("tag") or "") or None,
-            mode=str(payload.get("mode") or "symlink"), lib=lib)
+            mode=payload.get("mode"), lib=lib)
         result["scope"] = scope
         result["lib"] = normalize(lib)
         return result

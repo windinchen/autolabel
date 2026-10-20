@@ -255,7 +255,7 @@ function buildSettingsModal() {
       <div class="set-note muted small">点一下就生效，不用保存；只影响这个浏览器，不会写进数据集。</div>
     </section>
     <section>
-      <div class="panel-title">推理参数</div>
+      <div class="panel-title">推理与导出</div>
       <div class="set-note muted small">标注跑在哪块卡上。选了这台机器没有的设备不会报错，跑的时候自动降级并说明原因。</div>
       <div class="set-note muted small" id="set-env" hidden></div>
       <div id="set-devices"></div>
@@ -269,6 +269,8 @@ function buildSettingsModal() {
         <span class="set-name">默认置信度<span class="muted small">低于这个分数的框直接丢掉，标服装/配件时调低它</span></span>
         <input class="set-num mono" id="set-conf" type="number" min="0.01" max="0.95" step="0.01" inputmode="decimal">
       </div>
+      <div class="set-row"><span class="set-name">导出训练集的图片<span class="muted small">硬链接能直接压缩、拷去别的机器训练，同一个磁盘不额外占空间</span></span></div>
+      <div class="seg" id="set-export-mode"></div>
       <div class="set-note muted small" id="set-openvocab" hidden></div>
       <div class="set-note muted small" id="set-status">读取中…</div>
     </section>
@@ -329,6 +331,8 @@ function renderSettingsPanel() {
   seg("set-font", FONT_CHOICES, appearance.fs, setFontStep);
   seg("set-imgsz", (settingsState.data || {}).imgsz_choices || [], settingsSaved().imgsz,
     (value) => saveSettings({ imgsz: value }));
+  seg("set-export-mode", (settingsState.data || {}).export_mode_choices || [],
+    settingsSaved().export_mode, (value) => saveSettings({ export_mode: value }));
   const confBox = $("set-conf");
   // 正在这个框里打字时别把用户刚敲的数字盖回去
   if (confBox && document.activeElement !== confBox) {
@@ -1715,6 +1719,7 @@ function exportSummary(info, kind) {
   }
   if (info.segment_note) bits.push(info.segment_note);
   if (info.skipped_note) bits.push(`没收进来的 ${info.skipped_note}`);
+  if (info.mode_label) bits.push(`图片用${info.mode_label}`);
   if (info.mode_note) bits.push(info.mode_note);
   const dropped = info.empty_dropped !== undefined ? info.empty_dropped : counts.empty_dropped;
   if (dropped) bits.push(`其中背景图按上限少收 ${dropped} 张`);

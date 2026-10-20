@@ -11,6 +11,9 @@ import shutil
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .dataset import label_path_for, load_index, now_str, source_missing
+from .settings import DEFAULTS as SETTING_DEFAULTS
+from .settings import EXPORT_MODE_VALUES
+from .settings import load as load_settings
 from .yolo_pose import (COCO17_KEYPOINTS, COCO17_FLIP_IDX, COCO17_SKELETON, label_object_count,
                         parse_label_file)
 
@@ -19,6 +22,85 @@ MISSING_LABEL_REASON = "缺少标签"
 MISSING_SOURCE_REASON = "源文件缺失（images/ 里的文件不在了）"
 EMPTY_CAP_REASON = "背景图超出比例上限"
 CLASS_RANGE_REASON = "类别号不在当前类别表"
+
+#: 默认硬链接：软链接在原地能训，一压缩 / 一拷走就只剩几十字节的链接记录
+DEFAULT_PLACE_MODE = str(SETTING_DEFAULTS["export_mode"])
+#: 软链接产物的症状，界面与命令行共用一句提醒
+SYMLINK_WARNING = ("图片是软链接，只能在这台电脑的原位置训练；压缩或拷到别的机器"
+                   "会变成几十字节的空壳，要带走请改用「硬链接」或「直接拷贝」重导一次")
+
+
+def place_mode(value: object = None, *, name: str = "导出时图片的放法") -> str:
+    """把导出时图片的放法收成 ``hardlink`` / ``copy`` / ``symlink``，没写就取系统设置那一档。
+
+    默认从软链接换成硬链接：以前导出的目录里图片全是软链接，用户把它压成 zip
+    拿去训练，每张图只剩 43 字节的链接记录，看起来就是「图片只有快捷方式」。
+    这个值也不许猜：填进一个不认识的词又默默按软链走，症状要等到压缩打包才暴露。
+    """
+    mode = str(value if value is not None else "").strip().lower()
+    if not mode:
+        mode = str(load_settings()["export_mode"])
+    if mode not in EXPORT_MODE_VALUES:
+        raise ValueError(f"{name}只能是 {' / '.join(EXPORT_MODE_VALUES)}，现在是「{value}」")
+    return mode
+
+
+def export_dir_links(out_root: str) -> List[str]:
+    """导出目录里仍是软链接的文件（图片和标签都算）：用来判断这份产物能不能安全压缩。"""
+    found: List[str] = []
+    for kind in ("images", "labels"):
+        for split in ("train", "val"):
+            folder = os.path.join(out_root, kind, split)
+            try:
+                with os.scandir(folder) as handle:
+                    found.extend(entry.path for entry in handle if entry.is_symlink())
+            except OSError:
+                continue
+    return sorted(found)
+
+
+def materialize_export(out_root: str, mode: Optional[str] = None) -> dict:
+    """把已有导出目录里的软链接换成真实文件（默认硬链接，跨盘自动退回直接拷贝）。
+
+    改默认之前导出的那些目录原地能训、一压缩就废。为这个重新标一遍不值得，
+    就地换掉放法即可：图片、标签、train/val 划分、``data.yaml`` 全都不动。
+    """
+    target = os.path.abspath(out_root)
+    if not os.path.isdir(target):
+        raise ValueError(f"导出目录不存在：{target}")
+    want = place_mode(mode)
+    links = export_dir_links(target)
+    if not links:
+        return {"out": target, "converted": 0, "broken": [], "placed_with": [],
+                "placed_label": "", "mode_note": "这个导出目录里没有软链接，图片本来就是真实文件"}
+    used: List[str] = []
+    broken: List[str] = []
+    for link in links:
+        src = os.path.realpath(link)
+        if not os.path.isfile(src):
+            # 链接那头已经被删了：硬链会当场报错，先把名字报出来，别假装换好了
+            broken.append(os.path.relpath(link, target))
+            continue
+        used.append(_place(src, link, want))
+    for meta_name in sorted(set(EXPORT_META_NAMES.values())):
+        meta_path = os.path.join(target, meta_name)
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            with open(meta_path, encoding="utf-8") as fh:
+                meta = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        meta["mode"] = want
+        meta["placed_with"] = sorted(set(used))
+        meta["materialized_at"] = now_str()
+        with open(meta_path, "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, ensure_ascii=False, indent=2)
+        break
+    return {"out": target, "converted": len(used), "broken": broken,
+            "placed_with": sorted(set(used)),
+            "placed_label": "、".join(PLACE_LABELS.get(item, item) for item in sorted(set(used))),
+            "mode_note": place_note(want, used)}
 
 
 def class_range_reason(class_id: int, names: Dict[int, str]) -> str:
@@ -96,17 +178,18 @@ def export_dataset(
     exclude_status: Sequence[str] = ("rejected",),
     require_label: bool = True,
     max_empty_ratio: float = 0.15,
-    mode: str = "symlink",
+    mode: Optional[str] = None,
     tag: Optional[str] = None,
     coco: bool = False,
     coords: bool = False,
 ) -> dict:
     """生成可直接喂给 `yolo pose train` 的目录。
 
-    :param mode: symlink（省空间）| copy
+    :param mode: hardlink（默认，能压缩能拷走）| copy | symlink；留空取系统设置那一档
     :param max_empty_ratio: 背景图（无人）在导出数据集中的占比上限，避免负样本淹没正样本
     :param coords: 同时在导出目录里生成 CSV/JSONL 坐标文件（含 split 列）
     """
+    mode = place_mode(mode)
     idx = load_index(root)
     exclude = set(exclude_status)
     populated: List[Tuple[str, dict]] = []
@@ -243,7 +326,11 @@ def export_dataset(
                          f"（{len(bad)} 帧读不通，例：{bad[0] if bad else '标签为空'}）"
                          + "：按提示里的 文件:行号 修掉坏行，或先跑 autolabel validate 查格式")
 
-    lines = [f"# 由自动标注系统生成 on {now_str()}", f"path: {out_root}", "train: images/train",
+    # 不写 path：省略时 ultralytics 拿 data.yaml 自己所在的目录当数据集根。写死绝对路径的
+    # 产物一压缩 / 一拷到别的机器就去找这台电脑上的老路径，症状是 "images not found"。
+    lines = [f"# 由自动标注系统生成 on {now_str()}",
+             f"# 图片放法：{PLACE_LABELS.get(mode, mode)}｜本文件所在目录就是数据集根（不写 path，换机器直接训）",
+             "train: images/train",
              "val: images/val", f"kpt_shape: [{num_kpt}, 3]",
              f"flip_idx: {flip_idx_for(num_kpt)}"]
     lines.append("names:")
@@ -289,6 +376,7 @@ def export_dataset(
     return {"out": out_root, **counts, "skipped": len(skipped),
             "skipped_note": skipped_summary(skipped),
             "mode_note": place_note(mode, sorted(placed)),
+            "mode": mode, "mode_label": PLACE_LABELS.get(mode, mode),
             "train_images": counts["train"], "val_images": counts["val"],
             "coords": coord_out}
 
@@ -553,7 +641,7 @@ def find_reusable_export(root: str, fingerprint: str, kind: str = "pose") -> Opt
                     # 复用旧目录时口径也得说对：分割训练集被叫成检测训练集，
                     # 用户就会对着 task: segment 的 data.yaml 怀疑自己看错了
                     "task": task, "segment_note": segment_note(counts),
-                    "data_yaml": row["data_yaml"]}
+                    "data_yaml": row["data_yaml"], **reuse_mode_fields(meta)}
         return {"out": row["path"], "reused": True,
                 "train": counts.get("train", 0), "val": counts.get("val", 0),
                 "people": counts.get("people") or {}, "empty": counts.get("empty", 0),
@@ -562,8 +650,17 @@ def find_reusable_export(root: str, fingerprint: str, kind: str = "pose") -> Opt
                     [(str(r.get("image") or ""), str(r.get("reason") or ""))
                      for r in (meta.get("skipped") or []) if isinstance(r, dict)]),
                 "train_images": counts.get("train", 0), "val_images": counts.get("val", 0),
-                "coords": meta.get("coords"), "data_yaml": row["data_yaml"]}
+                "coords": meta.get("coords"), "data_yaml": row["data_yaml"],
+                **reuse_mode_fields(meta)}
     return None
+
+
+def reuse_mode_fields(meta: dict) -> dict:
+    """复用旧导出目录时也要报出图片的放法：软链接的旧目录一压缩照样变空壳。"""
+    mode = str(meta.get("mode") or "")
+    used = meta.get("placed_with") or ([mode] if mode else [])
+    return {"mode": mode, "mode_label": PLACE_LABELS.get(mode, mode),
+            "mode_note": place_note(mode, used)}
 
 
 #: 三种"把文件放进导出目录"的说法，报给用户时别用英文术语
@@ -625,7 +722,8 @@ def place_note(requested: str, used: Sequence[str]) -> str:
     """退回到硬链/拷贝时说清原因，别让人以为导出坏了（只会看到目录变大）。"""
     extra = sorted({item for item in used if item != requested})
     if not extra:
-        return ""
+        # 真用了软链接就提醒一句：这种产物原地能训，压成 zip 或拷走就只剩链接记录
+        return SYMLINK_WARNING if "symlink" in set(used) else ""
     got = "、".join(PLACE_LABELS.get(item, item) for item in extra)
     return (f"这台机器建不了{PLACE_LABELS.get(requested, requested)}"
             "（Windows 上软链接要开「开发者模式」或用管理员），本次改用"

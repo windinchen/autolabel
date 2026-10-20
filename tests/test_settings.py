@@ -77,7 +77,7 @@ def probe_off(monkeypatch):
 # --------------------------------------------------------------------------- //
 
 def test_missing_file_falls_back_to_defaults():
-    assert system.load() == {"device": "auto", "half": False, "imgsz": 640, "conf": 0.25}
+    assert system.load() == system.DEFAULTS
     assert not os.path.exists(system.path())
 
 
@@ -92,7 +92,8 @@ def test_save_writes_only_the_known_keys():
     system.save({"device": "cpu", "half": True, "imgsz": 1024, "conf": 0.05,
                  "顺手塞进来的": "x"})
     with open(system.path(), encoding="utf-8") as fh:
-        assert json.load(fh) == {"device": "cpu", "half": True, "imgsz": 1024, "conf": 0.05}
+        assert json.load(fh) == {"device": "cpu", "half": True, "imgsz": 1024, "conf": 0.05,
+                                "export_mode": "hardlink"}
 
 
 def test_unknown_device_is_refused_with_the_choices_listed():
@@ -109,11 +110,25 @@ def test_multi_gpu_spellings_fold_into_cuda():
     assert system.normalize({"device": "乱七八糟"})["device"] == "auto"
 
 
+def test_export_mode_is_the_safe_one_and_refuses_nonsense():
+    """导出放法的默认必须是硬链接：软链接的产物一压缩就只剩链接记录。
+
+    认不出的写法也不许悄悄退回默认继续跑——界面上选了「直接拷贝」、存下来变成
+    软链接，用户要等到把训练集压去别的机器才发现图片全是空壳。
+    """
+    assert system.DEFAULTS["export_mode"] == "hardlink"
+    assert [item["value"] for item in system.EXPORT_MODE_CHOICES] == ["hardlink", "copy", "symlink"]
+    assert system.normalize({"export_mode": "COPY"})["export_mode"] == "copy"
+    assert system.normalize({"export_mode": "随便写的"})["export_mode"] == "hardlink"
+    with pytest.raises(ValueError, match="导出"):
+        system.save({"export_mode": "zip"})
+
+
 def test_broken_file_does_not_take_the_whole_ui_down(monkeypatch):
     os.makedirs(os.path.dirname(system.path()), exist_ok=True)
     with open(system.path(), "w", encoding="utf-8") as fh:
         fh.write("{这文件被谁改坏了")
-    assert system.load() == {"device": "auto", "half": False, "imgsz": 640, "conf": 0.25}
+    assert system.load() == system.DEFAULTS
 
 
 # --------------------------------------------------------------------------- //
@@ -317,9 +332,16 @@ def test_settings_api_round_trip(server, probe_off):
     base, _store = server
     status, data = get(base, "/api/settings")
     assert status == 200
-    assert data["saved"] == {"device": "auto", "half": False, "imgsz": 640, "conf": 0.25}
+    assert data["saved"] == system.DEFAULTS
     assert [c["value"] for c in data["choices"]] == ["auto", "cuda", "mps", "cpu"]
     assert [c["value"] for c in data["imgsz_choices"]] == [640, 1024, 1280]
+    assert [c["value"] for c in data["export_mode_choices"]] == ["hardlink", "copy", "symlink"]
+
+    status, data = post(base, "/api/settings", {"export_mode": "copy"})
+    assert status == 200 and data["saved"]["export_mode"] == "copy"
+
+    status, data = post(base, "/api/settings", {"export_mode": "hardlink"})
+    assert status == 200 and data["saved"]["export_mode"] == "hardlink"
 
     status, data = post(base, "/api/settings", {"device": "cpu"})
     assert status == 200 and data["saved"]["device"] == "cpu"

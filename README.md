@@ -102,7 +102,7 @@ yolo detect / segment train
 
 ```bash
 python3 -m pip install -r requirements.txt   # 已有 torch/ultralytics 可跳过
-python3 -m pytest tests -q                    # 1340 项测试，约 2 分钟
+python3 -m pytest tests -q                    # 1351 项测试，约 2 分钟
 # 其中 5 项端到端用例需要 models/yolo11n-pose.pt 与 models/bus.jpg，缺权重时会自动跳过（`-rs` 可看到原因）
 ```
 
@@ -293,7 +293,7 @@ yolo pose train data=$D/exports/<时间戳>/data.yaml model=yolo11s-pose.pt epoc
 ```
 
 默认剔除 `rejected`、按 2:1 切 train/val 且至少留 1 张验证图；**验证集成员按 `(seed, 相对路径)` 哈希定**，后来补图不会把老验证图换进训练集，两次导出的指标可以对比。接口是 `POST /api/export`（`scope=reviewed|approved|all`），工作台的导出行上有这个下拉框，不用回命令行敲 `--only-approved`；一张都不符合条件时直接报错说明原因（比如「status=rejected 2 张」），而不是丢一个空目录说导出成功。`val_ratio=0`（整库当训练集）、`max_empty_ratio=0`（不要负样本）这类 0 值写法，界面与命令行现在同等生效。
-导出目录是平的，**子目录会压进输出名**（`images/a/frame_0001.jpg` → `images/train/a__frame_0001.jpg`），不同子目录里的同名素材不再互相覆盖（素材平铺时输出名不变）；`--mode symlink` 的软链写**相对路径**，数据集整体改名 / 搬家不断链；`data.yaml` 的 `flip_idx` 按实际关键点数收敛，自定义少点模型不会拿到越界下标。标签没改动时重复点导出会直接复用最近一份（提示「标签没有变化，已复用上次导出」），不会堆重复目录。产物路径不会只闪一次：模块页顶栏下面与门户导出行常驻「上次导出（时间）路径 · N 训练 / M 验证」，附 **在访达中显示**、**复制路径** 与 **复制训练命令**（来自 `GET /api/dataset` 的 `exports_recent`，扫 `exports/` 取最近 8 份）；导出成功后后端还会调系统文件管理器自动打开一次目录（`POST /api/export/reveal`，只认 `exports/` 下的路径）。细节见 `demo_docs/03-坐标文件说明.md`。
+导出目录是平的，**子目录会压进输出名**（`images/a/frame_0001.jpg` → `images/train/a__frame_0001.jpg`），不同子目录里的同名素材不再互相覆盖（素材平铺时输出名不变）；图片默认用**硬链接**放进导出目录——和真文件一样能压缩、拷去别的机器训练（以前默认软链接，一压成 zip 每张图只剩 43 字节，看着就是「全是快捷方式」；改哪一档在「系统设置 → 推理与导出」，命令行 `--mode` 临时覆盖，以前那些软链接目录用 `export --materialize <导出目录>` 就地换掉不用重标）；`data.yaml` 也不再写这台电脑的绝对 `path`，解压到哪都能直接训；`data.yaml` 的 `flip_idx` 按实际关键点数收敛，自定义少点模型不会拿到越界下标。标签没改动时重复点导出会直接复用最近一份（提示「标签没有变化，已复用上次导出」），不会堆重复目录。产物路径不会只闪一次：模块页顶栏下面与门户导出行常驻「上次导出（时间）路径 · N 训练 / M 验证」，附 **在访达中显示**、**复制路径** 与 **复制训练命令**（来自 `GET /api/dataset` 的 `exports_recent`，扫 `exports/` 取最近 8 份）；导出成功后后端还会调系统文件管理器自动打开一次目录（`POST /api/export/reveal`，只认 `exports/` 下的路径）。细节见 `demo_docs/03-坐标文件说明.md`。
 
 ## 坐标文件导出
 
@@ -364,7 +364,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 │   ├── image_utils.py    读图、dHash、骨架绘制
 │   └── static/           前端：portal 工作台 / pool 素材池 / app 姿态标注 / objects+detect 检测框标注（共用一份脚本）
 │                         / models 模型管理 / common 共用件
-├── tests/                1340 项测试（含端到端与回归）
+├── tests/                1351 项测试（含端到端与回归）
 ├── certs/                本地 HTTPS 证书与私钥（`autolabel ca` 生成，已 gitignore）
 ├── configs/default.yaml  参数模板
 ├── configs/vlm.json      多模态大模型配置（不含明文 Key，建议不入库）

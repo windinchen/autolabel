@@ -1028,7 +1028,7 @@ def export_detection_dataset(
     seed: int = 7,
     exclude_status: Sequence[str] = ("rejected",),
     max_empty_ratio: float = 0.15,
-    mode: str = "symlink",
+    mode: Optional[str] = None,
     tag: Optional[str] = None,
     lib: str = LIB_OBJECTS,
 ) -> dict:
@@ -1041,10 +1041,12 @@ def export_detection_dataset(
     类别号会被重映射成连续的 0..N-1：登记表里删过字段时，标签里的 ``class_id``
     可能不连续，而 YOLO 要求 ``names`` 的键从 0 连续递增。
     """
-    from .export import (MISSING_SOURCE_REASON, _place, content_fingerprint,
-                         find_reusable_export, place_note, prune_stale, rank_for_split,
+    from .export import (MISSING_SOURCE_REASON, PLACE_LABELS, _place, content_fingerprint,
+                         find_reusable_export, place_mode, place_note, prune_stale, rank_for_split,
                          segment_note, skipped_summary, split_val_set, unique_export_dir,
                          unique_stem, yaml_comment, yaml_scalar)
+
+    mode = place_mode(mode)
 
     lib = normalize_lib(lib)
     records, meta = collect_object_records(root, exclude_status=exclude_status, lib=lib)
@@ -1143,9 +1145,11 @@ def export_detection_dataset(
 
     segmented = counts["segment_boxes"] > 0
     task_line = f"task: {'segment' if segmented else 'detect'}"
+    # 与姿态库同口径：不写 path，换机器 / 换路径时 ultralytics 拿本文件所在目录当数据集根
     lines = [f"# 由自动标注系统生成 on {now_str()}"
              f"（{lib_name(lib)} / YOLO {'segment' if segmented else 'detection'}）",
-             f"path: {out_root}", "train: images/train", "val: images/val", task_line]
+             f"# 图片放法：{PLACE_LABELS.get(mode, mode)}｜本文件所在目录就是数据集根（不写 path，换机器直接训）",
+             "train: images/train", "val: images/val", task_line]
     labels = []
     for cls in used:
         field_row = names.get(cls) or {}
@@ -1185,7 +1189,8 @@ def export_detection_dataset(
             "counts": counts, "data_yaml": os.path.join(out_root, "data.yaml"),
             "task": "segment" if segmented else "detect",
             "segment_note": segment_note(counts),
-            "mode_note": place_note(mode, sorted(placed))}
+            "mode_note": place_note(mode, sorted(placed)),
+            "mode": mode, "mode_label": PLACE_LABELS.get(mode, mode)}
 
 
 def write_prompt_files(root: str, lib: str = LIB_OBJECTS) -> int:

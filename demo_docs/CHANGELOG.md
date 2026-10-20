@@ -1,5 +1,30 @@
 # 变更记录
 
+## 2026-10-20 15:10 — v1.4.22：导出训练集不再是"快捷方式合集"
+
+用户反馈"导出 yolo 训练集，图片只有快捷方式，没法训练"。查他自己那份产物：
+`exports/2026-10-20_142736-yolo-detect.zip` 只有 **112 KB / 208 个条目**，解压出来
+每张图 **43 字节**（一条软链接记录），`data.yaml` 还写着 `path: /Users/windinchen/...`。
+两个原因得一起修：默认用软链接放图片（Finder 压缩只存链接记录），`path` 又写死了绝对路径。
+
+- `export.py` 新增 `DEFAULT_PLACE_MODE` / `SYMLINK_WARNING` / `place_mode()` /
+  `export_dir_links()` / `materialize_export()`；`export_dataset(mode=None)` 的空值
+  走 `settings.load()["export_mode"]`（不是 import 时算死的常量，改了设置要立即生效）。
+- 默认放法 `symlink` → **`hardlink`**：`settings.DEFAULTS["export_mode"]` +
+  `EXPORT_MODE_CHOICES`（硬链接 / 直接拷贝 / 软链接）+ `as_export_mode(strict=)` +
+  `AUTOLABEL_EXPORT_MODE` 启动覆盖；不认识的词当场报错。
+- `data.yaml` **不写 `path:`**（实测 ultralytics 8.4.179：省略 → 取 yaml 所在目录 ✅；
+  `path: .` → 按 CWD 解析 ❌；绝对路径搬家后 ❌），改成一行说明图片放法的注释。
+- `autolabel export <数据集> --materialize <导出目录>`：老目录原地换硬链接，
+  图片/标签/划分/yaml 都不动，换完写回 `manifest.json`；源文件已删的点名上报。
+- `prompt.py export_detection_dataset` 同口径；`review.py` 两条导出通道改传
+  `payload.get("mode")`（`None` → 系统设置）；界面「系统设置 → 推理与导出」加一档分段选择。
+- 修一处"选了没生效"：`ReviewStore.save_settings` 的参数白名单漏了 `export_mode`，
+  界面选了「直接拷贝」保存回来还是硬链接 → 白名单收成 `settings.SETTINGS_KEYS` 一份。
+- 全量 **1351 通过 / 8 跳过**（新增 10 项 `tests/test_export_mode.py`：真实文件 +
+  `st_nlink>=2` + 压缩搬家后 JPEG 仍可读 + yaml 无 `path` + materialize 三种情形 +
+  三处默认一致）；另用 4 张实拍帧端到端跑通导出 → zip → 换目录解压 → `check_det_dataset`。
+
 ## 2026-10-20 13:40 — v1.4.21：视频拆帧不再"看着像就丢"，张数能自己乘出来
 
 用户反馈"视频帧拆分成图，感觉数量不对"。用自己那批素材复算：5 条同机位录像（21~32 秒、

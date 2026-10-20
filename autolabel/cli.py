@@ -12,7 +12,7 @@ import unicodedata
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .backends import BackendSettings
-from .settings import DEVICE_ARGS, IMGSZ_MIN, IMGSZ_VALUES
+from .settings import DEVICE_ARGS, EXPORT_MODE_VALUES, IMGSZ_MIN, IMGSZ_VALUES
 from . import __version__
 from . import platform_utils
 from .dataset import (
@@ -403,6 +403,8 @@ def cmd_settings(args: argparse.Namespace) -> int:
         patch["imgsz"] = args.imgsz
     if args.conf is not None:
         patch["conf"] = args.conf
+    if getattr(args, "export_mode", None):
+        patch["export_mode"] = args.export_mode
     if args.reset:
         patch = dict(system.DEFAULTS)
     if patch:
@@ -414,6 +416,7 @@ def cmd_settings(args: argparse.Namespace) -> int:
         print(f"[ok] 系统设置已存到 {system.path()}")
         print(f"     推理设备 {system.DEVICE_LABELS[saved['device']]} · 半精度 {'开' if saved['half'] else '关'}")
         print(f"     输入分辨率 {saved['imgsz']} · 默认置信度 {saved['conf']}")
+        print(f"     导出训练集 图片用{system.EXPORT_MODE_LABELS[saved['export_mode']]}")
         print("     界面「系统设置」和命令行用的是同一份，改完即生效（正在跑的任务下次启动才算）")
         if args.device and args.device != "auto":
             facts = system.detect(force=True).get(args.device, {})
@@ -429,13 +432,27 @@ def cmd_settings(args: argparse.Namespace) -> int:
 
 
 def cmd_export(args: argparse.Namespace) -> int:
-    from .export import export_dataset
+    from .export import export_dataset, materialize_export
 
     exclude = _exclude_from_args(args)
+    if getattr(args, "materialize", ""):
+        # 老导出的图片是软链接：原地能训，压成 zip 就只剩几十字节的链接记录。
+        # 换放法不用重标，就地替换即可，标签与 train/val 划分都不动。
+        result = materialize_export(args.materialize, mode=args.mode)
+        if not result["converted"]:
+            print(f"[ok] {result['out']}：{result['mode_note']}")
+        else:
+            print(f"[ok] {result['out']}：{result['converted']} 个软链接已换成"
+                  f"{result['placed_label']}，现在可以直接压缩或拷去别的机器训练")
+        for row in result["broken"][:5]:
+            print(f"[warn] 链接那头已经不在了，换不了：{row}")
+        if result["converted"] and result.get("mode_note"):
+            print(f"     {result['mode_note']}")
+        return 0
     result = export_dataset(args.dataset, out=args.out, val_ratio=args.val_ratio, seed=args.seed,
                             exclude_status=exclude, max_empty_ratio=args.max_empty_ratio,
                             mode=args.mode, tag=args.tag, coco=args.coco, coords=args.coords)
-    print(f"[ok] 导出 -> {result['out']}")
+    print(f"[ok] 导出 -> {result['out']}（图片：{result.get('mode_label') or result.get('mode')}）")
     print(f"     train {result['train_images']} 张 / {result['people']['train']} 人 · "
           f"val {result['val_images']} 张 / {result['people']['val']} 人 · 跳过 {result['skipped']}")
     if result.get("skipped_note"):
@@ -450,6 +467,8 @@ def cmd_export(args: argparse.Namespace) -> int:
     print(f"     data.yaml: {os.path.join(result['out'], 'data.yaml')}")
     if result.get("coords"):
         print(f"     坐标文件: {result['coords']}（coords.csv / coords_long.csv / coords.jsonl）")
+    if result.get("mode_note"):
+        print(f"[warn] {result['mode_note']}")
     print(f"     训练命令: yolo pose train data={os.path.join(result['out'], 'data.yaml')} "
           f"model=yolo11s-pose.pt epochs=100 imgsz=640")
     return 0
@@ -1937,8 +1956,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_version)
 
     p = sub.add_parser("settings", help="看/改系统设置：推理设备（CUDA / Apple 加速 / CPU）、"
-                                        "半精度、输入分辨率、默认置信度")
+                                        "半精度、输入分辨率、默认置信度、导出训练集的图片放法")
     p.add_argument("--device", choices=list(DEVICE_ARGS), help="推理用哪块算力")
+    p.add_argument("--export-mode", dest="export_mode", choices=list(EXPORT_MODE_VALUES),
+                   help="导出训练集时图片怎么放：hardlink（默认，能压缩能拷走）/ copy / symlink")
     p.add_argument("--imgsz", type=_positive_int, metavar="分辨率",
                    help=f"输入分辨率，界面给的是 {' / '.join(str(v) for v in IMGSZ_VALUES)}，"
                         f"命令行允许 {IMGSZ_MIN} 以上的整数；提高它换的是更慢但更容易出框")
@@ -1966,7 +1987,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--val-ratio", type=_fraction, default=0.2, help="验证集占比，0~1 之间（不含两端）")
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--max-empty-ratio", type=_unit_interval, default=0.15, help="背景图占比上限")
-    p.add_argument("--mode", choices=["symlink", "copy", "hardlink"], default="symlink")
+    p.add_argument("--mode", choices=list(EXPORT_MODE_VALUES), default=None,
+                   help="导出目录里的图片怎么放：hardlink（默认，跟真文件一样，能压缩能拷走）、"
+                        "copy（直接拷贝，多一份磁盘）、symlink（最省，但压缩/拷走会变几十字节空壳）；"
+                        "不填按「系统设置」里那一档")
+    p.add_argument("--materialize", metavar="导出目录",
+                   help="不重新导出，只把这份已有导出目录里的软链接换成真实文件"
+                        "（要把训练集压缩或拷去别的机器训练时用它）")
     p.add_argument("--coco", action="store_true", help="同时导出 COCO keypoint JSON")
     p.add_argument("--coords", action="store_true", help="同时导出 CSV/JSONL 坐标文件（含 split 列）")
     p.add_argument("--only-approved", action="store_true", help="只导出已接受/已修改的样本")

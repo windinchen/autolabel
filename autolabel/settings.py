@@ -37,7 +37,28 @@ DEVICE_VALUES = tuple(item["value"] for item in DEVICE_CHOICES)
 DEVICE_ARGS = DEVICE_VALUES + ("0", "1", "cuda:0", "cuda:1")
 DEVICE_LABELS = {item["value"]: item["label"] for item in DEVICE_CHOICES}
 
-DEFAULTS = {"device": "auto", "half": False, "imgsz": 640, "conf": 0.25}
+DEFAULTS = {"device": "auto", "half": False, "imgsz": 640, "conf": 0.25,
+            "export_mode": "hardlink"}
+
+#: 能被改写的设置项：设置面板、命令行、复核服务三处共用这一份清单。
+#: 新增一档只改这里——以前是各处各写一份，加 export_mode 时漏了服务那条白名单，
+#: 症状是「界面上选了直接拷贝、点保存，回来一看还是硬链接」。
+SETTINGS_KEYS = ("device", "half", "imgsz", "conf", "export_mode")
+
+#: 导出训练集时把图片「放」进导出目录的三种方式，界面里的顺序就是这个顺序。
+#: 硬链接排第一是踩过坑的：软链接在原地能训，但把它压成 zip 或拷去别的机器，
+#: 每张图片就剩下几十个字节的链接记录，症状是「训练集里全是快捷方式，没法训」。
+#: 硬链接和真文件没有区别，同一个盘上还不额外占磁盘。
+EXPORT_MODE_CHOICES: Tuple[Dict[str, str], ...] = (
+    {"value": "hardlink", "label": "硬链接（推荐）",
+     "hint": "跟真文件一样，能直接压缩、拷贝、上传到别的机器训练；同一个磁盘不额外占空间"},
+    {"value": "copy", "label": "直接拷贝",
+     "hint": "最稳，但多一份磁盘占用；导出到 U 盘或另一个分区时用这个"},
+    {"value": "symlink", "label": "软链接（最省）",
+     "hint": "最省磁盘，但只能在原位置训练：一压缩或一拷走就变成几十字节的空壳"},
+)
+EXPORT_MODE_VALUES = tuple(item["value"] for item in EXPORT_MODE_CHOICES)
+EXPORT_MODE_LABELS = {item["value"]: item["label"] for item in EXPORT_MODE_CHOICES}
 
 #: 输入分辨率档位。界面上只摆这三档（命令行允许 320–1920 之间任意整数）。
 #: 这一档对能不能出框的影响比想象中大：本机实测同一张白 T 恤棚拍照，
@@ -116,12 +137,27 @@ def as_conf(value: object, *, strict: bool = False) -> float:
         return float(DEFAULTS["conf"])
     return round(number, 4)
 
+def as_export_mode(value: object, *, strict: bool = False) -> str:
+    """把「导出时图片怎么放」读成三种之一，读不懂就退回默认值。
+
+    这一档决定产物拿去别的机器还能不能训练，所以认不出时**不能**猜：
+    界面上选了「直接拷贝」、存下来变成软链接，用户要到压缩打包才发现图片是空壳。
+    """
+    mode = str(value if value is not None else "").strip().lower()
+    if mode in EXPORT_MODE_VALUES:
+        return mode
+    if strict:
+        raise ValueError(f"导出的图片放法只能选 {' / '.join(EXPORT_MODE_VALUES)}，现在是「{value}」")
+    return str(DEFAULTS["export_mode"])
+
+
 #: 启动参数 / 环境变量覆盖：想"一个实例跑一块卡"就在起服务时带上 ``review --device cuda``，
 #: 它只影响这一个进程，不改家目录里那份设置，两个实例各用各的卡互不干扰。
 ENV_DEVICE = "AUTOLABEL_DEVICE"
 ENV_HALF = "AUTOLABEL_HALF"
 ENV_IMGSZ = "AUTOLABEL_IMGSZ"
 ENV_CONF = "AUTOLABEL_CONF"
+ENV_EXPORT_MODE = "AUTOLABEL_EXPORT_MODE"
 
 #: 同一次服务里只探测一次：import torch 不算便宜，每次开菜单都探测会白等。
 _probe_cache: Optional[dict] = None
@@ -143,7 +179,9 @@ def normalize(raw: Optional[dict]) -> dict:
     half = as_bool(raw.get("half", DEFAULTS["half"]), default=DEFAULTS["half"])
     imgsz = as_imgsz(raw.get("imgsz", DEFAULTS["imgsz"]))
     conf = as_conf(raw.get("conf", DEFAULTS["conf"]))
-    return {"device": device, "half": half, "imgsz": imgsz, "conf": conf}
+    export_mode = as_export_mode(raw.get("export_mode", DEFAULTS["export_mode"]))
+    return {"device": device, "half": half, "imgsz": imgsz, "conf": conf,
+            "export_mode": export_mode}
 
 
 def env_override() -> dict:
@@ -164,6 +202,9 @@ def env_override() -> dict:
     raw_conf = os.environ.get(ENV_CONF, "").strip()
     if raw_conf:
         out["conf"] = as_conf(raw_conf)
+    raw_export_mode = os.environ.get(ENV_EXPORT_MODE, "").strip().lower()
+    if raw_export_mode:
+        out["export_mode"] = as_export_mode(raw_export_mode)
     return out
 
 
@@ -186,6 +227,7 @@ def load(*, ignore_env: bool = False) -> dict:
             merged["half"] = data.get("half", merged["half"])
             merged["imgsz"] = data.get("imgsz", merged["imgsz"])
             merged["conf"] = data.get("conf", merged["conf"])
+            merged["export_mode"] = data.get("export_mode", merged["export_mode"])
         merged = normalize(merged)
     if not ignore_env:
         merged.update(env_override())
@@ -193,7 +235,7 @@ def load(*, ignore_env: bool = False) -> dict:
 
 
 def save(patch: Optional[dict] = None) -> dict:
-    """改几项存回去（只认 device / half / imgsz / conf），返回存好之后的完整设置。"""
+    """改几项存回去（只认 device / half / imgsz / conf / export_mode），返回完整设置。"""
     wanted = {k: v for k, v in (patch or {}).items() if v is not None}
     if "device" in wanted:
         asked = str(wanted["device"]).strip().lower()
@@ -206,6 +248,8 @@ def save(patch: Optional[dict] = None) -> dict:
         wanted["imgsz"] = as_imgsz(wanted["imgsz"], strict=True)
     if "conf" in wanted:
         wanted["conf"] = as_conf(wanted["conf"], strict=True)
+    if "export_mode" in wanted:
+        wanted["export_mode"] = as_export_mode(wanted["export_mode"], strict=True)
     next_settings = normalize({**load(ignore_env=True), **wanted})
     target = path()
     os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -380,8 +424,10 @@ def payload(probe: bool = False) -> dict:
         "devices": devices,
         "choices": [dict(item) for item in DEVICE_CHOICES],
         "imgsz_choices": [dict(item) for item in IMGSZ_CHOICES],
+        "export_mode_choices": [dict(item) for item in EXPORT_MODE_CHOICES],
         "effective": {"device": effective, "half": running["half"], "note": note,
                       "imgsz": running["imgsz"], "conf": running["conf"],
+                      "export_mode": running["export_mode"],
                       "from_env": bool(override)},
         "path": path(),
     }
@@ -394,7 +440,8 @@ def describe(raw: Optional[dict] = None) -> str:
     lines = [f"系统设置文件 {data['path']}",
              f"推理设备 {DEVICE_LABELS[saved['device']]}（{saved['device']}）",
              f"半精度 {'开' if saved['half'] else '关'}",
-             f"输入分辨率 {saved['imgsz']} · 默认置信度 {saved['conf']}"]
+             f"输入分辨率 {saved['imgsz']} · 默认置信度 {saved['conf']}",
+             f"导出训练集 图片用{EXPORT_MODE_LABELS[saved['export_mode']]}（{saved['export_mode']}）"]
     usable = [devices[v]["label"] for v in DEVICE_VALUES if v != "auto" and devices[v]["available"]]
     lines.append(f"这台机器可用 {' / '.join(usable) or '只有 CPU'}")
     if saved["device"] == "auto" and devices["auto"]["names"]:
@@ -429,6 +476,8 @@ def describe(raw: Optional[dict] = None) -> str:
 
 
 __all__ = ["DEFAULTS", "DEVICE_ARGS", "DEVICE_CHOICES", "DEVICE_LABELS",
-           "DEVICE_VALUES", "ENV_DEVICE",
-           "ENV_HALF", "describe", "detect", "env_override", "label_defaults", "load",
+           "DEVICE_VALUES", "ENV_DEVICE", "ENV_EXPORT_MODE", "ENV_HALF",
+           "EXPORT_MODE_CHOICES", "EXPORT_MODE_LABELS", "EXPORT_MODE_VALUES",
+           "SETTINGS_KEYS",
+           "as_export_mode", "describe", "detect", "env_override", "label_defaults", "load",
            "normalize", "path", "payload", "resolve", "save"]

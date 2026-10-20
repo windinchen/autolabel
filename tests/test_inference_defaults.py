@@ -178,7 +178,7 @@ def test_confidence_is_refused_before_it_silently_eats_every_box():
 def test_a_hand_broken_file_still_reads_a_whole_settings(tmp_path):
     with open(system.path(), "w", encoding="utf-8") as fh:
         fh.write('{"device": "cpu", "imgsz": "很大", "conf": 99}')
-    assert system.load() == {"device": "cpu", "half": False, "imgsz": 640, "conf": 0.25}
+    assert system.load() == {**system.DEFAULTS, "device": "cpu", "imgsz": 640, "conf": 0.25}
 
 
 def test_launch_arguments_can_pin_resolution_for_one_instance_only(monkeypatch):
@@ -187,8 +187,7 @@ def test_launch_arguments_can_pin_resolution_for_one_instance_only(monkeypatch):
     monkeypatch.setenv("AUTOLABEL_CONF", "0.02")
     assert system.load()["imgsz"] == 1024 and system.load()["conf"] == 0.02
     # 存盘时不能被本进程的启动参数改写：那是临时值，不是用户真正选过的东西
-    assert system.load(ignore_env=True) == {"device": "auto", "half": False,
-                                            "imgsz": 640, "conf": 0.25}
+    assert system.load(ignore_env=True) == {**system.DEFAULTS, "imgsz": 640, "conf": 0.25}
 
 
 # --------------------------------------------------------------------------- //
@@ -339,7 +338,7 @@ def test_the_settings_api_accepts_the_two_new_knobs(server, probe_off):
     base, _store = server
     status, data = post_json(base, "/api/settings", {"imgsz": 1024, "conf": 0.05})
     assert status == 200
-    assert data["saved"] == {"device": "auto", "half": False, "imgsz": 1024, "conf": 0.05}
+    assert data["saved"] == {**system.DEFAULTS, "imgsz": 1024, "conf": 0.05}
 
     status, data = post_json(base, "/api/settings", {"imgsz": 99})
     assert status == 400 and "输入分辨率" in data["error"]
