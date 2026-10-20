@@ -22,6 +22,7 @@ const POOL = {
   batchSel: new Set(),
   batchFiles: {},
   poll: null,
+  active: new Set(),   // 上一轮还在跑的任务 ID：任务结束时要能说清它跑出了什么
 };
 
 const UNCATEGORIZED = "__none__";
@@ -769,7 +770,10 @@ async function pollJobs() {
   try {
     const res = await fetch("/api/jobs");
     const data = await res.json();
-    const jobs = (data.jobs || []).filter((job) => !job.finished);
+    const all = data.jobs || [];
+    const jobs = all.filter((job) => !job.finished);
+    reportFinished(all);
+    POOL.active = new Set(jobs.map((job) => job.id));
     const strip = $("job-strip");
     if (!jobs.length) {
       strip.classList.add("hidden");
@@ -783,6 +787,22 @@ async function pollJobs() {
   } catch (err) {
     if (POOL.poll) { clearInterval(POOL.poll); POOL.poll = null; }
     poolLog("任务状态读不到：" + err.message, true);
+  }
+}
+
+/** 任务从"在跑"变成"结束"的那一刻把结果说出口。
+ *
+ *  以前任务条只是收起、页面重读一遍：抽帧到底进来多少帧、视频为什么一帧没进来，
+ *  全都在那一瞬间消失，只剩下一个空池子——"传了视频没显示"就是这么来的。
+ */
+function reportFinished(all) {
+  for (const id of POOL.active) {
+    if (all.some((job) => job.id === id && !job.finished)) { continue; }
+    const done = all.find((job) => job.id === id);
+    if (!done) { continue; }
+    const text = done.message || (done.ok ? "导入完成" : "导入失败");
+    poolLog(text, !done.ok);
+    toast(text, !done.ok);
   }
 }
 

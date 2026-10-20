@@ -223,6 +223,8 @@ function stepFont(delta) {
 // 服务器那份 ~/.autolabel/settings.json，换台电脑打开同一个数据集才不会被偷偷改回去。
 // --------------------------------------------------------------------------- //
 const settingsState = { data: null, loading: false, saving: false };
+/** 这台机器的视频解码能力：上传弹层靠它提前说清"视频传上来会不会白传"。 */
+const decoderState = { info: null, loading: false };
 
 const settingsSaved = () => (settingsState.data || {}).saved || {};
 const settingsDevice = (value) => ((settingsState.data || {}).devices || {})[value] || {};
@@ -335,6 +337,20 @@ function renderSettingsPanel() {
   const path = $("set-path");
   if (path) { path.textContent = (settingsState.data || {}).path || "—"; }
   renderOpenVocabRow();
+  renderDecoderRow();
+}
+
+/** 视频抽帧用的是哪一级解码器：缺 ffmpeg 不是故障，但必须看得见。 */
+function renderDecoderRow() {
+  const host = $("set-video");
+  if (!host) { return; }
+  const info = (settingsState.data || {}).video || decoderState.info || {};
+  if (!info || !Object.keys(info).length) { return; }
+  host.hidden = false;
+  host.classList.toggle("warn", !info.ready);
+  host.classList.toggle("ok", Boolean(info.ready) && info.name === "ffmpeg");
+  host.textContent = "视频抽帧 " + (info.label || "未知")
+    + (info.note ? `：${info.note}` : "");
 }
 
 /** 开放词表权重（YOLOE / YOLO-World）的依赖状况。
@@ -429,6 +445,40 @@ async function saveSettings(patch) {
   } finally {
     settingsState.saving = false;
   }
+}
+
+/** 读一次解码器现状（不探测显卡，很便宜），给所有上传弹层共用。 */
+async function loadDecoderInfo() {
+  if (decoderState.loading || decoderState.info) { return; }
+  decoderState.loading = true;
+  try {
+    const data = await getJson("/api/settings");
+    decoderState.info = data.video || null;
+    if (settingsState.data) { settingsState.data.video = data.video; }
+  } catch (err) {
+    decoderState.info = null;   // 读不到就不提示，别拿猜测拦人
+  } finally {
+    decoderState.loading = false;
+    paintDecoderNotices();
+  }
+}
+
+/** 把解码器现状刷到页面上所有 data-decoder-note 的位置（上传弹层里那一行）。
+ *
+ *  ffmpeg 在时没什么可说的，直接藏起来；只有"用兜底解码器"和"根本没解码器"
+ *  这两种情况值得占一行——视频导入历史上会静默变空，用户完全不知道发生了什么。
+ */
+function paintDecoderNotices() {
+  const info = decoderState.info;
+  document.querySelectorAll("[data-decoder-note]").forEach((el) => {
+    if (!info) { el.hidden = true; return; }
+    if (info.name === "ffmpeg") { el.hidden = true; return; }
+    el.hidden = false;
+    el.classList.toggle("warn", true);
+    el.textContent = info.ready
+      ? "视频抽帧：" + (info.note || "改用内置解码器")
+      : "视频现在传了也抽不出帧：" + (info.note || "这台机器还没有视频解码器");
+  });
 }
 
 async function loadSettings(probe) {
@@ -1200,6 +1250,7 @@ function initShellChrome(options) {
     if (el && typeof fn === "function") { el.onclick = fn; }
   };
   applyAppearance({ animate: false });
+  loadDecoderInfo();
   if (window.matchMedia) {
     const mq = window.matchMedia("(prefers-color-scheme: light)");
     const follow = () => { if (appearance.theme === "auto") { applyAppearance(); } };

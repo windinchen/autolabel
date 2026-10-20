@@ -1,5 +1,42 @@
 # 变更记录
 
+## 2026-10-20 11:58 — v1.4.19：视频导入素材不再静默变空；抽帧不再只认 ffmpeg，四个入口统一按文件类型分派
+
+批次记录里的铁证：`视频 5 个 · 1792122217708.mp4 等 | 失败 | 素材 0 | RuntimeError: 未找到 ffmpeg`。
+两件事叠在一起，每一件都让人看不出来。
+
+### 一、抽帧只认 ffmpeg，而这台机器没有 ffmpeg
+
+- `video.py` 改成两级解码：**ffmpeg 优先**（快一个量级，且只有它支持按镜头切换取样）→
+  **OpenCV 兜底**（随标注依赖一起来，macOS/Windows 都不用额外装）。两级都没有才报错。
+- 新 `decoder()`：`{name, label, ffmpeg, opencv, scene, ready, note}`，`note` 里把
+  `brew install ffmpeg` / `winget install ffmpeg` / `pip install opencv-python` 三种装法都写出来。
+- `_sample_opencv()`：`grab()` 跳帧 + `retrieve()` 只取留下的帧；采样间隔按 `fps` 算、
+  抽满 `max_frames` 就停；超时保留已抽到的帧并在 `note` 里说明，不整次作废。
+- 元信息同样兜底：没有 `ffprobe` 时 `_probe_opencv()` 读时长/帧率/尺寸。
+- `_capture()`：Windows 上打不开且路径带非 ASCII 时，挂一个 ASCII 硬链接重试
+  （`cv2.VideoCapture` 与 `cv2.imwrite` 只认 ANSI 是同一个坑）；JPEG 交给 PIL 写，不用 `cv2.imwrite`。
+- `ffmpeg_timeout` 更名 `decode_timeout`（保留旧名），两级解码器共用同一份抽帧预算。
+
+### 二、四个上传入口只有一个会抽帧
+
+- `upload._ingest()` 改成**按后缀分派**，不再按任务类型：素材池页的 `pool` 任务、
+  提示词标注与目标检测标注的混传任务以前都把 `.mp4` 丢给图片解码器，0 张进池。
+- 新增 `upload._extract()`：视频抽帧后照常盖「来处 + 分类」，并把每个视频的
+  `extracted / imported / backend / note` 记在任务上。
+- `Job.ingest_note()` 合并去重与抽帧两项说明：「已进池 6 张（视频 1 个抽出 6 帧、进池 6 帧）」。
+- `_relabel_video()`：账本与库索引里的来源写**原始文件名**，不再是 `uploads/` 里那个
+  任务收尾就删除的 `a1b2c3d4_现场录像.mp4`。
+
+### 三、把结果说出口
+
+- `pool.js` 新增 `reportFinished()`：任务从"在跑"变成"结束"时把最终结论打进页面日志并弹提示。
+  以前任务条只是收起，抽帧结果在那一瞬间一起消失。
+- `settings.payload()` 增加 `video` 段并在 `describe()` 里打印；`common.js` 新增
+  `loadDecoderInfo()` / `paintDecoderNotices()` / `renderDecoderRow()`，系统设置里多一行
+  「视频抽帧」，四个上传弹层在选视频前先把解码器现状说在前面（`data-decoder-note`）。
+- 新增 23 项测试（1267 → 1290）。
+
 ## 2026-10-20 09:48 — v1.4.18：姿态标注页的按钮主次和另外两个标注页反了
 
 - `review.html`：`#btn-run`（批量姿态标注）`btn → btn primary`，`#btn-upload`（导入素材）`btn primary → btn`。

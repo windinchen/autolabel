@@ -370,8 +370,11 @@ def payload(probe: bool = False) -> dict:
     from . import backends as inference   # 延迟导入：这个文件平时只读一份 JSON
 
     open_vocab = inference.text_encoder_status() if probe else {}
+    from . import video as video_tools   # 只查有没有解码器，不 import cv2，平时代价几乎为零
+
     return {
         "open_vocab": open_vocab,
+        "video": video_tools.decoder(),
         "saved": saved,
         "env": {k: DEVICE_LABELS.get(v, v) if k == "device" else v for k, v in override.items()},
         "devices": devices,
@@ -413,6 +416,9 @@ def describe(raw: Optional[dict] = None) -> str:
                      + (f" · 文本编码器权重已缓存 {round(cached / 1048576)} MB" if cached else ""))
         if not open_vocab.get("installed"):
             lines.append(f"  · {open_vocab.get('note') or ''}")
+    video = data.get("video") or {}
+    lines.append(f"视频抽帧 {video.get('label') or '未知'}"
+                 + (f"：{video.get('note')}" if video.get("note") else ""))
     if data["env"]:
         got = "、".join(
             (DEVICE_LABELS.get(v, v) if k == "device" else ("开" if v else "关"))

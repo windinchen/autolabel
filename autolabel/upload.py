@@ -124,6 +124,11 @@ def safe_upload_name(name: str) -> str:
     return base[:120] or "file"
 
 
+def _ext(path: str) -> str:
+    """小写后缀；上传落盘名带的是原文件名，中文和空格都得受得住。"""
+    return os.path.splitext(str(path))[1].lower()
+
+
 def kind_for(ext: str) -> str:
     ext = ext.lower()
     if ext in IMAGE_EXTS:
@@ -228,6 +233,9 @@ class Job:
     ingested: List[str] = field(default_factory=list)
     #: 入库时被去重跳过 / 读不出图片的张数，完成消息要照这个说，不能糊在"入库 N 张"里
     counts: dict = field(default_factory=dict)
+    #: 每个视频抽了多少帧、用的哪个解码器，完成消息与「批次详情」都要照着说
+    videos: List[dict] = field(default_factory=list)
+    frames: int = 0
     result: dict = field(default_factory=dict)
     error: str = ""
     created_at: str = field(default_factory=now_str)
@@ -243,12 +251,30 @@ class Job:
             self.total = total
         self.updated_at = now_str()
 
+    def ingest_note(self) -> str:
+        """完成消息里那对括号：少掉的张数 + 视频抽了多少帧，一次说完。
+
+        「我那条 3 分钟的录像怎么池里只有 90 张」是抽帧最容易被当成丢素材的疑问：
+        按每 2 秒 1 帧本来就该是 90 帧，把数字和原因一起说出来才不用猜。
+        """
+        parts = []
+        quiet = duplicate_note(self.counts).strip("（）")
+        if quiet:
+            parts.append(quiet)
+        if self.videos:
+            got = sum(int(row.get("extracted") or 0) for row in self.videos)
+            kept = sum(int(row.get("imported") or 0) for row in self.videos)
+            parts.append(f"视频 {len(self.videos)} 个抽出 {got} 帧、进池 {kept} 帧")
+            parts.extend(sorted({str(row.get("note") or "") for row in self.videos if row.get("note")}))
+        return f"（{'，'.join(parts)}）" if parts else ""
+
     def payload(self) -> dict:
         return {"id": self.id, "kind": self.kind, "files": self.files[:6], "file_count": len(self.files),
                 "stage": self.stage, "message": self.message, "done": self.done, "total": self.total,
                 "finished": self.finished, "ok": self.ok, "result": self.result, "error": self.error,
                 "cancel_requested": self.cancel_requested,
                 "batch_id": self.batch_id, "counts": self.counts,
+                "frames": self.frames, "videos": self.videos,
                 "model": self.params.get("model"),
                 "vlm_profile": self.params.get("vlm_profile") or "",
                 "vlm_name": self.params.get("vlm_name") or "",
@@ -514,35 +540,89 @@ class JobStore:
         attach_items(self.root, job.batch_id, job.ingested, lib=lib_for_kind(job.kind))
 
     def _ingest(self, job: Job) -> int:
+        """把任务收到的文件落进池/库：图片直接入库，视频先抽帧。
+
+        **按后缀分派，不按任务类型分派**：素材池页上传的视频走的是 ``pool`` 任务，
+        提示词标注和目标检测标注上传时图片和视频混在同一个任务里——以前只有姿态页
+        那个 ``video`` 任务会抽帧，其余三处把 .mp4 当图片交给解码器，一张都进不来，
+        界面上只剩「已进池 0 张」。谁上传都得是同一个结果。
+        """
         from .dataset import import_images
-        from .video import extract_frames
 
         # 素材池页的导入只落文件、不进库：各库要用再从「从素材池添加」里挑
         register = job.kind != "pool"
+        max_side = int(job.params.get("max_side", 1600))
+        lib = lib_for_kind(job.kind)
         paths = [os.path.join(uploads_dir(self.root), name) for name in job.files]
-        if job.kind == "video":
-            imported = 0
-            for path in paths:
-                self._check(job)
-                job.set_stage("importing", f"抽帧 {os.path.basename(path)}")
-                result = extract_frames(path, self.root, fps=float(job.params.get("fps", 0.5)),
-                                        max_frames=int(job.params.get("max_frames", 600)),
-                                        scene=job.params.get("scene"),
-                                        max_side=int(job.params.get("max_side", 1600)),
-                                        dedupe=str(job.params.get("video_dedupe", "perceptual")),
-                                        lib=lib_for_kind(job.kind), register=register)
-                imported += int(result["imported"]) + int(result.get("reused") or 0)
-                self._tally(job, result)
-                job.ingested.extend(rel for _src, rel in result.get("imported_files", []))
-            self._attach_batch(job)
-            return imported
-        stats = import_images(self.root, paths, max_side=int(job.params.get("max_side", 1600)),
-                              dedupe=str(job.params.get("dedupe", "exact")),
-                              lib=lib_for_kind(job.kind), register=register)
-        self._tally(job, stats)
-        job.ingested.extend(rel for _src, rel in stats.get("imported_files", []))
+        videos = [path for path in paths if kind_for(_ext(path)) == "video"]
+        stills = [path for path in paths if kind_for(_ext(path)) != "video"]
+        imported = 0
+        if videos:
+            imported += self._extract(job, videos, register=register, lib=lib)
+        if stills:
+            stats = import_images(self.root, stills, max_side=max_side,
+                                  dedupe=str(job.params.get("dedupe", "exact")),
+                                  lib=lib, register=register)
+            self._tally(job, stats)
+            job.ingested.extend(rel for _src, rel in stats.get("imported_files", []))
+            imported += int(stats["imported"]) + int(stats["reused"])
         self._attach_batch(job)
-        return int(stats["imported"]) + int(stats["reused"])
+        return imported
+
+    def _extract(self, job: Job, paths: List[str], *, register: bool, lib: str) -> int:
+        """逐个视频抽帧入库，并把「哪个视频抽了几帧、用的哪个解码器」记在任务上。
+
+        完成消息要能回答「我那条 3 分钟的录像怎么池里只有 90 张」——按 0.5 fps
+        抽本来就该是 90 帧，不说清楚就像丢了东西。
+        """
+        from .video import extract_frames
+
+        imported = 0
+        for path in paths:
+            self._check(job)
+            job.set_stage("importing", f"抽帧 {os.path.basename(path)}")
+            result = extract_frames(path, self.root, fps=float(job.params.get("fps", 0.5)),
+                                    max_frames=int(job.params.get("max_frames", 600)),
+                                    scene=job.params.get("scene"),
+                                    start=float(job.params.get("start") or 0.0),
+                                    duration=job.params.get("duration"),
+                                    max_side=int(job.params.get("max_side", 1600)),
+                                    dedupe=str(job.params.get("video_dedupe", "perceptual")),
+                                    lib=lib, register=register)
+            imported += int(result["imported"]) + int(result.get("reused") or 0)
+            self._tally(job, result)
+            job.ingested.extend(rel for _src, rel in result.get("imported_files", []))
+            self._relabel_video(job, result, path, register=register, lib=lib)
+            job.videos.append({"video": display_name(os.path.basename(path)),
+                               "extracted": int(result.get("extracted") or 0),
+                               "imported": len(result.get("imported_files") or []),
+                               "backend": result.get("backend") or "",
+                               "note": result.get("note") or ""})
+        job.frames = sum(int(row.get("extracted") or 0) for row in job.videos)
+        return imported
+
+    def _relabel_video(self, job: Job, result: dict, path: str, *, register: bool, lib: str) -> None:
+        """把账本里的「来源视频」换成用户原来那个文件名。
+
+        抽帧时来源写的是 ``.autolabel/uploads/`` 里的临时文件，任务收尾就删了；账本上
+        再留着 ``a1b2c3d4_现场录像.mp4`` 这种带哈希前缀的临时名，界面上读起来就像
+        「我那个文件怎么变成乱码了」，而它其实只是上传时的去重用的前缀。
+        """
+        rels = [rel for _src, rel in result.get("imported_files", [])]
+        if not rels:
+            return
+        label = display_name(os.path.basename(path))
+        if register:
+            from .dataset import load_index
+
+            index = load_index(self.root, lib)
+            for rel in rels:
+                index.upsert(rel, video=label)
+            index.save()
+            return
+        from . import pool as pool_catalog
+
+        pool_catalog.record_files(self.root, [(rel, {"video": label}) for rel in rels])
 
     @staticmethod
     def _tally(job: Job, stats: dict) -> None:
@@ -654,7 +734,7 @@ class JobStore:
         self._check(job)
         self._cleanup(job)
         job.result = {"imported": ingested, "batch_id": job.batch_id}
-        job.set_stage("done", f"已进池 {ingested} 张{duplicate_note(job.counts)}",
+        job.set_stage("done", f"已进池 {ingested} 张{job.ingest_note()}",
                      done=ingested, total=max(len(job.files), ingested))
         # finished / ok 必须在这儿落定：以前只写了 stage=done，任务条会一直转，
         # 「还在导入中」的保护还会把这批素材一直拦住不让删
@@ -684,7 +764,7 @@ class JobStore:
         job.result = {"imported": ingested, "labeled": labeled.get("labeled", 0),
                       "people": labeled.get("people", 0), "flagged": labeled.get("flagged", 0),
                       "report": report, "coords": coords, "batch_id": job.batch_id}
-        job.set_stage("done", f"完成：入库 {ingested} 张{duplicate_note(job.counts)}，"
+        job.set_stage("done", f"完成：入库 {ingested} 张{job.ingest_note()}，"
                              f"标注 {labeled.get('labeled', 0)} 张")
         job.finished, job.ok = True, True
         finish_batch_any(self.root, job.batch_id, "done", job.message)
@@ -702,7 +782,7 @@ class JobStore:
             self._cleanup(job)
             job.result = {"imported": 0, "labeled": 0, "boxes": 0, "batch_id": job.batch_id}
             job.set_stage("done", "完成：没有新图入库"
-                         + (duplicate_note(job.counts) or "（可能与已有图片重复，或文件里没有可用图片）"))
+                         + (job.ingest_note() or "（可能与已有图片重复，或文件里没有可用图片）"))
             job.finished, job.ok = True, True
             finish_batch_any(self.root, job.batch_id, "done", job.message)
             return
@@ -733,7 +813,7 @@ class JobStore:
                       "protected": stats.get("protected", 0),
                       "unknown_fields": stats.get("unknown_fields", []),
                       "coords": coords, "batch_id": job.batch_id, "fields": names}
-        done = (f"完成：入库 {ingested} 张{duplicate_note(job.counts)}，"
+        done = (f"完成：入库 {ingested} 张{job.ingest_note()}，"
                 f"标注 {stats.get('labeled', 0)} 张，产出 {stats.get('boxes', 0)} 个框")
         if stats.get("failed"):
             done += f"（{stats['failed']} 张没答上）"
@@ -862,7 +942,7 @@ class JobStore:
             self._cleanup(job)
             job.result = {"imported": 0, "labeled": 0, "boxes": 0, "batch_id": job.batch_id}
             job.set_stage("done", "完成：没有新图入库"
-                         + (duplicate_note(job.counts) or "（可能与已有图片重复，或文件里没有可用图片）"))
+                         + (job.ingest_note() or "（可能与已有图片重复，或文件里没有可用图片）"))
             job.finished, job.ok = True, True
             finish_batch_any(self.root, job.batch_id, "done", job.message)
             return
@@ -893,7 +973,7 @@ class JobStore:
                       "missing_classes": stats.get("missing_classes", []),
                       "model": stats.get("model", model),
                       "coords": coords, "batch_id": job.batch_id, "classes": names}
-        job.set_stage("done", self._detect_done_text(stats, ingested, duplicate_note(job.counts)))
+        job.set_stage("done", self._detect_done_text(stats, ingested, job.ingest_note()))
         job.finished, job.ok = True, True
         finish_batch_any(self.root, job.batch_id, "done", job.message)
 
