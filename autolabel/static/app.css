@@ -569,7 +569,8 @@ footer #hint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; whi
 }
 .modal-x:hover { color: var(--fill-ink); background: var(--coral-fill); border-color: var(--coral); }
 .modal-x:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
-.modal-x .ic { width: 13px; height: 13px; }
+/* 图标符号只有描边没有填充，不给 stroke 就是一个空心方块（全站弹层的关闭键都受这个影响） */
+.modal-x .ic { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.6; }
 #palette-modal .modal-x { background: none; border-color: transparent; }
 #palette-modal .modal-x:hover { background: var(--coral-fill); border-color: var(--coral); }
 .modal .btn-row button { flex: 1; }
@@ -608,6 +609,13 @@ footer #hint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; whi
 }
 #up-drop.over { border-color: var(--amber); background: color-mix(in srgb, var(--amber) 7%, transparent); }
 .pick-row, .param-row { display: flex; gap: var(--s2); flex-wrap: wrap; align-items: center; margin: 10px 0; }
+/* 「从素材池添加」的筛选下拉：批次名动辄几十字，不设上限会把一整行撑到换行 */
+/* 「从素材池添加」的两行筛选：批次名动辄几十字，不设上限会把整行撑到换行；
+   输入框要真的吃掉剩余宽度，否则同一行右边留一大块空白 */
+#pool-modal .pick-row select { max-width: 240px; }
+#pool-modal .pick-row .btn { flex: 0 0 auto; }
+#pool-modal .pick-row label.grow { flex: 1 1 220px; min-width: 190px; }
+#pool-modal .pick-row label.grow input { flex: 1; min-width: 150px; }
 .param-row input[type=number] { width: 72px; }
 #up-files { max-height: 74px; overflow-y: auto; font-size:  calc(12px * var(--fs)); color: var(--ink-2); margin-bottom: var(--s2); }
 #up-log {

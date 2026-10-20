@@ -1289,7 +1289,34 @@ const POOL_LIBS = [
   { lib: "detect", name: "检测库" },
 ];
 
-const poolState = { lib: "pose", files: [], sel: new Set(), loading: false, busy: false, onDone: null };
+const POOL_FILTER_ALL = "";
+/** 界面里的「未分类 / 没记批次」占位值：后端把没分类写成空串，不能拿空串当筛选项 */
+const POOL_NONE = "__none__";
+
+const poolState = {
+  lib: "pose", files: [], cats: [], sel: new Set(), loading: false, busy: false, onDone: null,
+  // 筛选三档：分类 / 批次 / 文件名。素材池页早就能按分类和批次清库存，
+  // 「从素材池添加」却还是一串平铺勾选——池子实测 255 个文件时，
+  // 想挑出「上周那条录像抽的那批」只能肉眼翻到底。
+  cat: POOL_FILTER_ALL, batch: POOL_FILTER_ALL, query: "",
+};
+
+/** 当前筛选下要列出来的素材；选中状态跟着素材走，换筛选不会把已勾的丢掉。 */
+function poolVisibleFiles() {
+  const q = poolState.query.trim().toLowerCase();
+  return poolState.files.filter((file) => {
+    if (poolState.cat === POOL_NONE && file.category) { return false; }
+    if (poolState.cat && poolState.cat !== POOL_NONE
+      && String(file.category || "") !== poolState.cat) { return false; }
+    if (poolState.batch === POOL_NONE && file.pool_batch) { return false; }
+    if (poolState.batch && poolState.batch !== POOL_NONE
+      && String(file.pool_batch || "") !== poolState.batch) { return false; }
+    if (q && !`${file.name} ${file.video || ""}`.toLowerCase().includes(q)) { return false; }
+    return true;
+  });
+}
+
+const poolFilterOn = () => Boolean(poolState.cat || poolState.batch || poolState.query.trim());
 
 function ensurePoolModal() {
   if ($("pool-modal")) { return; }
@@ -1301,15 +1328,31 @@ function ensurePoolModal() {
       <div class="modal-title">从素材池添加<span class="muted small"> · 素材已在 <span class="mono">images/</span> 里，只是还没进本库；添加不复制文件</span></div>
       <div class="muted small" id="pool-note"></div>
       <div class="pick-row">
-        <button id="pool-refresh" class="btn">重新载入</button>
-        <label class="muted small grow">批次名（选填）
-          <input type="text" id="pool-batch-name" placeholder="例如：补标 10 月旧素材" spellcheck="false">
+        <label class="muted small">分类
+          <select id="pool-filter-cat"><option value="">全部分类</option></select>
         </label>
+        <label class="muted small">批次
+          <select id="pool-filter-batch"><option value="">全部批次</option></select>
+        </label>
+        <label class="muted small grow">找文件名
+          <input type="text" id="pool-filter-q" placeholder="输入文件名里的字" spellcheck="false">
+        </label>
+        <button id="pool-filter-clear" class="btn">清空筛选</button>
       </div>
       <div id="pool-files" class="pool-list muted small">加载中…</div>
+      <div class="pick-row">
+        <label class="muted small grow">这批叫什么（选填，只写进本库批次管理）
+          <input type="text" id="pool-batch-name" placeholder="例如：补标 10 月旧素材" spellcheck="false">
+        </label>
+        <label class="muted small">顺手归类到
+          <select id="pool-adopt-cat"><option value="">不改分类</option></select>
+        </label>
+      </div>
       <div class="btn-row">
         <button id="pool-adopt" class="primary" disabled>添加到本库</button>
         <button id="pool-all">全选</button>
+        <button id="pool-clear-sel">清空选择</button>
+        <button id="pool-refresh">重新载入</button>
         <button id="pool-close">关闭</button>
       </div>
       <div class="muted small" id="pool-log"></div>
@@ -1317,14 +1360,101 @@ function ensurePoolModal() {
   document.body.append(wrap);
   $("pool-refresh").onclick = () => loadPool();
   $("pool-all").onclick = poolToggleAll;
+  $("pool-clear-sel").onclick = () => { poolState.sel = new Set(); renderPool(); };
   $("pool-adopt").onclick = poolAdopt;
   $("pool-close").onclick = () => openPool(false);
+  $("pool-filter-cat").onchange = (e) => { poolState.cat = e.target.value; renderPool(); };
+  $("pool-filter-batch").onchange = (e) => { poolState.batch = e.target.value; renderPool(); };
+  $("pool-filter-q").oninput = (e) => { poolState.query = e.target.value; renderPool(); };
+  $("pool-filter-clear").onclick = () => {
+    poolState.cat = POOL_FILTER_ALL; poolState.batch = POOL_FILTER_ALL; poolState.query = "";
+    $("pool-filter-q").value = "";
+    fillPoolFilters();
+    renderPool();
+  };
   installModalChrome();
+}
+
+/** 把三个筛选控件铺出来：只列当前「可添加」的素材里真有的分类和批次，
+ *  并按名字留住上一次的筛选（重新载入后不该把人刚选的筛选抹掉）。 */
+function fillPoolFilters() {
+  const cat = $("pool-filter-cat");
+  const batch = $("pool-filter-batch");
+  const adoptCat = $("pool-adopt-cat");
+  if (!cat || !batch || !adoptCat) { return; }
+  const counts = {};
+  for (const file of poolState.files) {
+    const key = String(file.category || "") || POOL_NONE;
+    counts[key] = (counts[key] || 0) + 1;
+  }
+  const options = [{ value: POOL_FILTER_ALL, label: `全部分类（${poolState.files.length}）` }];
+  for (const row of poolState.cats) {
+    // 空分类照样列出来（置灰）：藏掉会让人以为「我建的分类去哪了」
+    const id = String(row.id);
+    options.push({ value: id, label: `${row.name || "未命名分类"}（${counts[id] || 0}）`, 
+      disabled: !counts[id] });
+  }
+  options.push({ value: POOL_NONE, label: `未分类（${counts[POOL_NONE] || 0}）`, 
+    disabled: !counts[POOL_NONE] });
+  fillSelect(cat, options, poolState.cat);
+
+  // 批次按素材身上盖的来处章凑，顺序跟着「最近导入」在前
+  const seen = new Map();
+  const batchNames = new Map();
+  for (const file of poolState.files) {
+    const id = String(file.pool_batch || "") || POOL_NONE;
+    seen.set(id, (seen.get(id) || 0) + 1);
+    if (!batchNames.has(id)) { batchNames.set(id, file.pool_batch_name || id); }
+  }
+  const batchOptions = [{ value: POOL_FILTER_ALL, label: `全部批次（${poolState.files.length}）` }];
+  for (const [id, num] of seen) {
+    if (id === POOL_NONE) { continue; }
+    // 批次名默认带着头一个文件名（「素材池 255 个 · frame_00059.png 等」），
+    // 整条塞进下拉会把选择框撑到两行宽，够认就行
+    const name = String(batchNames.get(id) || id);
+    const short = name.length > 20 ? `${name.slice(0, 20)}…` : name;
+    batchOptions.push({ value: id, label: `${short}（${num}）` });
+  }
+  if (seen.get(POOL_NONE)) { batchOptions.push({ value: POOL_NONE, label: `没记来处（${seen.get(POOL_NONE)}）` }); }
+  fillSelect(batch, batchOptions, poolState.batch);
+
+  const adoptOptions = [{ value: "", label: "不改分类" }];
+  for (const row of poolState.cats) {
+    adoptOptions.push({ value: String(row.id), label: row.name || "未命名分类" });
+  }
+  adoptOptions.push({ value: POOL_NONE, label: "退回未分类" });
+  fillSelect(adoptCat, adoptOptions, adoptCat.value || "");
+}
+
+function fillSelect(select, options, keep) {
+  select.innerHTML = "";
+  for (const row of options) {
+    const opt = document.createElement("option");
+    opt.value = row.value;
+    opt.textContent = row.label;
+    opt.disabled = Boolean(row.disabled);
+    select.append(opt);
+  }
+  const usable = (row) => row.value === keep && !row.disabled;
+  select.value = options.some(usable) ? keep : options[0].value;
+  if (select.value !== keep) {
+    // 选中的那一项没了（分类刚被删）：把状态收回来，别让筛选挂着个不存在的值
+    if (select.id === "pool-filter-cat") { poolState.cat = select.value; }
+    if (select.id === "pool-filter-batch") { poolState.batch = select.value; }
+  }
 }
 
 function openPool(open, lib, onDone) {
   ensurePoolModal();
-  if (typeof lib === "string" && lib) { poolState.lib = lib; }
+  if (typeof lib === "string" && lib && lib !== poolState.lib) {
+    // 换了库，上一轮的筛选和勾选都不该带过去：可添加的清单本来就是按库算的
+    poolState.lib = lib;
+    poolState.cat = POOL_FILTER_ALL;
+    poolState.batch = POOL_FILTER_ALL;
+    poolState.query = "";
+    poolState.sel = new Set();
+    if ($("pool-filter-q")) { $("pool-filter-q").value = ""; }
+  }
   if (typeof onDone === "function") { poolState.onDone = onDone; }
   const el = $("pool-modal");
   el.classList.toggle("hidden", !open);
@@ -1339,7 +1469,9 @@ async function loadPool() {
   try {
     const data = await getJson("/api/pool?lib=" + encodeURIComponent(poolState.lib));
     poolState.files = data.files || [];
-    poolState.sel = new Set();
+    poolState.cats = data.categories || [];
+    poolState.sel = new Set([...poolState.sel].filter(
+      (rel) => poolState.files.some((file) => file.image === rel)));
     poolState.stats = data.stats || {};
     const owned = (data.libs || POOL_LIBS)
       .map((row) => `${row.name} ${poolState.stats[row.lib] || 0}`).join(" · ");
@@ -1350,18 +1482,34 @@ async function loadPool() {
   } catch (err) {
     box.textContent = "素材池读取失败：" + err.message;
     poolState.files = [];
+    poolState.cats = [];
   }
   poolState.loading = false;
+  fillPoolFilters();
   renderPool();
 }
 
 function renderPool() {
   const box = $("pool-files");
+  const rows = poolVisibleFiles();
   box.innerHTML = "";
-  if (!poolState.files.length) {
-    box.textContent = "素材池里没有可添加的图了：本库已引用全部素材，或池子本来就是空的。";
+  if (!rows.length) {
+    if (poolFilterOn() && poolState.files.length) {
+      const tip = document.createElement("div");
+      tip.textContent = "当前筛选下没有可添加的素材（换个分类 / 批次，或清空筛选）。";
+      const clear = document.createElement("button");
+      clear.className = "btn";
+      clear.textContent = "清空筛选";
+      clear.onclick = () => $("pool-filter-clear").click();
+      tip.append(document.createElement("br"), clear);
+      box.append(tip);
+    } else {
+      box.textContent = poolState.files.length
+        ? "当前筛选下没有可添加的素材。"
+        : "素材池里没有可添加的图了：本库已引用全部素材，或池子本来就是空的。";
+    }
   }
-  for (const file of poolState.files) {
+  for (const file of rows) {
     const line = document.createElement("div");
     line.className = "file-row";
     const check = document.createElement("input");
@@ -1382,7 +1530,11 @@ function renderPool() {
     const chips = document.createElement("span");
     chips.className = "chip";
     const owned = POOL_LIBS.filter((row) => file["in_" + row.lib]).map((row) => "已在" + row.name);
-    chips.textContent = owned.join(" · ") || "各库都没有";
+    // 分类和来处直接写在行上：筛完了还得逐张确认「这是不是我要的那批」就没意义了
+    chips.textContent = [file.category_name || "未分类",
+      file.pool_batch_name ? `批次 ${file.pool_batch_name}` : "没记批次",
+      ...owned].join(" · ");
+    chips.title = file.pool_batch_name || "";
     line.append(check, name, meta, chips);
     box.append(line);
   }
@@ -1390,18 +1542,29 @@ function renderPool() {
 }
 
 function syncPoolButtons() {
-  const all = poolState.files.length;
-  $("pool-all").textContent = all && poolState.sel.size === all ? "清空选择" : "全选";
+  const visible = poolVisibleFiles();
+  const all = visible.length;
+  const pickedHere = visible.filter((file) => poolState.sel.has(file.image)).length;
+  $("pool-all").textContent = all && pickedHere === all ? "取消这一屏" : `全选这一屏（${all}）`;
   $("pool-all").disabled = !all;
+  $("pool-clear-sel").disabled = !poolState.sel.size;
+  const outside = poolState.sel.size - pickedHere;
   $("pool-adopt").disabled = !poolState.sel.size || poolState.busy;
   $("pool-adopt").textContent = poolState.busy ? "添加中…"
-    : (poolState.sel.size ? `添加到${libLabel(poolState.lib)}（${poolState.sel.size} 张）` : "添加到本库");
+    : (poolState.sel.size
+      ? `添加到${libLabel(poolState.lib)}（${poolState.sel.size} 张${outside ? ` · 含筛选外 ${outside}` : ""}）`
+      : "添加到本库");
 }
 
 function poolToggleAll() {
-  const all = poolState.files.length;
-  poolState.sel = all && poolState.sel.size === all
-    ? new Set() : new Set(poolState.files.map((f) => f.image));
+  const visible = poolVisibleFiles();
+  const pickedHere = visible.filter((file) => poolState.sel.has(file.image)).length;
+  if (visible.length && pickedHere === visible.length) {
+    // 只取消这一屏：筛选外手工勾的那些留着，别拿一次「全选」把人家的选择整没
+    for (const file of visible) { poolState.sel.delete(file.image); }
+  } else {
+    for (const file of visible) { poolState.sel.add(file.image); }
+  }
   renderPool();
 }
 
@@ -1410,12 +1573,27 @@ async function poolAdopt() {
   if (!images.length || poolState.busy) { return; }
   poolState.busy = true;
   syncPoolButtons();
+  const category = String($("pool-adopt-cat").value || "");
   try {
     const data = await postJson("/api/pool/adopt", {
       images, lib: poolState.lib, batch_name: $("pool-batch-name").value.trim(),
     });
-    const added = `已添加 ${data.added} 张到「${libLabel(data.lib)}」`
+    let added = `已添加 ${data.added} 张到「${libLabel(data.lib)}」`
       + (data.already ? `（本来就在库里 ${data.already} 张）` : "");
+    if (category) {
+      // 分类只有素材池那一份：在这里顺手归一次类，三个模块看到的分类一起变
+      try {
+        const back = await postJson("/api/pool/assign", {
+          images, category: category === POOL_NONE ? "" : category,
+        });
+        const moved = category === POOL_NONE
+          ? (back.cleared ?? images.length) : (back.set ?? images.length);
+        added += category === POOL_NONE ? `，已把 ${moved} 张退回未分类`
+          : `，并把 ${moved} 张归到「${categoryName(category)}」`;
+      } catch (err) {
+        added += `，但归类失败：${err.message}`;
+      }
+    }
     $("pool-log").textContent = added
       + (data.missing && data.missing.length ? `，池里查无 ${data.missing.length} 张` : "") + "。";
     toast(added);
@@ -1428,6 +1606,14 @@ async function poolAdopt() {
   poolState.busy = false;
   syncPoolButtons();
 }
+
+/** 分类 ID → 名字（归类成功的提示要说人话，别把内部 ID 念给用户）。 */
+function categoryName(id) {
+  if (!id || id === POOL_NONE) { return "未分类"; }
+  const row = (poolState.cats || []).find((cat) => String(cat.id) === String(id));
+  return (row && (row.name || "未命名分类")) || "该分类";
+}
+
 
 // --------------------------------------------------------------------------- //
 // 应用壳（四个页面共用）：命令面板 / 溢出菜单 / 快捷键速查 / 撤销条

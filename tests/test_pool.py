@@ -5,6 +5,7 @@
 删素材看的是「还有哪个库在用」，没入库的就是真删。
 """
 
+import io
 import json
 import os
 
@@ -36,6 +37,13 @@ from autolabel.dataset import (
 )
 
 JSON = {"Content-Type": "application/json"}
+STATIC = os.path.join(
+    os.path.dirname(__file__), "..", "autolabel", "static")
+
+
+def read_static(name):
+    with io.open(os.path.join(STATIC, name), encoding="utf-8") as handle:
+        return handle.read()
 
 
 @pytest.fixture()
@@ -289,6 +297,46 @@ def test_pool_api_view_all_carries_dataset_categories_and_batches(server, datase
     picker = json.loads(body)
     assert {row["image"] for row in picker["files"]} == set(pool_rows(dataset)) - set(imported), \
         "已经在本库的素材还留在挑选列表里"
+
+
+def test_picker_view_carries_the_filters_for_category_and_batch(server, dataset, fresh_dir):
+    """「从素材池添加」要能按分类和批次挑：挑选清单必须自带这两样，
+    否则界面上只有平铺勾选，池子几百个文件时只能肉眼翻。"""
+    base = server[0]
+    imported, _stats = import_only(dataset, fresh_dir)
+    cat = pool_catalog.save_category(dataset, "户外")["category"]
+    pool_catalog.assign(dataset, imported[:1], cat["id"])
+    batch = pool_catalog.create_batch(dataset, name="10 月旧素材")
+    pool_catalog.attach_items(dataset, batch["id"], imported[1:])
+
+    status, _headers, body = call(base, "/api/pool?lib=detect")
+    assert status == 200, body
+    data = json.loads(body)
+    rows = {row["image"]: row for row in data["files"]}
+    assert len(rows) == len(pool_rows(dataset))
+    for rel, row in rows.items():
+        assert "category" in row and "category_name" in row, f"{rel} 没带分类，分类下拉凑不出选项"
+        assert "pool_batch" in row and "pool_batch_name" in row, f"{rel} 没带来处，批次下拉凑不出选项"
+    named = [row for row in data["files"] if row["category_name"] != "未分类"]
+    assert len(named) == 1 and named[0]["category_name"] == "户外"
+    stamped = [row for row in data["files"] if row["pool_batch"] == batch["id"]]
+    assert len(stamped) == len(imported) - 1, "盖到来处章的那批要在挑选清单里认得出来"
+    # 空分类也要出现在界面上（置灰），所以分类表本身得跟着挑选清单一起下发
+    assert {row["id"] for row in data["categories"]} == {cat["id"]}
+
+
+def test_pool_picker_filters_are_wired_in_the_shared_modal():
+    """四个页面的「从素材池添加」共用 common.js 这一份弹层：
+    筛选控件、按筛选全选、顺手归类都得在这份里接好。"""
+    js = read_static("common.js")
+    for element in ("pool-filter-cat", "pool-filter-batch", "pool-filter-q",
+                    "pool-filter-clear", "pool-adopt-cat", "pool-clear-sel"):
+        assert f'id="{element}"' in js, f"弹层缺控件 {element}"
+        assert f'$("{element}")' in js, f"控件 {element} 没接线"
+    assert "function poolVisibleFiles" in js, "筛选后的清单没有统一的算法"
+    assert '"/api/pool/assign"' in js, "添加时顺手归类没接后端"
+    # 换库时得把上一轮的筛选和勾选收掉：可添加的清单本来就是按库算的
+    assert "poolState.lib = lib" in js and "poolState.sel = new Set()" in js
 
 
 def test_pool_category_and_assign_endpoints(server, dataset):
