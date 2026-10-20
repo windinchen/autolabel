@@ -16,14 +16,14 @@
       "last_test": {
         "ok": true,
         "message": "连接正常，可见 1 个模型：Qwen3.8-Flash-Next-Uncensored-oQ6e-mtp",
-        "latency_ms": 84,
+        "latency_ms": 168,
         "models": [
           "Qwen3.8-Flash-Next-Uncensored-oQ6e-mtp"
         ],
-        "checked_at": "2026-10-19 11:39:14"
+        "checked_at": "2026-10-20 11:36:19"
       }
     }
   ],
   "default": "vlm_6b46d0b9",
-  "updated_at": "2026-10-19 23:05:02"
+  "updated_at": "2026-10-20 11:36:19"
 }
