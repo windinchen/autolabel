@@ -12,6 +12,7 @@ import re
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Sequence
 
@@ -136,6 +137,22 @@ def kind_for(ext: str) -> str:
     if ext in VIDEO_EXTS:
         return "video"
     return ""
+
+
+def load_hint_text(name: str, size_mb: float = 0.0) -> str:
+    """加载权重时给界面的那句话：把「多大、大概多久」写出来，慢就不像卡死。
+
+    经验值：读盘 + 建计算图 + 搬上显存，100 MB 权重量级是十几到几十秒，
+    200 MB 以上（26x / yolov8x-seg 这类）到一两分钟都正常。给区间不给准数，
+    估快了用户以为坏了，估慢了没人信。
+    """
+    size = float(size_mb or 0)
+    if size <= 0:
+        return f"加载模型 {name}…"
+    low = max(5, int(size / 6))
+    high = max(low + 5, int(size / 1.5))
+    return (f"加载模型 {name}（权重 {round(size, 1)} MB，"
+            f"读进内存 / 显存约需 {low}–{high} 秒，大模型更久属正常）…")
 
 
 def save_upload(root: str, name: str, data: bytes, max_mb: int = DEFAULT_MAX_UPLOAD_MB) -> dict:
@@ -471,9 +488,36 @@ class JobStore:
         except OSError:
             return "加载模型…"
         if info["ready"]:
-            return f"加载模型 {name}…"
+            return load_hint_text(name, float(info["size_mb"] or 0))
         note = f"已下载 {info['size_mb']} MB" if info["size_mb"] else "尚未下载"
         return f"首次加载 {name}：正在下载权重（{note}，视网络可能要几分钟）…"
+
+    @contextmanager
+    def _loading(self, job: Job, hint: str):
+        """把"把权重读进内存/显存"这段单独标成 ``loading``，并每秒报一次已等时长。
+
+        大权重（yolov8x / 26x 这类 100 MB 以上）冷加载要几十秒，以前这段时间被并进
+        ``labeling`` 且 0/0，进度条一口气跳到一半再一动不动——看着就是卡死了，很多人
+        于是点「清除任务」把正在加载的模型掐了。单独一个阶段 + 一直在动的秒数，
+        才能区分"在加载"和"卡住"。
+        """
+        started = time.time()
+        job.set_stage("loading", f"{hint}（已用 0 秒）", done=0, total=0)
+        stop = threading.Event()
+
+        def tick() -> None:
+            while not stop.wait(1.0):
+                # 内部的进度回调一旦把阶段推到 labeling，这条心跳就该自己退场
+                if job.stage != "loading" or job.finished:
+                    return
+                job.set_stage("loading", f"{hint}（已用 {int(time.time() - started)} 秒）",
+                              done=0, total=0)
+
+        threading.Thread(target=tick, name=f"load-hint-{job.id}", daemon=True).start()
+        try:
+            yield
+        finally:
+            stop.set()
 
     def _check(self, job: Job) -> None:
         """阶段边界检查：收到清除请求就抛出 :class:`JobCancelled`。"""
@@ -749,8 +793,8 @@ class JobStore:
 
         self._check(job)
         if job.params.get("label", True):
-            job.set_stage("labeling", self._load_hint(job))
-            labeled = self._label(job)
+            with self._loading(job, self._load_hint(job)):
+                labeled = self._label(job)
             self._check(job)
             job.set_stage("qc", "生成质量报告")
             report = self._qc(job)
@@ -855,6 +899,17 @@ class JobStore:
 
         return progress
 
+    def _detect_load_hint(self, model: str) -> str:
+        """检测权重的加载提示：模型既可能是裸文件名，也可能是用户给的绝对路径。"""
+        from .backends import default_weights_dir
+
+        path = model if os.path.isabs(model) else os.path.join(default_weights_dir(), model)
+        try:
+            size_mb = os.path.getsize(path) / 1048576
+        except OSError:
+            size_mb = 0.0
+        return load_hint_text(os.path.basename(model), size_mb)
+
     def _detect_coords(self, job: Job) -> str:
         from .detect import write_detect_coordinate_files
 
@@ -887,10 +942,9 @@ class JobStore:
         total = len(job.files)
         job.ingested = list(job.files)        # 批次要能列出"这批标的是哪几张"
         self._attach_batch(job)
-        job.set_stage("labeling",
-                      f"{self._load_hint(job)}（本库这批 {total} 张，参数没变且已标过的自动跳过）"
-                      f" 0/{total}", done=0, total=total)
-        labeled = self._label(job)
+        with self._loading(job, f"{self._load_hint(job)}"
+                                f"本库这批 {total} 张，参数没变且已标过的自动跳过"):
+            labeled = self._label(job)
         self._check(job)
         job.set_stage("qc", "生成质量报告")
         report = self._qc(job)
@@ -915,11 +969,9 @@ class JobStore:
         model, classes = targets["model"], targets["classes"]
         total = len(job.files)
         names = "、".join(classes) or "（本库类别表里全部）"
-        job.set_stage("labeling",
-                      f"用 {os.path.basename(model)} 标注【{names}】，共 {total} 张"
-                      f"（本地推理，比多模态大模型快得多）0/{total}",
-                      done=0, total=total)
-        stats = self._detect_label(job, targets)
+        with self._loading(job, f"{self._detect_load_hint(model)} "
+                                f"标注【{names}】共 {total} 张（本地推理，比多模态大模型快得多）"):
+            stats = self._detect_label(job, targets)
         self._check(job)
         job.set_stage("coords", "生成坐标文件")
         coords = self._detect_coords(job)
@@ -957,11 +1009,9 @@ class JobStore:
                 job.set_stage("labeling", f"目标检测 {done}/{total} · {os.path.basename(model)}",
                               done=done, total=total)
 
-            job.set_stage("labeling",
-                          f"用 {os.path.basename(model)} 标注【{names}】，共 {len(rels)} 张"
-                          f"（本地推理，比多模态大模型快得多）0/{len(rels)}",
-                          done=0, total=len(rels))
-            stats = self._detect_label(job, targets, images=rels)
+            with self._loading(job, f"{self._detect_load_hint(model)} "
+                                    f"标注【{names}】共 {len(rels)} 张（本地推理，比多模态大模型快得多）"):
+                stats = self._detect_label(job, targets, images=rels)
             self._check(job)
 
         job.set_stage("coords", "生成检测框坐标文件")

@@ -257,3 +257,65 @@ def test_offline_with_a_broken_cache_still_explains_itself(monkeypatch):
     info = versioning.status(force=True)
 
     assert info["latest"] == "1.9.0" and "离线" in info["note"]
+
+
+# --------------------------------------------------------------------------- #
+# GitHub 那一侧的版本号：三个来源都要问，取最新的那个
+# --------------------------------------------------------------------------- #
+
+def three_source_fetcher(release="v1.4.5", tags=("v1.4.18", "v1.4.9"), raw='VERSION = "1.4.17"\n'):
+    """Releases / 标签列表 / 仓库里的 version.py 各给一份数据，不联网。"""
+    def fetch(url):
+        if url == versioning.RELEASE_API_URL:
+            if release is None:
+                raise OSError("没有发布过版本")
+            return json.dumps({"tag_name": release})
+        if url == versioning.TAGS_API_URL:
+            if tags is None:
+                raise OSError("标签列表读不到")
+            return json.dumps([{"name": name} for name in tags])
+        if url == versioning.RAW_VERSION_URL:
+            return raw
+        raise OSError(f"没料到要访问 {url}")
+    return fetch
+
+
+def test_repository_tags_can_be_newer_than_the_last_release():
+    """本项目 1.4.5 之后只打 tag 不发 release：只认 Releases 时界面长期说反话。"""
+    latest, source = versioning.fetch_latest(fetcher=three_source_fetcher())
+    assert (latest, source) == ("1.4.18", "tag")
+
+
+def test_release_still_wins_when_it_is_the_newest():
+    latest, source = versioning.fetch_latest(
+        fetcher=three_source_fetcher(release="v1.6.0", tags=("v1.4.18",)))
+    assert (latest, source) == ("1.6.0", "release")
+
+
+def test_unparsable_tags_are_ignored():
+    """标签里有 latest / backup-2024 这类非版本号的东西，不能被当成"有更新"。"""
+    latest, source = versioning.fetch_latest(
+        fetcher=three_source_fetcher(tags=("latest", "backup-2024", "v1.4.7"),
+                                     raw='VERSION = "1.4.3"\n'))
+    assert (latest, source) == ("1.4.7", "tag")
+
+
+def test_garbage_tag_payload_falls_back_instead_of_crashing():
+    latest, source = versioning.fetch_latest(
+        fetcher=three_source_fetcher(tags=None, raw='VERSION = "1.5.1"\n'))
+    assert (latest, source) == ("1.5.1", "source") or source == "release"
+
+
+def test_status_labels_where_the_number_came_from(monkeypatch, tmp_path):
+    """界面要能说实话：发布版 / 仓库标签 / 仓库代码是三种可信度。"""
+    monkeypatch.setenv("AUTOLABEL_UPDATE_CACHE", str(tmp_path / "cache.json"))
+    monkeypatch.delenv("AUTOLABEL_OFFLINE", raising=False)
+    info = versioning.status(fetcher=three_source_fetcher(), force=True)
+    assert info["source"] == "tag" and info["source_label"] == "仓库标签"
+    assert "仓库标签" in versioning.describe(info)
+
+
+def test_unknown_source_is_reported_verbatim():
+    assert versioning.source_label("release") == "发布版"
+    assert versioning.source_label("offline") == "离线跳过"
+    assert versioning.source_label("whatever") == "whatever"

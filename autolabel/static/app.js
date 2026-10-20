@@ -414,6 +414,16 @@ function renderPanel() {
       <span class="chip ${visible < 5 ? "warn" : ""}">${visible}/${obj.keypoints.length}</span></span>`;
     head.onclick = () => { state.selObj = oi; state.selKpt = -1; renderPanel(); draw(); };
     wrap.appendChild(head);
+    // 每张卡片都带一个删除键：误检多的人通常一眼就认得出来，不该逼用户先点选中、
+    // 再记 X 键；按钮自己吃掉点击，不会顺手把这张卡选中
+    const kill = document.createElement("button");
+    kill.type = "button";
+    kill.className = "obj-x";
+    kill.title = `删除 #${oi} 这个目标（X 同）`;
+    kill.setAttribute("aria-label", `删除第 ${oi + 1} 个目标`);
+    kill.innerHTML = '<svg class="ic"><use href="#ic-cross"></use></svg>';
+    kill.onclick = (e) => { e.stopPropagation(); deleteObject(oi); };
+    head.appendChild(kill);
     if (!selected) {
       // 七个人 × 十七个点全摊开就没法看了：未选中的只留一行摘要，点一下才展开
       const sub = document.createElement("div");
@@ -448,6 +458,11 @@ function renderPanel() {
     }
     box.appendChild(wrap);
   });
+  if (!it.objects.length) {
+    // 全删空之后列表一片空白，看着像页面坏了：给出下一步（拖框补一个 / 直接接受）
+    box.innerHTML = '<div class="obj-sub">这一帧的目标都删掉了。'
+      + '要补一个就点下面的「新增目标（拖框）」，不补就直接接受这一帧。</div>';
+  }
 }
 
 // --------------------------------------------------------------------------- //
@@ -641,12 +656,32 @@ function setVisibility(v) {
   markDirty(); renderPanel(); draw();
 }
 
-function deleteObject() {
-  if (!state.item || state.selObj < 0) return;
-  state.item.objects.splice(state.selObj, 1);
-  state.selObj = Math.min(state.selObj, state.item.objects.length - 1);
+/** 删掉一个目标：不传下标就删当前选中的那个（X 键走这条）。
+ *
+ * 删完给 5 秒撤销条：误检框删错了不用去右侧翻「撤销」，看到手滑当场退回。
+ * 退回要把整份关键点对象原样塞回原位——只 push 到末尾会让 #2 变成 #5，
+ * 画布上的编号牌和待办清单全部错位。
+ */
+function deleteObject(oi) {
+  const it = state.item;
+  if (!it) return;
+  const index = Number.isInteger(oi) ? oi : state.selObj;
+  if (index < 0 || index >= it.objects.length) { toast("先选中一个目标"); return; }
+  const [removed] = it.objects.splice(index, 1);
+  const image = it.image;
+  state.selObj = Math.min(state.selObj, it.objects.length - 1);
+  if (state.selObj >= it.objects.length) state.selObj = it.objects.length - 1;
   state.selKpt = -1;
   markDirty(); renderPanel(); draw();
+  toast(`已删除 #${index} 目标`);
+  showUndoBar(`已删除 #${index} 目标`, () => {
+    const back = state.item;
+    if (!back || back.image !== image) { toast("已经翻到别的帧了，去那一帧才能撤销"); return; }
+    back.objects.splice(Math.min(index, back.objects.length), 0, removed);
+    state.selObj = index; state.selKpt = -1;
+    markDirty(); renderPanel(); draw();
+    toast(`已退回 #${index} 目标`);
+  });
 }
 
 // --------------------------------------------------------------------------- //
@@ -1040,10 +1075,12 @@ async function pollJobs() {
     if (up.warm || !job.finished) upLog(`任务 ${job.id} · ${job.message}`);
   }
   up.warm = true;
-  setBusy(active.length > 0, active.length ? active[active.length - 1] : null);
-  const percent = jobPercent(active) >= 0 ? (60 + jobPercent(active) * 0.4) + "%" : "100%";
-  $("up-bar").style.width = percent;
-  if ($("run-bar")) { $("run-bar").style.width = percent; }
+  const current = active.length ? active[active.length - 1] : null;
+  setBusy(active.length > 0, current);
+  // 以前这里把任务百分比再压进 60–100% 一段，检测页同一步才走 55%，两个页面各说各话；
+  // 现在宽度统一由 common.js 的分段口径决定
+  for (const id of ["up-bar", "run-bar"]) { paintJobBar($(id), current || { stage: "done" }); }
+  forgetJobProgress(jobs.filter((j) => j.finished).map((j) => j.id));
   if (!active.length) {
     stopJobPolling();
     $("up-start").disabled = up.files.length === 0;
@@ -1057,13 +1094,6 @@ async function pollJobs() {
   }
 }
 
-function jobPercent(active) {
-  if (!active.length) return -1;
-  const j = active[active.length - 1];
-  if (j.total > 0) return Math.round((j.done / j.total) * 100);
-  return { queued: 5, importing: 20, labeling: 55, qc: 85, coords: 95 }[j.stage] ?? 10;
-}
-
 function setBusy(busy, job) {
   up.busy = busy;
   const strip = $("job-strip");
@@ -1071,9 +1101,8 @@ function setBusy(busy, job) {
   strip.classList.toggle("err", Boolean(busy && job && job.stage === "failed"));
   const cancelling = Boolean(busy && job && job.cancel_requested);
   if (busy && job) {
-    const extra = job.total > 0 ? ` ${job.done}/${job.total}` : "";
-    $("job-strip-text").textContent = (cancelling ? "取消中 · " : "")
-      + `后台标注进行中 · 任务 ${job.id}${extra} · ${job.message}（期间请先别改标注，完成后列表会自动刷新）`;
+    $("job-strip-text").textContent = jobStatusText(job, "后台标注")
+      + "（期间请先别改标注，完成后列表会自动刷新）";
   }
   for (const id of ["strip-clear-jobs", "up-clear-jobs", "run-clear-jobs"]) {
     const el = $(id);

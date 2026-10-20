@@ -12,6 +12,8 @@ const POOL = {
   stats: {},
   sel: new Set(),    // 选中的素材相对路径
   view: "grid",      // grid = 按素材 · batches = 按导入批次
+  layout: "grid",    // 素材区显示方式：grid / dense / list / tree，见 setPoolLayout
+  collapsed: new Set(),   // 目录树里收起来的分组，只影响这台浏览器
   cat: "",           // "" = 全部；"__none__" = 未分类；其余是分类 ID
   state: "",         // "" / unassigned / in / shared
   batch: "",         // 来源批次 ID
@@ -30,6 +32,39 @@ const BATCH_STATUS = { running: "进行中", done: "已完成", cancelled: "已�
                        failed: "失败", interrupted: "已中断", retired: "已退回模块外" };
 const BATCH_SOURCE = { upload: "网页上传", cli: "命令行", ui: "网页操作",
                        unknown: "历史", "-": "历史" };
+const NO_BATCH = "__none__";   // 「来处未记录」在目录树里当分组 ID 用
+
+/* 显示方式记在这台浏览器：换页面、刷新都沿用上次的看法，但不写进数据集，
+ * 换台电脑打开同一个池子各看各的（和主题、字号一个道理）。
+ */
+const POOL_LAYOUT_KEY = "autolabel.poolLayout";
+const POOL_LAYOUTS = ["grid", "dense", "list", "tree"];
+const POOL_LAYOUT_NAME = { grid: "舒适网格", dense: "紧凑网格", list: "列表", tree: "目录树" };
+
+function readStoredLayout() {
+  try { return localStorage.getItem(POOL_LAYOUT_KEY) || ""; } catch (err) { return ""; }
+}
+
+function syncLayoutButtons() {
+  for (const button of document.querySelectorAll("#pool-view button")) {
+    button.classList.toggle("on", button.dataset.view === POOL.layout);
+  }
+}
+
+/** 换素材区显示方式：分段按钮、快捷键 1/2/3/4、命令面板共用这一个入口。 */
+function setPoolLayout(layout) {
+  POOL.layout = POOL_LAYOUTS.includes(layout) ? layout : "grid";
+  try { localStorage.setItem(POOL_LAYOUT_KEY, POOL.layout); } catch (err) { /* 无痕模式只是记不住 */ }
+  syncLayoutButtons();
+  renderPoolGrid();
+}
+
+/** 启动时把上次的显示方式装回去（这时候池子还没读，所以只画按钮不画内容）。 */
+function restorePoolLayout() {
+  const stored = readStoredLayout();
+  if (POOL_LAYOUTS.includes(stored)) { POOL.layout = stored; }
+  syncLayoutButtons();
+}
 
 const poolLog = (msg, isErr) => appendLog("pool-log", msg, isErr);
 
@@ -172,8 +207,13 @@ function renderPoolGrid() {
   const box = $("pool-grid");
   const rows = visibleRows();
   $("pool-count").textContent = POOL.rows.length
-    ? `这一屏 ${rows.length} 个 / 池里共 ${POOL.rows.length} 个` : "池子还是空的";
+    ? `这一屏 ${rows.length} 个 / 池里共 ${POOL.rows.length} 个 · ${POOL_LAYOUT_NAME[POOL.layout]}`
+    : "池子还是空的";
   box.innerHTML = "";
+  // 容器换类名而不是加类名：换回网格时不会把列表的 flex 布局残留下来
+  box.className = POOL.layout === "list" ? "pool-rows"
+    : (POOL.layout === "tree" ? "pool-tree"
+      : "pool-grid" + (POOL.layout === "dense" ? " dense" : ""));
   if (!POOL.rows.length) {
     box.append(poolEmpty("素材池里还没有东西：点右上角「导入素材」上传图片、目录或视频（U）。"
       + "传进来的东西先落在这，哪个模块要用再去那个模块点「从素材池添加」。"));
@@ -186,7 +226,13 @@ function renderPoolGrid() {
     syncPoolBar();
     return;
   }
-  for (const row of rows) { box.append(poolCard(row)); }
+  if (POOL.layout === "tree") {
+    renderPoolTree(box, rows);
+  } else if (POOL.layout === "list") {
+    for (const row of rows) { box.append(poolRow(row)); }
+  } else {
+    for (const row of rows) { box.append(poolCard(row)); }
+  }
   syncPoolBar();
 }
 
@@ -251,6 +297,153 @@ function chipRow(row) {
     wrap.append(shared);
   }
   return wrap;
+}
+
+/** 列表行：缩略图 + 文件名 + 来处 + 尺寸体积 + 归属签。按文件名找东西、核对来处时比卡片快。 */
+function poolRow(row, level) {
+  const line = document.createElement("div");
+  line.className = "pool-row" + (level ? " lv" + level : "")
+    + (POOL.sel.has(row.image) ? " selected" : "");
+  line.title = row.image;
+  const check = document.createElement("input");
+  check.type = "checkbox";
+  check.checked = POOL.sel.has(row.image);
+  check.onclick = (e) => e.stopPropagation();
+  check.onchange = (e) => toggleSelect(row.image, e.target.checked);
+  const thumb = document.createElement("img");
+  thumb.loading = "lazy";
+  thumb.src = "/thumb/" + encodeURIComponent(row.image);
+  thumb.alt = "";
+  const main = document.createElement("div");
+  main.className = "pool-row-main";
+  const name = document.createElement("div");
+  name.className = "pool-row-name";
+  name.textContent = row.name;
+  const from = [row.pool_batch_name ? "来自 " + row.pool_batch_name : "来处未记录"];
+  if (row.video) { from.push("抽自视频 " + row.video); }
+  if (row.imported_at) { from.push(String(row.imported_at).slice(0, 16)); }
+  const sub = document.createElement("div");
+  sub.className = "muted small";
+  sub.textContent = from.join(" · ");
+  main.append(name, sub);
+  const chips = document.createElement("div");
+  chips.className = "pool-row-chips";
+  chips.append(chipRow(row));
+  const nums = document.createElement("div");
+  nums.className = "pool-row-nums";
+  const size = document.createElement("b");
+  size.textContent = row.width ? `${row.width}×${row.height}` : "尺寸未知";
+  const bytes = document.createElement("span");
+  bytes.textContent = kb(row.bytes || 0);
+  nums.append(size, bytes);
+  line.append(check, thumb, main, chips, nums);
+  line.onclick = () => toggleSelect(row.image, !POOL.sel.has(row.image));
+  return line;
+}
+
+/** 目录树：分类 → 来源批次 → 素材。素材一多、又混着好几批导入时，按层级清库存比翻网格快。 */
+function renderPoolTree(box, rows) {
+  const tree = new Map();
+  for (const row of rows) {
+    const cid = row.category || UNCATEGORIZED;
+    const bid = row.pool_batch || NO_BATCH;
+    if (!tree.has(cid)) {
+      tree.set(cid, { name: row.category_name || "未分类", count: 0, bytes: 0, batches: new Map() });
+    }
+    const cat = tree.get(cid);
+    if (!cat.batches.has(bid)) {
+      cat.batches.set(bid, { name: row.pool_batch_name || "来处未记录", rows: [], bytes: 0 });
+    }
+    const batch = cat.batches.get(bid);
+    batch.rows.push(row);
+    batch.bytes += Number(row.bytes) || 0;
+    cat.count += 1;
+    cat.bytes += Number(row.bytes) || 0;
+  }
+  // 分类按张数从多到少排；「未分类」不是一类东西而是一堆没归置的，永远垫底
+  const cats = [...tree.entries()].sort((a, b) => {
+    if (a[0] === UNCATEGORIZED) { return 1; }
+    if (b[0] === UNCATEGORIZED) { return -1; }
+    return b[1].count - a[1].count || a[1].name.localeCompare(b[1].name);
+  });
+  for (const [cid, cat] of cats) {
+    const key = "c:" + cid;
+    box.append(treeHead({
+      key, level: 0, closed: POOL.collapsed.has(key), label: cat.name,
+      count: cat.count, bytes: cat.bytes,
+      extra: cat.batches.size > 1 ? `${cat.batches.size} 个来处` : "",
+    }));
+    if (POOL.collapsed.has(key)) { continue; }
+    const batches = [...cat.batches.entries()].sort((a, b) => b[1].rows.length - a[1].rows.length);
+    for (const [bid, batch] of batches) {
+      const bkey = key + "/b:" + bid;
+      // 只有一个来处、又确实没记录时不再套一层空壳子，点两下还是同一批东西
+      if (batches.length > 1 || bid !== NO_BATCH) {
+        box.append(treeHead({
+          key: bkey, level: 1, closed: POOL.collapsed.has(bkey), label: batch.name,
+          count: batch.rows.length, bytes: batch.bytes,
+        }));
+        if (POOL.collapsed.has(bkey)) { continue; }
+      }
+      for (const row of batch.rows) { box.append(poolRow(row, 2)); }
+    }
+  }
+}
+
+/** 目录树的分组头：展开箭头 + 名字 + 张数体积 + 「选中这一组」。 */
+function treeHead(opts) {
+  const head = document.createElement("div");
+  head.className = "tree-head lv" + opts.level + (opts.closed ? " closed" : "");
+  const caret = document.createElement("span");
+  caret.className = "tree-caret";
+  caret.innerHTML = '<svg><use href="#ic-chev"></use></svg>';
+  const name = document.createElement("span");
+  name.className = "tree-name";
+  name.textContent = opts.label;
+  const nums = document.createElement("span");
+  nums.className = "tree-nums muted small";
+  nums.textContent = `${opts.count} 个 · ${kb(opts.bytes || 0)}`
+    + (opts.extra ? " · " + opts.extra : "");
+  const pick = document.createElement("button");
+  pick.type = "button";
+  pick.className = "peek tree-pick";
+  pick.textContent = opts.closed ? "展开并全选" : "选中这一组";
+  pick.onclick = (e) => { e.stopPropagation(); selectTreeGroup(opts.key); };
+  head.append(caret, name, nums, pick);
+  head.onclick = () => toggleTreeNode(opts.key);
+  head.title = opts.closed ? "展开这一组（点名字或箭头）" : "收起这一组（点名字或箭头）";
+  return head;
+}
+
+function toggleTreeNode(key) {
+  if (POOL.collapsed.has(key)) { POOL.collapsed.delete(key); } else { POOL.collapsed.add(key); }
+  renderPoolGrid();
+}
+
+/** 分组 key 反查它盖住哪些素材：和 renderPoolTree 用同一套归类规则，筛选一变选择也跟着变准。 */
+function treeGroupRows(key) {
+  const parts = String(key).split("/");
+  const cid = parts[0].slice(2);
+  const bid = parts.length > 1 ? parts[1].slice(2) : "";
+  return visibleRows().filter((row) => {
+    if ((row.category || UNCATEGORIZED) !== cid) { return false; }
+    return bid ? (row.pool_batch || NO_BATCH) === bid : true;
+  });
+}
+
+function selectTreeGroup(key) {
+  if (POOL.collapsed.has(key)) {
+    POOL.collapsed.delete(key);
+    renderPoolGrid();
+  }
+  const rows = treeGroupRows(key);
+  if (!rows.length) { toast("这一组里没有素材", true); return; }
+  const all = rows.every((row) => POOL.sel.has(row.image));
+  for (const row of rows) {
+    if (all) { POOL.sel.delete(row.image); } else { POOL.sel.add(row.image); }
+  }
+  renderPoolGrid();
+  toast(all ? `已取消这一组 ${rows.length} 个素材` : `已选中这一组 ${rows.length} 个素材`);
 }
 
 function toggleSelect(rel, on) {
@@ -694,6 +887,23 @@ function syncUpload() {
 
 function upLog(text, isErr) { appendLog("up-log", text, isErr); }
 
+/** 上传字节只占进度条的前这一段，后一段交给后台任务（抽帧 / 入库）的百分比。
+ *
+ *  以前上传画到 60% 就把条子丢在那儿不动了：传 255 个文件时条子停在 60% 好几分钟，
+ *  看着像传坏了，其实是后台在抽帧。两段拼起来才是一条完整进度。
+ */
+const UPLOAD_BAND = 40;
+
+function paintPoolBar(job) {
+  const bar = $("up-bar");
+  if (!bar) { return; }
+  const value = jobPercent(job);
+  if (value < 0) { return; }
+  bar.style.width = Math.round(UPLOAD_BAND + (100 - UPLOAD_BAND) * (value / 100)) + "%";
+  const track = bar.parentElement;
+  if (track) { track.classList.toggle("loading", Boolean(job && job.stage === "loading")); }
+}
+
 async function startUpload() {
   const files = up.files.slice();
   if (!files.length) { toast("先选择文件或目录", true); return; }
@@ -705,7 +915,8 @@ async function startUpload() {
   const paint = () => {
     let done = 0;
     acked.forEach((value) => { done += value; });
-    $("up-bar").style.width = Math.round((done / totalBytes) * 60) + "%";
+    const bar = $("up-bar");
+    if (bar) { bar.style.width = Math.round((done / totalBytes) * UPLOAD_BAND) + "%"; }
   };
   for (let i = 0; i < files.length; i += 3) {
     const batch = files.slice(i, i + 3);
@@ -778,12 +989,15 @@ async function pollJobs() {
     if (!jobs.length) {
       strip.classList.add("hidden");
       if (POOL.poll) { clearInterval(POOL.poll); POOL.poll = null; }
+      paintPoolBar({ stage: "done" });   // 都跑完了就把条子画满，别停在上一格
+      forgetJobProgress(all.filter((job) => job.finished).map((job) => job.id));
       await loadPool();
       return;
     }
     const job = jobs[0];
     strip.classList.remove("hidden");
-    $("job-strip-text").textContent = `素材入库中：${job.message || job.stage}（还有 ${jobs.length} 个任务）`;
+    paintPoolBar(job);
+    $("job-strip-text").textContent = `${jobStatusText(job, "素材入库")}（还有 ${jobs.length} 个任务）`;
   } catch (err) {
     if (POOL.poll) { clearInterval(POOL.poll); POOL.poll = null; }
     poolLog("任务状态读不到：" + err.message, true);
@@ -823,6 +1037,10 @@ function poolCommands() {
     { label: "分类管理", key: "C", tag: "素材池", run: () => openCategories(true) },
     { label: "看导入批次", key: "B", tag: "素材池", run: () => setPoolView("batches") },
     { label: "按素材看（缩略图）", tag: "素材池", run: () => setPoolView("grid") },
+    { label: "素材改成紧凑网格", key: "2", tag: "显示", run: () => setPoolLayout("dense") },
+    { label: "素材改列表 + 缩略图", key: "3", tag: "显示", run: () => setPoolLayout("list") },
+    { label: "素材改目录树", key: "4", tag: "显示", run: () => setPoolLayout("tree") },
+    { label: "素材改回舒适网格", key: "1", tag: "显示", run: () => setPoolLayout("grid") },
     { label: "重新读取磁盘", key: "R", tag: "素材池", run: () => loadPool() },
     { label: "全选这一屏素材", tag: "素材池", run: () => selectAllVisible() },
     { label: "把选中的加进姿态标注", tag: "素材池", run: () => adoptTo("pose") },
@@ -847,6 +1065,10 @@ function poolKeys(e) {
     case "b": e.preventDefault(); setPoolView(POOL.view === "batches" ? "grid" : "batches"); break;
     case "a": e.preventDefault(); adoptSelected(); break;
     case "r": e.preventDefault(); loadPool(); break;
+    case "1": e.preventDefault(); setPoolLayout("grid"); break;
+    case "2": e.preventDefault(); setPoolLayout("dense"); break;
+    case "3": e.preventDefault(); setPoolLayout("list"); break;
+    case "4": e.preventDefault(); setPoolLayout("tree"); break;
     case "escape": POOL.sel = new Set(); renderPoolGrid(); break;
     default:
   }
@@ -865,6 +1087,10 @@ async function bootPool() {
   $("btn-view-batches").onclick = () => { openMenu(false); setPoolView("batches"); };
   $("pool-refresh").onclick = () => loadPool();
   $("pool-select-all").onclick = selectAllVisible;
+  for (const button of document.querySelectorAll("#pool-view button")) {
+    button.onclick = () => setPoolLayout(button.dataset.view);
+  }
+  restorePoolLayout();
   $("pool-state").onchange = (e) => { POOL.state = e.target.value; renderPoolGrid(); };
   $("pool-batch").onchange = (e) => { POOL.batch = e.target.value; renderPoolGrid(); };
   $("batch-kind").onchange = (e) => { POOL.batchKind = e.target.value; renderBatchView(); };
@@ -898,6 +1124,8 @@ async function bootPool() {
   await loadPool();
   if (params.get("upload") === "1") { openUpload(true); }
   if (params.get("view") === "batches") { setPoolView("batches"); }
+  // ?layout=grid|dense|list|tree：命令面板和文档链接能直接指到某一种看法
+  if (params.get("layout")) { setPoolLayout(params.get("layout")); }
   pollJobs().then(() => { if ($("job-strip").classList.contains("hidden") === false) { startJobPolling(); } });
 }
 

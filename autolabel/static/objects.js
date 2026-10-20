@@ -1928,7 +1928,11 @@ async function pollJobs() {
     if (run.warm || !job.finished) runLog(`任务 ${job.id} · ${job.message}`);
   }
   run.warm = true;
-  setJobBusy(active.length > 0, active.length ? active[active.length - 1] : null);
+  const current = active.length ? active[active.length - 1] : null;
+  setJobBusy(active.length > 0, current);
+  // 没在跑的时候把两条条子画满并撤掉 loading 态，不然上一轮停在 88% 会一直挂着
+  for (const id of ["run-bar", "up-bar"]) { paintJobBar($(id), current || { stage: "done" }); }
+  forgetJobProgress(mine.filter((j) => j.finished).map((j) => j.id));
   if (!active.length) {
     stopJobPolling();
     if (!run.hadActive) return;
@@ -1945,26 +1949,16 @@ async function pollJobs() {
   }
 }
 
-function jobPercent(job) {
-  if (!job) return 10;
-  if (job.total > 0) return Math.round((job.done / job.total) * 100);
-  return { queued: 5, importing: 25, labeling: 55, coords: 92 }[job.stage] ?? 12;
-}
-
 function setJobBusy(busy, job) {
   run.busy = busy;
   const strip = $("job-strip");
   strip.classList.toggle("hidden", !busy);
   strip.classList.toggle("err", Boolean(busy && job && job.stage === "failed"));
   if (busy && job) {
-    const extra = job.total > 0 ? ` ${job.done}/${job.total}` : "";
-    const cancelling = Boolean(job.cancel_requested);
     const verb = String(job.kind || "").endsWith("_upload") ? "上传并标注" : CFG.name;
-    $("job-strip-text").textContent = (cancelling ? "取消中 · " : "")
-      + `${verb}进行中 · 任务 ${job.id}${extra} · `
-      + `${job.message}（期间请先别改标注，完成后列表会自动刷新）`;
-    $("run-bar").style.width = jobPercent(job) + "%";
-    $("up-bar").style.width = jobPercent(job) + "%";
+    $("job-strip-text").textContent = jobStatusText(job, verb)
+      + "（期间请先别改标注，完成后列表会自动刷新）";
+    for (const id of ["run-bar", "up-bar"]) { paintJobBar($(id), job); }
   }
   for (const id of ["strip-clear-jobs", "run-clear-jobs", "up-clear-jobs"]) {
     const el = $(id);

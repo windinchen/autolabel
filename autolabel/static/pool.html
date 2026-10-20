@@ -63,6 +63,9 @@
   <symbol id="ic-scene" viewBox="0 0 16 16"><rect x="1.8" y="3.4" width="12.4" height="9.2" rx="1.5"/><path d="m4.6 10.6 2.6-3 2 2.2 1.6-1.8 2.4 2.6"/><circle cx="5.4" cy="6" r=".9"/></symbol>
   <symbol id="ic-video" viewBox="0 0 16 16"><rect x="1.9" y="4" width="8.6" height="8" rx="1.4"/><path d="m10.5 8.4 3.6-2.3v4.6l-3.6-2.3Z"/></symbol>
   <symbol id="ic-trash" viewBox="0 0 16 16"><path d="M2.8 4.4h10.4M6.2 4.4V2.9h3.6v1.5M4.2 4.4l.6 8.3a1 1 0 0 0 1 .9h4.4a1 1 0 0 0 1-.9l.6-8.3"/></symbol>
+  <symbol id="ic-grid" viewBox="0 0 16 16"><rect x="1.9" y="1.9" width="4.8" height="4.8" rx="1"/><rect x="9.3" y="1.9" width="4.8" height="4.8" rx="1"/><rect x="1.9" y="9.3" width="4.8" height="4.8" rx="1"/><rect x="9.3" y="9.3" width="4.8" height="4.8" rx="1"/></symbol>
+  <symbol id="ic-tree" viewBox="0 0 16 16"><path d="M2.6 2.4v11.2M2.6 5.2h4.4M2.6 10.8h4.4"/><rect x="7" y="3.3" width="6.6" height="3.8" rx="1"/><rect x="7" y="8.9" width="6.6" height="3.8" rx="1"/></symbol>
+  <symbol id="ic-chev" viewBox="0 0 16 16"><path d="m5.4 3.4 5.2 4.6-5.2 4.6"/></symbol>
 </svg>
 
 <header>
@@ -158,6 +161,16 @@
           <label class="muted small grow">找素材
             <input type="search" id="pool-query" placeholder="文件名 / 来自哪个视频" spellcheck="false">
           </label>
+          <span class="seg pool-view" id="pool-view" role="group" aria-label="显示方式">
+            <button type="button" class="on" data-view="grid" title="舒适网格（1）：图大，好认内容"
+              aria-label="舒适网格"><svg class="ic"><use href="#ic-boxes"/></svg></button>
+            <button type="button" data-view="dense" title="紧凑网格（2）：一屏多看几倍，挑重复图用"
+              aria-label="紧凑网格"><svg class="ic"><use href="#ic-grid"/></svg></button>
+            <button type="button" data-view="list" title="列表 + 缩略图（3）：文件名、来处、大小看得全"
+              aria-label="列表加缩略图"><svg class="ic"><use href="#ic-list"/></svg></button>
+            <button type="button" data-view="tree" title="目录树（4）：按分类 → 来源批次一层层管"
+              aria-label="目录树"><svg class="ic"><use href="#ic-tree"/></svg></button>
+          </span>
           <button class="btn" id="pool-select-all">全选这一屏</button>
         </div>
         <div id="pool-grid" class="pool-grid"><p class="pool-empty muted small">读取中…</p></div>
@@ -301,6 +314,7 @@
       <div><span>U</span><span>导入素材</span></div>
       <div><span>C</span><span>分类管理</span></div>
       <div><span>B</span><span>切到批次记录视图</span></div>
+      <div><span>1 / 2 / 3 / 4</span><span>素材显示方式：舒适网格 / 紧凑网格 / 列表 + 缩略图 / 目录树（按分类 → 来处分组，能收起、能整组选中）</span></div>
       <div><span>A</span><span>把选中的素材加进右边那个模块</span></div>
       <div><span>R</span><span>重新读取磁盘上的文件</span></div>
       <div><span>⌘K</span><span>命令面板：跳模块、删素材、开系统设置都能搜</span></div>

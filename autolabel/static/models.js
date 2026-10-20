@@ -472,10 +472,15 @@ function catalogCard(row) {
   bindForget(row, q(".forget"));
   const download = modelState.downloads[row.filename] || null;
   const running = Boolean(download && download.stage === "running");
-  if (running && download.total) {
-    q(".model-progress").classList.remove("hidden");
-    const pct = Math.round((download.done || 0) * 100 / download.total);
-    q(".model-progress .bar").style.width = `${clamp(pct, 0, 100)}%`;
+  if (running) {
+    // 官方没公布体积时也算不出百分比：条子进入爬行态（琥珀 + 斜纹流动），
+    // 至少能看出"在下载"，而不是干脆把进度条藏起来让人以为没动
+    const track = q(".model-progress");
+    track.classList.remove("hidden");
+    const known = Number(download.total) > 0;
+    const pct = known ? clamp(Math.round((download.done || 0) * 100 / download.total), 0, 100) : 12;
+    q(".model-progress .bar").style.width = `${pct}%`;
+    track.classList.toggle("loading", !known);
   }
   const dl = q(".dl");
   if (isVlm || !row.downloadable) dl.classList.add("hidden");

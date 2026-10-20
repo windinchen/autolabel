@@ -153,6 +153,11 @@ header .btn, header button { flex: 0 0 auto; min-height: 28px; padding: 0 11px; 
   background: color-mix(in srgb, var(--amber) 12%, transparent);
 }
 .update-bar a:hover, .update-bar button:hover { background: color-mix(in srgb, var(--amber) 20%, transparent); }
+/* 一键更新跑起来时菜单项会变成进度文案：不能点，但要看得出还在动 */
+#about-update[disabled] { opacity: .62; cursor: progress; }
+#about-update[disabled] .ic { animation: spin 1.4s linear infinite; }
+@keyframes spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { #about-update[disabled] .ic { animation: none; } }
 .menu-field a { color: var(--amber); text-decoration: none; }
 .menu-field a:hover { text-decoration: underline; }
 .wrap-rel { position: relative; display: inline-flex; }
@@ -392,6 +397,18 @@ aside#panel {
 .obj.selected { border-color: color-mix(in srgb, var(--sky) 55%, transparent); }
 .obj-head { display: flex; justify-content: space-between; align-items: center; cursor: pointer; gap: var(--s2); }
 .obj-head .name { font-weight: 600; font-size:  calc(12.5px * var(--fs)); }
+/* 目标卡片上的单个删除键：常驻但压暗，hover 才变珊瑚红。
+   只在 hover 才出现的话触屏与「找不到按钮」的抱怨会原样复现，所以不玩藏猫猫。 */
+.obj-x {
+  width: 20px; height: 20px; padding: 0; flex: 0 0 auto; cursor: pointer;
+  display: grid; place-items: center; border: 1px solid transparent; border-radius: var(--r4);
+  background: none; color: var(--ink-3); opacity: .62;
+  transition: opacity var(--t1), color var(--t1), background var(--t1), border-color var(--t1);
+}
+.obj:hover .obj-x, .obj.selected .obj-x { opacity: 1; }
+.obj-x:hover { opacity: 1; color: var(--fill-ink); background: var(--coral-fill); border-color: var(--coral); }
+.obj-x:focus-visible { opacity: 1; outline: 2px solid var(--amber); outline-offset: 1px; }
+.obj-x .ic { width: 11px; height: 11px; }
 .obj-sub { margin-top: 3px; font-size:  calc(11px * var(--fs)); color: var(--ink-3); }
 .obj-sub em { font-style: normal; color: var(--coral); }
 .kpts { margin-top: 6px; max-height: 150px; overflow-y: auto; }
@@ -461,8 +478,21 @@ input[type=text], input[type=number], input[type=password], textarea {
 input[type=text]:focus, input[type=number]:focus, input[type=password]:focus, textarea:focus {
   border-color: color-mix(in srgb, var(--amber) 50%, transparent);
 }
-.progress { height: 3px; background: var(--surface-3); border-radius: 2px; overflow: hidden; }
-.progress .bar { height: 100%; width: 0; background: var(--jade); transition: width var(--t3); }
+.progress { height: 3px; background: var(--surface-3); border-radius: 2px; overflow: hidden; position: relative; }
+.progress .bar { height: 100%; width: 0; background: var(--jade); transition: width var(--t3); position: relative; }
+/* 加载模型这类没有张数可数的阶段：换成琥珀（=正在做这一步）并让斜纹流动，
+   条子中速爬行 + 动感，才和"卡在 22% 不动"区分得开。玉色留给真正的进度。 */
+.progress.loading .bar { background: var(--amber-fill); transition: width var(--t2); }
+.progress.loading .bar::after {
+  content: ""; position: absolute; inset: -2px;
+  background-image: repeating-linear-gradient(115deg,
+    color-mix(in srgb, var(--shadow) 26%, transparent) 0 4px, transparent 4px 10px);
+  animation: bar-crawl 900ms linear infinite;
+}
+@keyframes bar-crawl { from { transform: translateX(0); } to { transform: translateX(10px); } }
+@media (prefers-reduced-motion: reduce) {
+  .progress.loading .bar::after { animation: none; }
+}
 .progress-wrap { flex: 1; min-width: 140px; display: flex; flex-direction: column; gap: 3px; }
 
 .chip {
@@ -522,10 +552,26 @@ footer #hint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; whi
 @keyframes fade { from { opacity: 0; } to { opacity: 1; } }
 .modal.hidden { display: none; }  /* .modal 定义在 .hidden 之后，必须压过它 */
 .modal-card {
+  position: relative;   /* 统一注入的关闭键钉在卡片右上角 */
   width: min(660px, 92vw); max-height: 88vh; overflow-y: auto; background: var(--surface);
   border: 1px solid var(--hairline); border-radius: 10px; padding: 14px var(--s4); box-shadow: var(--e2);
 }
 .modal-title { font-size:  calc(14.5px * var(--fs)); font-weight: 600; margin-bottom: 10px; letter-spacing: -.01em; }
+/* 右上角让位给关闭键：标题后面常跟一长串说明，不预留位置会被压住最后几个字 */
+.modal-card.has-x > .modal-title { padding-right: 34px; }
+/* 关闭键：common.js 给每个 .modal-card 注入同一个，位置 / 外观 / 行为全站一致 */
+.modal-x {
+  position: absolute; top: 7px; right: 7px; width: 26px; height: 26px; padding: 0;
+  display: grid; place-items: center; cursor: pointer; flex: 0 0 auto;
+  border: 1px solid var(--hairline); border-radius: var(--r7);
+  background: var(--surface-2); color: var(--ink-2);
+  transition: color var(--t1), background var(--t1), border-color var(--t1);
+}
+.modal-x:hover { color: var(--fill-ink); background: var(--coral-fill); border-color: var(--coral); }
+.modal-x:focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
+.modal-x .ic { width: 13px; height: 13px; }
+#palette-modal .modal-x { background: none; border-color: transparent; }
+#palette-modal .modal-x:hover { background: var(--coral-fill); border-color: var(--coral); }
 .modal .btn-row button { flex: 1; }
 #confirm-modal { z-index: 60; }  /* 可能叠在上传/批次面板之上，层级必须更高 */
 #confirm-modal .modal-card { width: min(440px, 90vw); }
@@ -535,7 +581,8 @@ footer #hint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; whi
 #palette-modal .modal-card { width: min(560px, 92vw); margin-top: 16vh; padding: 0; overflow: hidden; }
 #palette-input {
   width: 100%; border: 0; border-bottom: 1px solid var(--hairline); border-radius: 0;
-  background: var(--well); padding: 11px var(--s4); font-size:  calc(14px * var(--fs));
+  /* 关闭键悬在输入框右端上面：留出空位，光标落到 ✕ 上不该变成输入 */
+  background: var(--well); padding: 11px 40px 11px var(--s4); font-size:  calc(14px * var(--fs));
 }
 #palette-list { max-height: 46vh; overflow-y: auto; padding: 6px; }
 .palette-item {
@@ -1024,6 +1071,70 @@ button.catalog-refresh svg { width: 14px; height: 14px; fill: none; stroke: curr
 .pool-card-chips { margin-top: 6px; }
 .pool-card-chips-inner { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
 .pool-card-chips .chip { flex: 0 0 auto; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 显示方式分段按钮：贴在筛选条右端，图标即视图。外观沿用系统设置里那组分段按钮，
+   但这组是图标按钮，要被 .pool-tools button 的通用内边距压住，所以写得比它更具体。 */
+.seg.pool-view { flex: 0 0 auto; }
+.seg.pool-view button { flex: 0 0 auto; width: 30px; padding: 0; }
+.seg.pool-view svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.5; }
+
+/* 紧凑网格：一屏多看几倍，只留缩略图和文件名，挑重复帧、找漏标用 */
+.pool-grid.dense { grid-template-columns: repeat(auto-fill, minmax(112px, 1fr)); gap: 7px; }
+.pool-grid.dense .pool-card img { aspect-ratio: 1 / 1; }
+.pool-grid.dense .pool-card-meta { padding: 5px 6px 6px; }
+.pool-grid.dense .pool-card-name { font-size: calc(11px * var(--fs)); }
+.pool-grid.dense .pool-card-chips { display: none; }
+.pool-grid.dense .pool-card input[type=checkbox] { top: 5px; left: 5px; width: 14px; height: 14px; }
+
+/* 列表 + 缩略图 / 目录树：类名与选择器都要避开 .pool-list——那是「从素材池添加」弹层
+   里的滚动框（max-height + overflow-y），撞上了素材列表会在 300px 里滚。 */
+#pool-grid.pool-rows { display: flex; flex-direction: column; border: 1px solid var(--hairline);
+  border-radius: var(--r7); }
+#pool-grid .pool-row { display: flex; align-items: center; gap: var(--s3); min-height: 46px;
+  padding: 5px 10px; border-bottom: 1px solid var(--hairline); cursor: pointer;
+  transition: background var(--t1), box-shadow var(--t1); }
+#pool-grid .pool-row:last-child { border-bottom: none; }
+#pool-grid .pool-row:hover { background: color-mix(in srgb, var(--ink) 3.5%, transparent); }
+#pool-grid .pool-row.selected { background: color-mix(in srgb, var(--sky) 9%, transparent);
+  box-shadow: inset 2px 0 0 var(--sky); }
+#pool-grid .pool-row input[type=checkbox] { flex: 0 0 auto; width: 15px; height: 15px; margin: 0;
+  accent-color: var(--sky); cursor: pointer; }
+#pool-grid .pool-row img { flex: 0 0 auto; width: 52px; height: 40px; object-fit: cover;
+  border-radius: var(--r4); background: var(--well); }
+#pool-grid .pool-row-main { flex: 1 1 auto; min-width: 0; }
+#pool-grid .pool-row-name { font-weight: 600; font-size: calc(12.5px * var(--fs));
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#pool-grid .pool-row-chips { flex: 0 1 auto; min-width: 0; max-width: 38%; }
+#pool-grid .pool-row-nums { flex: 0 0 auto; display: flex; flex-direction: column;
+  align-items: flex-end; gap: 1px; color: var(--ink-3); font-size: calc(11px * var(--fs));
+  font-variant-numeric: tabular-nums; }
+#pool-grid .pool-row-nums b { color: var(--ink-2); font-weight: 600; }
+
+/* 目录树：分类 → 来源批次 → 素材。节点头带张数和体积，能收起，也能整组选中 */
+#pool-grid.pool-tree { display: flex; flex-direction: column; border: 1px solid var(--hairline);
+  border-radius: var(--r7); }
+#pool-grid .tree-head { display: flex; align-items: center; gap: var(--s2); min-height: 34px;
+  padding: 0 10px; cursor: pointer; border-bottom: 1px solid var(--hairline);
+  background: color-mix(in srgb, var(--well) 60%, transparent); }
+#pool-grid .tree-head:hover { background: color-mix(in srgb, var(--ink) 5%, transparent); }
+#pool-grid .tree-head.lv1 { min-height: 30px; padding-left: 30px; background: none; }
+#pool-grid .tree-caret { flex: 0 0 auto; display: grid; place-items: center; color: var(--ink-3);
+  transition: transform var(--t1); }
+#pool-grid .tree-head.closed .tree-caret { transform: rotate(-90deg); }
+#pool-grid .tree-caret svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.8; }
+#pool-grid .tree-name { font-weight: 600; font-size: calc(12.5px * var(--fs));
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#pool-grid .tree-nums { flex: 0 0 auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
+#pool-grid .tree-pick { flex: 0 0 auto; margin-left: auto; padding: 3px 10px;
+  font-size: calc(11.5px * var(--fs)); }
+#pool-grid .pool-row.lv2 { padding-left: 58px; }
+
+@media (max-width: 980px) {
+  /* 窄屏先砍信息量最大的那块，保证文件名和操作按钮不被挤没 */
+  #pool-grid .pool-row-chips { display: none; }
+  #pool-grid .pool-row.lv2 { padding-left: 34px; }
+  #pool-grid .tree-head.lv1 { padding-left: 20px; }
+}
 
 /* 底部操作条：选完就地动手，素材一多也不用一路滚回顶上找按钮 */
 .pool-bar {

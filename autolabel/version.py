@@ -17,18 +17,24 @@ import threading
 import time
 import urllib.request
 from datetime import datetime
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 DEVELOPER = "windinchen"
 REPO = "windinchen/autolabel"
-VERSION = "1.4.19"
+VERSION = "1.4.20"
 
 OWNER = REPO.split("/", 1)[0]
 HOME_PAGE_URL = f"https://github.com/{OWNER}"
 REPO_URL = f"https://github.com/{REPO}"
 RELEASES_URL = f"{REPO_URL}/releases"
 RELEASE_API_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
+TAGS_API_URL = f"https://api.github.com/repos/{REPO}/tags"
 RAW_VERSION_URL = f"https://raw.githubusercontent.com/{REPO}/main/autolabel/version.py"
+
+#: GitHub 上那个版本号是从哪儿取到的，界面上要如实标出来：发布版、仓库标签、
+#: 仓库代码是三种不同的可信度，只写「GitHub 最新 v1.4.18」没人知道信不信得过
+SOURCE_LABEL = {"release": "发布版", "tag": "仓库标签", "source": "仓库代码",
+                "none": "没查到", "offline": "离线跳过"}
 
 DEFAULT_CACHE = os.path.join("~", ".autolabel", "update.json")
 CACHE_TTL = 12 * 3600          # 半天查一次：界面上每次开页只读缓存，不该为版本号去等网络
@@ -128,27 +134,54 @@ def _http_get(url: str) -> str:
 def fetch_latest(fetcher: Optional[Callable[[str], str]] = None) -> Tuple[str, str]:
     """取 GitHub 上最新的版本号，返回 ``(版本, 来源)``；取不到返回 ``("", 原因)``。
 
-    先认 Releases 的 tag（发布流程认的东西），没有 Releases 再退回仓库里的
-    ``autolabel/version.py``——直接推 main 不发 release 的时候也能提示到。
+    三个来源都问一遍再取最新的那个：发布版（Releases）、仓库标签（tags）、
+    main 里的 ``autolabel/version.py``。
+
+    以前只认 Releases，没发过 release 才退回 version.py。本项目 1.4.5 之后每次改动
+    只打 tag 不发 release，于是界面长期停在「GitHub 最新 v1.4.5」，本地都 v1.4.19 了
+    还在说反话——版本号看着就像根本没同步。三个来源一起比，GitHub 那一侧的数字
+    才跟着真实发布走。
     """
     fetch = fetcher or _http_get
-    problems = []
+    found: List[Tuple[str, str]] = []
+    problems: List[str] = []
     try:
         data = json.loads(fetch(RELEASE_API_URL))
-        tag = normalized(data.get("tag_name") or data.get("name") or "")
+        payload = data if isinstance(data, dict) else {}
+        tag = normalized(payload.get("tag_name") or payload.get("name") or "")
         if parse_version(tag) != (0,):
-            return tag, "release"
-        problems.append("GitHub 还没有发布过版本")
+            found.append((tag, "release"))
+        else:
+            problems.append("GitHub 还没有发布过版本")
     except Exception as exc:  # noqa: BLE001  断网 / 限流 / 代理都是这里的日常
         problems.append(f"Releases 接口没通（{type(exc).__name__}）")
     try:
+        rows = json.loads(fetch(TAGS_API_URL))
+        tags = [normalized(row.get("name") if isinstance(row, dict) else row)
+                for row in (rows if isinstance(rows, list) else [])]
+        usable = [tag for tag in tags if parse_version(tag) != (0,)]
+        if usable:
+            found.append((max(usable, key=parse_version), "tag"))
+        else:
+            problems.append("仓库上没有版本标签")
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"标签列表没读到（{type(exc).__name__}）")
+    try:
         match = _VERSION_PATTERN.search(fetch(RAW_VERSION_URL))
         if match:
-            return match.group(1), "source"
-        problems.append("仓库里的 version.py 没读到版本号")
+            found.append((match.group(1), "source"))
+        else:
+            problems.append("仓库里的 version.py 没读到版本号")
     except Exception as exc:  # noqa: BLE001
         problems.append(f"仓库文件没读到（{type(exc).__name__}）")
-    return "", " · ".join(problems) or "没取到版本"
+    if not found:
+        return "", " · ".join(problems) or "没取到版本"
+    return max(found, key=lambda row: parse_version(row[0]))
+
+
+def source_label(source: object) -> str:
+    """来源标识换成界面上的中文；认不出的原样给出，不编个好听的说法。"""
+    return SOURCE_LABEL.get(str(source or ""), str(source or ""))
 
 
 def _as_float(value: object) -> float:
@@ -239,6 +272,8 @@ def status(fetcher: Optional[Callable[[str], str]] = None, force: bool = False) 
         "checked_at": float(record.get("checked_at") or 0),
         "checked_text": str(record.get("checked_text") or ""),
         "source": str(record.get("source") or "none"),
+        #: 那个数字是从发布版 / 仓库标签 / 仓库代码哪一处取来的，界面如实标注
+        "source_label": source_label(record.get("source") or "none"),
         "note": str(record.get("note") or ""),
     }
 
@@ -266,16 +301,20 @@ def describe(info: Optional[dict] = None) -> str:
     if not info["checked"]:
         lines.append(f"GitHub 版本：没查到（{info['note'] or '未检查'}）· 加 --check 重试")
     elif info["update_available"]:
-        lines.append(f"GitHub 最新 {info['latest']}：可以升级 → {RELEASES_URL}")
+        lines.append(f"GitHub 最新 {info['latest']}（{info.get('source_label') or info['source']}）"
+                     f"：可以升级 → {RELEASES_URL}")
     elif info["ahead"]:
-        lines.append(f"GitHub 最新 {info['latest']}：本地比它新，是开发中的版本")
+        lines.append(f"GitHub 最新 {info['latest']}（{info.get('source_label') or info['source']}）"
+                     f"：本地比它新，是开发中的版本")
     else:
-        lines.append(f"GitHub 最新 {info['latest']}：已经是最新版")
+        lines.append(f"GitHub 最新 {info['latest']}（{info.get('source_label') or info['source']}）"
+                     f"：已经是最新版")
     lines.append(f"上次检查 {info['checked_text'] or '从未'} · 缓存 {cache_path()}")
     return "\n".join(lines)
 
 
 __all__ = ["DEVELOPER", "HOME_PAGE_URL", "REPO", "REPO_URL", "RELEASES_URL", "VERSION",
+           "RAW_VERSION_URL", "RELEASE_API_URL", "SOURCE_LABEL", "TAGS_API_URL",
            "bump", "cache_path", "compare", "describe", "fetch_latest",
            "network_enabled", "normalized", "parse_version", "rewrite",
-           "start_background_check", "status"]
+           "source_label", "start_background_check", "status"]

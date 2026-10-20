@@ -1,5 +1,82 @@
 # 变更记录
 
+## 2026-10-20 12:43 — v1.4.20：进度条一份口径、弹层一个关闭键、素材池四种显示方式、版本一键更新
+
+五条来自实际使用的抱怨：进度条停在 60% 装死、弹窗找不到关闭键、素材库没法管理、
+删一个误检框要先选中、GitHub 版本号长期说反话。
+
+### 一、进度：口径只留一份，一条进度连成一条
+
+- `common.js` 新增 `STAGE_BANDS`（每个阶段占条子的哪一段：queued 0–3 / importing 3–12 /
+  loading 12–22 / labeling 22–88 / qc 88–93 / coords 93–99）、`LOAD_CRAWL_MS`、
+  `jobPeaks`（同一任务的高水位，条子只前进不倒退）、`loadClock`、`jobPercent()` /
+  `paintJobBar()` / `jobStatusText()` / `forgetJobProgress()`：**百分比与文案只有这一份实现**。
+- `loading` 阶段没有可数的东西，就按已等时长在 12–22 段里慢慢爬（上限 95%，
+  免得看着像在终点等着），`jobStatusText()` 同时明说"正在加载模型"，不再让人对着 `0/0` 猜。
+- `app.js`、`objects.js` 删掉各自的 `jobPercent()`（同一个任务在两页显示两个数的问题到此为止），
+  改调 `paintJobBar()`；素材池 `paintPoolBar()` 把上传段（`UPLOAD_BAND = 40`）与
+  后台任务段拼成一条——255 个文件传完不再在 60% 挂几分钟。
+- `.progress.loading`（`app.css`）：没张数可数的阶段换琥珀色 + `@keyframes bar-crawl` 斜纹流动，
+  与"卡住不动"一眼可分；`prefers-reduced-motion` 下停掉动效。
+  `models.js` 的权重下载在官方没公布体积时也进 loading 态，不再干脆把条子藏起来。
+- 任务收尾：条子画满、撤 loading、`forgetJobProgress()` 清掉单调记忆。
+
+### 二、弹层：22 个弹层共用一个关闭键
+
+- `common.js` 新增 `installModalChrome()`：运行时给每个 `.modal-card` 注入右上角 `.modal-x`
+  （位置/外观/行为全站一致），并补上"点遮罩关闭"。由 `initShellChrome()` 统一调用，
+  运行时建的系统设置与「从素材池添加」弹层各自建完再补一次。
+- `closeAnyModal()` 分派到各弹层自己的关闭逻辑（确认框结 Promise、命令面板清输入），
+  不是粗暴收 `hidden`；`topmostModal()` 让 Esc 永远关最上面那个。
+- `app.css`：`.modal-card` 加 `position: relative` 与 `.has-x > .modal-title { padding-right }`，
+  命令面板输入框右端让出关闭键的位置（光标落到 ✕ 上不该变成输入）。
+
+### 三、素材池：四种显示方式与目录树
+
+- `pool.html` 工具条右端新增 `#pool-view` 分段按钮（舒适网格 / 紧凑网格 / 列表 / 目录树），
+  补 `#ic-grid`、`#ic-tree`、`#ic-chev` 三枚图标。
+- `pool.js`：`POOL.layout` + `POOL.collapsed` + `setPoolLayout()`（记在
+  `localStorage["autolabel.poolLayout"]`，`?layout=` 可直达）；`poolRow()` 列表行、
+  `renderPoolTree()` 目录树（分类 → 来源批次 → 素材，节点头带张数与体积）、
+  `treeHead()` + `selectTreeGroup()` + `toggleTreeNode()` 整组选中与收起；快捷键 1/2/3/4。
+- **类名冲突排雷**：列表视图原先也叫 `.pool-list`，而「从素材池添加」弹层的
+  `#pool-files.pool-list` 早就占了这个类（`max-height: 300px` + `overflow-y: auto`），
+  撞名会让弹层里几十张图滚不动。现在列表叫 `.pool-rows`，
+  素材池布局样式全部钉在 `#pool-grid` 上。
+
+### 四、目标卡片自带删除键
+
+- `app.js` `renderPanel()`：每张目标卡片右上角常驻 `.obj-x`（压暗、hover 变珊瑚红、
+  `aria-label` 带序号），按钮自己吃掉点击不顺手选中卡片；`deleteObject(oi)` 改成可传下标，
+  删完给 5 秒撤销条并**按原位置插回**；全删空时给一句下一步提示。
+
+### 五、版本三来源 + 一键更新
+
+- `version.py`：`fetch_latest()` 问遍 Releases / 仓库标签 / main 的 `version.py` 取最新
+  （只认 Releases 时界面长期停在 v1.4.5）；新增 `source_label()` 与 `SOURCE_LABEL`，
+  `status()` 多返回 `source_label`，`describe()` 把来源写进那句话。
+- 新 `autolabel/update.py`：`install_kind()`（git / pip / plain）、`preflight()`
+  （脏工作区、无上游、无 git、非 git 检出四种拒绝）、`perform()`（fetch → `rev-list` →
+  `merge --ff-only`，任何一步不对当场停）、`start()`（后台跑、已在跑就复用）、
+  `restart_argv()` / `schedule_restart()` / `_reexec()`（Windows 走"起新的再退"，
+  `python -m` 形态显式写回 `-m autolabel`）。
+- `review.py`：`GET/POST /api/update`、`POST /api/update/restart`。
+- `common.js`：`updateState` + `renderUpdateButton()` / `ensureUpdateNow()` /
+  `runOneClickUpdate()` / `restartService()`，更新横幅上直接给「立即更新到 v1.4.20」。
+- 修 `perform()` 默认 runner 不收 `timeout` 的 TypeError（调用处会按命令传不同超时）。
+
+### 六、测试
+
+- 新增 `tests/test_one_click_update.py` 22 项：脏工作区不许碰仓库、分叉要给人工出路、
+  `pull=False` 只 fetch 不动工作区、runner 必须收 `timeout`、状态快照不许被外部改脏、
+  三个接口、重启命令保留 `-m autolabel`。
+- `tests/test_review_shell.py` +7 项：关闭键由外壳注入且六页不许自己再写、
+  进度口径只许在 `common.js` 一份、loading 态样式与动效、四种显示方式的按钮/快捷键/持久化、
+  素材池样式必须钉在 `#pool-grid`、目录树整组选中、目标卡片自带删除键。
+- `tests/test_version.py` +6 项：仓库标签能赢过旧发布版、发布版仍是最新时仍归它、
+  非版本号标签忽略、来源标注进 `describe()`、认不出的来源原样给出。
+- 1290 → **1325 passed / 8 skipped**；`ruff` 与 `node --check` 全过。
+
 ## 2026-10-20 11:58 — v1.4.19：视频导入素材不再静默变空；抽帧不再只认 ffmpeg，四个入口统一按文件类型分派
 
 批次记录里的铁证：`视频 5 个 · 1792122217708.mp4 等 | 失败 | 素材 0 | RuntimeError: 未找到 ffmpeg`。

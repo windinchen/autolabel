@@ -274,6 +274,7 @@ function buildSettingsModal() {
 </div>`;
   document.body.appendChild(wrap);
   $("set-close").onclick = () => openSettings(false);
+  installModalChrome();
   $("set-refresh").onclick = () => loadSettings(true);
   $("set-half").onclick = () => saveSettings({ half: !settingsSaved().half });
   // 置信度是打字输入的：失焦或回车才存，边打字边存会每敲一位就发一次请求
@@ -675,6 +676,59 @@ function visible(id) {
   return Boolean(el && !el.classList.contains("hidden"));
 }
 
+// --------------------------------------------------------------------------- //
+// 弹层统一外壳：右上角一个关闭键、点遮罩能关、Esc 能关
+//
+// 全站有二十多个弹层，关闭按钮以前各写各的：有的在按钮行最右边、有的根本没有
+// （只能点遮罩或按 Esc）、有的写着「知道了」让人以为是「以后别再提醒」。找一个
+// 关闭要逐个面板试。这里改成运行时统一注入：任何 .modal-card 都自动长出一个
+// 位置、外观、行为完全相同的关闭键，页面自己那行「关闭」按钮保留不动（老习惯不夺）。
+// --------------------------------------------------------------------------- //
+
+/** 关一个弹层：有专属关闭逻辑的走逻辑（要把 Promise 结掉、把状态清干净），其余收 hidden。 */
+function closeAnyModal(id) {
+  if (id === "confirm-modal") { closeConfirm(false); return; }
+  if (id === "palette-modal") { openPalette(false); return; }
+  if (id === "help-modal") { openHelp(false); return; }
+  if (id === "settings-modal") { openSettings(false); return; }
+  // 素材池弹层各页共用，但关闭函数在页面里（app.js / objects.js 各有一份）
+  if (id === "pool-modal" && typeof openPool === "function") { openPool(false); return; }
+  const el = $(id);
+  if (el) { el.classList.add("hidden"); }
+}
+
+/** 给所有还没装外壳的弹层补上关闭键与遮罩关闭。重复调用安全：装过的打上标记。 */
+function installModalChrome() {
+  document.querySelectorAll(".modal").forEach((wrap) => {
+    if (!wrap.id || wrap.dataset.modalChrome === "on") { return; }
+    const card = wrap.querySelector(".modal-card");
+    if (!card) { return; }
+    wrap.dataset.modalChrome = "on";
+    card.classList.add("has-x");
+    if (!card.querySelector(":scope > .modal-x")) {
+      const x = document.createElement("button");
+      x.type = "button";
+      x.className = "modal-x";
+      x.title = "关闭（Esc）";
+      x.setAttribute("aria-label", "关闭");
+      x.innerHTML = '<svg class="ic"><use href="#ic-cross"></use></svg>';
+      x.addEventListener("click", (e) => { e.stopPropagation(); closeAnyModal(wrap.id); });
+      card.appendChild(x);
+    }
+    // 点遮罩空白处关闭：命令面板与确认框本来就支持，其余弹层以前点了没反应
+    wrap.addEventListener("click", (e) => { if (e.target === wrap) { closeAnyModal(wrap.id); } });
+  });
+}
+
+/** 当前最该关的那个弹层 id。确认框压在最上面（z-index 最高），关它也最该优先。 */
+function topmostModal() {
+  const priority = ["confirm-modal", "pool-modal", "settings-modal", "palette-modal", "help-modal"];
+  const hit = priority.find(visible);
+  if (hit) { return hit; }
+  const rest = [...document.querySelectorAll(".modal")].find((el) => !el.classList.contains("hidden"));
+  return rest ? rest.id : "";
+}
+
 /** 弹层的键盘兜底：确认框 Esc 取消 / Enter 确定，素材池弹层 Esc 关闭。
  *  用捕获阶段抢在页面自己的快捷键前面，四个模块里行为一致。 */
 function bindModalKeys() {
@@ -692,6 +746,17 @@ function bindModalKeys() {
       e.preventDefault();
       e.stopPropagation();
       openPool(false);
+      return;
+    }
+    // 兜底：剩下那些只在自己 keydown 里认 Esc 的弹层（类别管理、批量标注、导入素材、
+    // 试词、批次记录……）以前关不关得看页面心情，现在统一关最上面那一个
+    if (e.key === "Escape") {
+      const top = topmostModal();
+      if (top) {
+        e.preventDefault();
+        e.stopPropagation();
+        closeAnyModal(top);
+      }
     }
   }, true);
 }
@@ -761,6 +826,8 @@ function initNav() {
 // --------------------------------------------------------------------------- //
 const UPDATE_DISMISS_KEY = "autolabel.updateDismissed";
 const versionState = { info: null };
+const updateState = { stage: "idle", message: "", restartable: false };
+let updatePoll = null;
 
 const dismissedVersion = () => {
   try { return localStorage.getItem(UPDATE_DISMISS_KEY) || ""; } catch (e) { return ""; }
@@ -807,6 +874,7 @@ function renderVersion(info) {
   if (home) home.href = info.repo_url || "#";
   const note = $("about-note");
   if (note) note.textContent = versionNote(info);
+  renderUpdateButton(info);
   // 「知道了」只按版本生效：升到 GitHub 那一版之前不再刷这条，但真出了更新版还会来
   const bar = $("update-bar");
   const show = !!info.update_available && info.latest !== dismissedVersion();
@@ -816,6 +884,9 @@ function renderVersion(info) {
     if (text) text.textContent = "GitHub 上有新版本 v" + info.latest + "（当前 v" + current + "）";
     const open = $("update-open");
     if (open) open.href = info.releases_url || info.repo_url || "#";
+    // 顺手在横幅上给一个「立即更新」，别让人为了升个级还得去「⋯」菜单里找
+    const now = ensureUpdateNow();
+    if (now) { now.textContent = "立即更新到 v" + info.latest; }
   }
 }
 
@@ -852,6 +923,223 @@ function initVersionWidget() {
   const check = $("about-check");
   if (check) check.addEventListener("click", () => checkForUpdates());
   loadVersion(false);
+  loadUpdateState();
+}
+
+// --------------------------------------------------------------------------- //
+// 一键更新：检测到新版本时，「关于」里多一项可以直接把本机这份升上去
+//
+// 六个页面各有自己的菜单 HTML，与其在六份文件里各加一个按钮（迟早只有一个跟着改），
+// 不如在这儿按版本状态注入；顺带把「更新到重启」这条链走完，用户不用回终端敲命令。
+// --------------------------------------------------------------------------- //
+async function loadUpdateState() {
+  try {
+    Object.assign(updateState, await getJson("/api/update"));
+  } catch (e) {
+    return null;   // 老服务没这条接口就安静待着，检查更新照常可用
+  }
+  renderUpdateButton(versionState.info);
+  return updateState;
+}
+
+function ensureUpdateButton() {
+  const check = $("about-check");
+  if (!check || !check.parentElement) { return null; }
+  const existing = $("about-update");
+  if (existing) { return existing; }
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.id = "about-update";
+  btn.className = "menu-item";
+  btn.innerHTML = '<svg class="ic"><use href="#ic-refresh"></use></svg>'
+    + '<span id="about-update-text">一键更新</span>';
+  btn.addEventListener("click", () => { runOneClickUpdate(); });
+  check.parentElement.insertBefore(btn, check.nextSibling);
+  return btn;
+}
+
+/** 更新横幅上的「立即更新」：和菜单里那一项是同一件事，只是放在了看得见的位置。 */
+function ensureUpdateNow() {
+  const open = $("update-open");
+  if (!open || !open.parentElement) { return null; }
+  const existing = $("update-now");
+  if (existing) { return existing; }
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.id = "update-now";
+  btn.addEventListener("click", () => { runOneClickUpdate(); });
+  open.parentElement.insertBefore(btn, open.nextSibling);
+  return btn;
+}
+
+/** 「关于」里那一项该写什么：能升就写升到哪版，在跑就写进度，升好了就叫重启。 */
+function renderUpdateButton(info) {
+  const btn = ensureUpdateButton();
+  if (!btn) { return; }
+  const label = $("about-update-text");
+  const version = (info || versionState.info || {}).latest || "";
+  const canUpdate = Boolean((info || versionState.info || {}).update_available);
+  const busy = updateState.stage === "running";
+  btn.disabled = busy;
+  btn.classList.toggle("busy", busy);
+  if (busy) {
+    btn.hidden = false;
+    if (label) label.textContent = updateState.message || "更新中…";
+    return;
+  }
+  if (updateState.stage === "done" && updateState.restartable) {
+    btn.hidden = false;
+    if (label) label.textContent = "更新好了，重启服务生效";
+    return;
+  }
+  if (updateState.stage === "failed") {
+    btn.hidden = !canUpdate;
+    if (label) label.textContent = "一键更新（上次没成，再试）";
+    return;
+  }
+  btn.hidden = !canUpdate;
+  if (label) label.textContent = version ? `一键更新到 v${version}` : "一键更新";
+}
+
+function stopUpdatePolling() {
+  if (updatePoll) { clearInterval(updatePoll); updatePoll = null; }
+}
+
+async function runOneClickUpdate() {
+  if (updateState.stage === "running") { toast("更新已经在跑了"); return; }
+  const info = versionState.info || {};
+  if (updateState.stage === "done" && updateState.restartable) {
+    await restartService();
+    return;
+  }
+  const ok = await confirmBox({
+    title: info.latest ? `更新到 v${info.latest}` : "一键更新",
+    body: "会用 git 把本机这份更新到 GitHub 上最新版，只接受快进：有没提交的改动、"
+      + "或者本地历史和远端分叉了，都会先停下来告诉你原因，不会覆盖你的改动。"
+      + "更新完需要重启服务才生效。",
+    okLabel: "开始更新",
+  });
+  if (!ok) { return; }
+  try {
+    Object.assign(updateState, await postJson("/api/update", {}));
+  } catch (err) {
+    toast("更新没跑起来：" + err.message, true);
+    return;
+  }
+  renderUpdateButton(info);
+  toast("开始更新，进度会在这里提示");
+  stopUpdatePolling();
+  let lastMessage = "";
+  updatePoll = setInterval(async () => {
+    const next = await loadUpdateState();
+    if (!next) { stopUpdatePolling(); return; }
+    if (next.message && next.message !== lastMessage) {
+      lastMessage = next.message;
+      toast(next.message);
+    }
+    if (next.stage === "done") {
+      stopUpdatePolling();
+      if (next.restartable) {
+        toast("已更新到 " + (next.to_commit || "最新版") + "，重启服务后生效");
+        await restartService();
+      } else {
+        toast(next.message || "已经是最新版");
+      }
+    } else if (next.stage === "failed") {
+      stopUpdatePolling();
+      const why = (next.detail || []).filter(Boolean).join("；");
+      toast("更新没成：" + (next.message || "") + (why ? " · " + why : ""), true);
+    }
+  }, 900);
+}
+
+/** 让服务用新代码重新起一次；起不来也要把该敲的命令说给用户，别让人对着白屏猜。 */
+async function restartService() {
+  const ok = await confirmBox({
+    title: "重启服务",
+    body: "新代码要重新加载才算升上来。服务会自己重启，大约 5～10 秒，"
+      + "这期间页面打不开是正常的，好了会自动回到这一页。",
+    okLabel: "现在重启",
+  });
+  if (!ok) { return; }
+  toast("服务重启中…");
+  try {
+    await postJson("/api/update/restart", {});
+  } catch (err) {
+    // 进程退出的瞬间连接必然断掉，这不算失败
+  }
+  stopUpdatePolling();
+  setTimeout(() => location.reload(), 6000);
+}
+
+// --------------------------------------------------------------------------- //
+// 后台任务进度：分段加权、只前进不回退
+//
+// 以前一条进度条上有三套互不相干的口径：姿态页把任务百分比又压进 60–100% 一段，
+// 提示词/检测页按阶段查一张写死的表（loading 不在表里就掉回 12%），有 done/total
+// 时又直接按 done/total 算。于是同一件事在姿态页走到 92%、在检测页才走 55%，
+// 而"正在加载大模型"那几十秒条子一动不动，看着就是卡死。
+//
+// 现在每个阶段占一条固定区间，区间内用真实的 done/total 走；loading 特殊处理：
+// 它没有可数的东西，就按已等时长慢慢爬（永远爬不满自己那段，免得像在终点等着）。
+// --------------------------------------------------------------------------- //
+const STAGE_BANDS = {
+  queued: [0, 3], importing: [3, 12], loading: [12, 22],
+  labeling: [22, 88], qc: [88, 93], coords: [93, 99], done: [100, 100],
+  failed: [0, 0], cancelled: [0, 0],
+};
+/** loading 段爬满自己那段要多久：再快也别快到看不出在动。 */
+const LOAD_CRAWL_MS = 45000;
+const jobPeaks = Object.create(null);   // 任务 id → 已经到过的最高百分比
+const loadClock = Object.create(null);  // 任务 id → 进入 loading 的时刻
+
+/** 一个后台任务该画到百分之几。取不到任务返回 -1，由调用方决定隐藏还是画满。 */
+function jobPercent(job) {
+  if (!job) { return -1; }
+  const band = STAGE_BANDS[job.stage] || [8, 12];
+  let value = band[0];
+  if (job.stage === "loading") {
+    if (!loadClock[job.id]) { loadClock[job.id] = Date.now(); }
+    const ratio = clamp((Date.now() - loadClock[job.id]) / LOAD_CRAWL_MS, 0, 0.95);
+    value = band[0] + (band[1] - band[0]) * ratio;
+  } else {
+    delete loadClock[job.id];
+    if (job.finished || job.stage === "done") value = 100;
+    else if (job.total > 0) {
+      value = band[0] + (band[1] - band[0]) * clamp(job.done / job.total, 0, 1);
+    }
+  }
+  // 只前进：阶段切换、或者换了另一个带计数的任务，都不该让条子倒退
+  const peak = jobPeaks[job.id] || 0;
+  const result = Math.max(value, peak);
+  jobPeaks[job.id] = result;
+  return Math.round(result);
+}
+
+/** 任务结束并从列表消失后清掉高水位，别让这张表跟着任务数一直长。 */
+function forgetJobProgress(ids) {
+  const list = Array.isArray(ids) ? ids : [ids];
+  for (const id of list) {
+    delete jobPeaks[id];
+    delete loadClock[id];
+  }
+}
+
+/** 任务条上那句状态：加载模型时明说在加载，别让人对着一句 0/0 猜。 */
+function jobStatusText(job, verb) {
+  if (!job) { return ""; }
+  const counting = job.total > 0 && job.stage !== "loading";
+  const extra = counting ? ` ${job.done || 0}/${job.total}` : "";
+  const head = verb ? `${verb}进行中 · 任务 ${job.id}${extra} · ` : `任务 ${job.id}${extra} · `;
+  return (job.cancel_requested ? "取消中 · " : "") + head + job.message;
+}
+
+/** 画一条任务进度条：宽度走统一口径；加载阶段让轨道进入 loading 态（琥珀 + 斜纹流动）。 */
+function paintJobBar(el, job) {
+  if (!el) { return; }
+  el.style.width = Math.max(0, jobPercent(job)) + "%";
+  const track = el.parentElement;
+  if (track) { track.classList.toggle("loading", Boolean(job && job.stage === "loading")); }
 }
 
 // --------------------------------------------------------------------------- //
@@ -1022,6 +1310,7 @@ function ensurePoolModal() {
   $("pool-all").onclick = poolToggleAll;
   $("pool-adopt").onclick = poolAdopt;
   $("pool-close").onclick = () => openPool(false);
+  installModalChrome();
 }
 
 function openPool(open, lib, onDone) {
@@ -1251,6 +1540,8 @@ function initShellChrome(options) {
   };
   applyAppearance({ animate: false });
   loadDecoderInfo();
+  // 静态写死的弹层在 HTML 里；运行时建的（系统设置 / 从素材池添加）各自建完再补一次
+  installModalChrome();
   if (window.matchMedia) {
     const mq = window.matchMedia("(prefers-color-scheme: light)");
     const follow = () => { if (appearance.theme === "auto") { applyAppearance(); } };

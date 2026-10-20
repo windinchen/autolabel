@@ -1673,6 +1673,11 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 # 顶栏的版本徽标；?refresh=1 是用户在「关于」里点了「检查更新」
                 refresh = parse_qs(parsed.query).get("refresh", ["0"])[0] in ("1", "true", "yes")
                 self._send_json(self.store.version_payload(force=refresh))
+            elif path == "/api/update":
+                # 一键更新的进度（界面轮询这条，不在服务端长挂请求）
+                from . import update as updater
+
+                self._send_json(updater.state())
             elif path == "/api/settings":
                 # ?probe=1 才去探测显卡：打开「系统设置」面板时带，平时切页不带
                 probe = parse_qs(parsed.query).get("probe", ["0"])[0] in ("1", "true", "yes")
@@ -1925,6 +1930,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
                                  "models": self.store.model_rows()})
             elif parsed.path == "/api/settings":
                 self._send_json(self.store.save_settings(payload))
+            elif parsed.path == "/api/update":
+                # 一键更新：fetch + 快进，跑在后台线程里；有未提交改动它自己会拒绝
+                from . import update as updater
+
+                self._send_json(updater.start(pull=bool(payload.get("pull", True))))
+            elif parsed.path == "/api/update/restart":
+                # 新代码要重新 import 才算升上来；延迟一点退出，先把这条响应发完
+                from . import update as updater
+
+                self._send_json(updater.schedule_restart(
+                    delay=float(payload.get("delay") or 1.0)))
             else:
                 raise UnknownEndpoint(parsed.path)
         except UnknownEndpoint as exc:

@@ -611,3 +611,119 @@ def test_annotation_pages_agree_on_which_button_is_the_next_step():
             f"{page} 的「导入素材」抢了主操作的位置，和另外两个标注页不一致"
     assert "primary" in button_class(read("pool.html"), "btn-upload"), \
         "素材池那页的下一步就是导入，必须是主操作"
+
+
+# --------------------------------------------------------------------------- //
+# 五轮改版留下的新契约：统一关闭键、一份进度口径、素材池多视图、单条删除
+# --------------------------------------------------------------------------- //
+
+def css_rules(css):
+    """把 CSS 拆成 (选择器, 规则体)，选择器只取 { 前那一行的尾部。"""
+    for chunk in css.split("}"):
+        if "{" not in chunk:
+            continue
+        selector, body = chunk.rsplit("{", 1)
+        selector = selector.splitlines()[-1].strip()
+        # 去掉注释行，注释里也会出现 .pool-row 这种字样
+        selector = " ".join(part.strip() for part in selector.split("*/")[-1::]).strip()
+        if selector:
+            yield selector, body.strip()
+
+
+def test_every_modal_can_be_closed_from_the_same_corner():
+    """所有弹层共用右上角那一个关闭键：以前 ✕ 各写各的，找一个关闭要逐个面板试。
+
+    关闭键由 common.js 运行时注入，所以六页 HTML 里谁都不许自己再写一个，
+    否则同一个弹层会出现两个 ✕，位置还不一样。
+    """
+    common = read("common.js")
+    css = read("app.css")
+    assert "function installModalChrome()" in common and "function closeAnyModal(" in common
+    shell = common.split("function initShellChrome(")[1]
+    assert "installModalChrome();" in shell.split("\n}")[0], "壳层初始化没装关闭键，新页面会漏"
+    assert "function topmostModal(" in common, "Esc 关不掉最上面那个弹层"
+    assert ".modal-x" in css and "position: absolute" in css
+    for selector, body in css_rules(css):
+        if selector.strip() == ".modal-x":
+            assert "top:" in body and "right:" in body, "关闭键没钉在右上角"
+    for page in SIX_PAGES:
+        assert 'class="modal-x"' not in read(page), f"{page} 自己又写了一个关闭键"
+
+
+def test_progress_percentages_are_computed_in_one_place():
+    """进度条的口径只允许在 common.js 有一份：各页自己换算时，同一个任务能画出两个百分比。
+
+    以前上传画到 60% 就停住（后半截交给后台任务，可没人接着画），
+    255 个文件的上传看着像传坏了；现在条子由 jobPercent + paintJobBar 统一负责。
+    """
+    assert "const STAGE_BANDS" in read("common.js")
+    for name in ("app.js", "objects.js", "pool.js", "models.js"):
+        js = read(name)
+        assert "function jobPercent" not in js, f"{name} 自己算了一份进度口径"
+        assert "STAGE_BANDS" not in js, f"{name} 抄了一份分段表"
+    for name in ("app.js", "objects.js"):
+        assert "paintJobBar(" in read(name) and "jobStatusText(" in read(name), \
+            f"{name} 还在自己画条子"
+    assert "paintPoolBar(" in read("pool.js"), "素材池的上传条没接上后台任务那一段"
+
+
+def test_a_stuck_progress_bar_looks_different_from_a_moving_one():
+    """加载大模型这类没张数可数的阶段：条子要变色并让斜纹流动，否则看着就是卡死。"""
+    css = read("app.css")
+    assert ".progress.loading" in css, "没有 loading 态的样式"
+    assert "bar-crawl" in css and "@keyframes bar-crawl" in css
+    assert "prefers-reduced-motion" in css, "动效没给晕动症用户留关掉的路"
+    assert 'toggle("loading"' in read("pool.js") and 'toggle("loading"' in read("models.js")
+
+
+def test_pool_offers_four_views_and_wires_every_one_of_them():
+    """素材池四种显示方式（舒适网格 / 紧凑网格 / 列表 / 目录树），按钮、快捷键、命令面板都要通。"""
+    html = read("pool.html")
+    js = read("pool.js")
+    block = re.search(r'<span class="seg pool-view".*?</span>\s*</span>', html, re.S)
+    assert block, "素材池页没有显示方式分段按钮"
+    views = re.findall(r'data-view="([a-z]+)"', block.group(0))
+    assert views == ["grid", "dense", "list", "tree"], f"显示方式按钮不全或顺序不对：{views}"
+    listed = re.search(r"const POOL_LAYOUTS = \[([^\]]+)\]", js)
+    assert listed and sorted(item.strip().strip('"') for item in listed.group(1).split(",")) == sorted(views)
+    assert "function setPoolLayout(" in js and "function restorePoolLayout()" in js
+    assert "renderPoolTree(" in js and "function poolRow(" in js, "列表 / 目录树没实现，只有按钮"
+    for digit in ("1", "2", "3", "4"):
+        assert f'case "{digit}"' in js, f"少了快捷键 {digit} 切换显示方式"
+    assert "autolabel.poolLayout" in js, "显示方式没记住，刷新一次就打回原形"
+    assert "params.get(\"layout\")" in js, "?layout= 不能直达，文档和命令面板没法指过去"
+
+
+def test_pool_list_and_tree_styles_stay_scoped_to_the_grid():
+    """列表 / 目录树的样式必须钉在 #pool-grid 上。
+
+    「从素材池添加」弹层里的 #pool-files 也带着 pool-list 类，那是个要滚动的框：
+    一旦让素材池的 flex 布局漏过去，弹层里几十张图就再也滚不动了。
+    """
+    css = read("app.css")
+    for selector, _body in css_rules(css):
+        if re.search(r"\.(pool-rows|pool-row|pool-tree|tree-head|tree-caret|tree-name|"
+                     r"tree-nums|tree-pick)\b", selector):
+            assert selector.startswith("#pool-grid") or "#pool-files" in selector, \
+                f"选择器 {selector!r} 会漏进「从素材池添加」弹层"
+
+
+def test_tree_group_headers_can_pick_the_whole_group():
+    """目录树的分组头要能整组选中：清库存时没人想一个个点 255 次。"""
+    js = read("pool.js")
+    assert "function selectTreeGroup(" in js and "选中这一组" in js
+    assert "function toggleTreeNode(" in js, "分组收不起来"
+    assert "POOL.collapsed" in js
+
+
+def test_pose_target_cards_have_their_own_delete_button():
+    """姿态标注每张目标卡片自带删除键，并且删完给撤销条。
+
+    只有 X 键的话，用户得先点选中、再记快捷键；误检框多的时候这是两倍的操作量。
+    """
+    js = read("app.js")
+    assert 'kill.className = "obj-x"' in js and "deleteObject(oi)" in js
+    assert "function showUndoBar" in read("common.js")
+    assert 'showUndoBar(`已删除' in js, "删错目标没有当场退回的路"
+    css = read("app.css")
+    assert any(".obj-x" in selector for selector, _body in css_rules(css))
