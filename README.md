@@ -102,7 +102,7 @@ yolo detect / segment train
 
 ```bash
 python3 -m pip install -r requirements.txt   # 已有 torch/ultralytics 可跳过
-python3 -m pytest tests -q                    # 1325 项测试，约 2 分钟
+python3 -m pytest tests -q                    # 1340 项测试，约 2 分钟
 # 其中 5 项端到端用例需要 models/yolo11n-pose.pt 与 models/bus.jpg，缺权重时会自动跳过（`-rs` 可看到原因）
 ```
 
@@ -280,7 +280,7 @@ python3 -m autolabel video $D 录像.mp4 --scene 0.3                    # 按镜
 
 不想敲命令就在复核界面右上角点 **导入素材** 选视频，抽帧密度、最多帧数、模型都在弹层里选，传完自动出坐标。
 
-抽帧默认 `--dedupe perceptual`（dHash 汉明距离 ≤ 5 视为近似重复），静态机位的视频通常能砍掉 60% 以上的冗余帧。每帧在索引里带 `time_sec` 与源视频路径，复核时能回溯到原视频时间点。
+抽帧默认只跳过字节完全相同的帧（`exact`），要按画面省张数再显式选 `perceptual`（dHash 汉明距离 ≤ 5 视为同一画面，静态机位能砍掉 60% 以上冗余帧）。入库张数是 `floor(时长 × 频率) + 1`，命令行与界面都把「每 2 秒 1 帧」这个口径跟数字一起报出来，被「最多帧数」截断也会单独说一句。每帧在索引里带 `time_sec` 与源视频路径，复核时能回溯到原视频时间点。
 
 ## 训练集导出（YOLO 标准格式）
 
@@ -364,7 +364,7 @@ risky = df[df["person_flags"].str.len() > 0]            # 只看被 QC 标记的
 │   ├── image_utils.py    读图、dHash、骨架绘制
 │   └── static/           前端：portal 工作台 / pool 素材池 / app 姿态标注 / objects+detect 检测框标注（共用一份脚本）
 │                         / models 模型管理 / common 共用件
-├── tests/                1325 项测试（含端到端与回归）
+├── tests/                1340 项测试（含端到端与回归）
 ├── certs/                本地 HTTPS 证书与私钥（`autolabel ca` 生成，已 gitignore）
 ├── configs/default.yaml  参数模板
 ├── configs/vlm.json      多模态大模型配置（不含明文 Key，建议不入库）

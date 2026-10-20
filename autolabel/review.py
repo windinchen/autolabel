@@ -636,8 +636,8 @@ class ReviewStore:
             "fps": self._positive(payload, "fps", 0.5, "视频抽帧频率"),
             "max_frames": int(self._positive(payload, "max_frames", 600, "视频最多抽帧数", integer=True)),
             "max_side": int(self._positive(payload, "max_side", 1600, "图片最长边像素", integer=True)),
-            "dedupe": str(payload.get("dedupe") or "exact"),
-            "video_dedupe": str(payload.get("video_dedupe") or "perceptual"),
+            "dedupe": self._dedupe_mode(payload, "dedupe", "图片去重方式"),
+            "video_dedupe": self._dedupe_mode(payload, "video_dedupe", "视频抽帧去重方式"),
             "batch_name": str(payload.get("batch_name") or "")[:80],
         }
         if profile is not None:
@@ -1017,8 +1017,8 @@ class ReviewStore:
             "fps": self._positive(payload, "fps", 0.5, "视频抽帧频率"),
             "max_frames": int(self._positive(payload, "max_frames", 600, "视频最多抽帧数", integer=True)),
             "max_side": int(self._positive(payload, "max_side", 1600, "图片最长边像素", integer=True)),
-            "dedupe": str(payload.get("dedupe") or "exact"),
-            "video_dedupe": str(payload.get("video_dedupe") or "perceptual"),
+            "dedupe": self._dedupe_mode(payload, "dedupe", "图片去重方式"),
+            "video_dedupe": self._dedupe_mode(payload, "video_dedupe", "视频抽帧去重方式"),
             "batch_name": str(payload.get("batch_name") or "")[:80],
         }
         if payload.get("conf") not in (None, ""):
@@ -1161,6 +1161,17 @@ class ReviewStore:
         if value <= 0:
             raise ValueError(f"{name}要大于 0，现在是 {value}")
         return value
+
+    def _dedupe_mode(self, payload: dict, key: str, name: str) -> str:
+        """去重方式只认 ``none`` / ``exact`` / ``perceptual``，填别的直接报错。
+
+        这个值决定抽出来的帧会被吃掉多少：``perceptual`` 把画面相近的帧当成同一帧
+        丢掉，视频帧几乎全中招——5 条录像抽出 264 帧只剩 46 张就是这么来的。传错
+        一个词以前会被当成「不去重」或「近似去重」默默改掉行为，比报错更难查。
+        """
+        from .upload import dedupe_mode
+
+        return dedupe_mode(payload.get(key), name)
 
     def export_detection(self, payload: dict, lib: str = LIB_OBJECTS) -> dict:
         """导出 YOLO detection 数据集（train/val + data.yaml），两个框库共用。"""

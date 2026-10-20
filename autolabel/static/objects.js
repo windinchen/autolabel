@@ -2147,7 +2147,7 @@ async function startUpload() {
       label: labeling,
       fps: readNumber("up-fps", 0.5),
       max_frames: Math.round(readNumber("up-max-frames", 600)),
-      video_dedupe: $("up-keep-similar").checked ? "none" : "perceptual",
+      video_dedupe: readSelect("up-video-dedupe", "exact"),
       batch_name: $("up-batch-name").value.trim(),
       category: readImportCategory("up-category"),
     };

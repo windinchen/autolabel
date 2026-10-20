@@ -150,6 +150,30 @@ def _import_note(imported: int, reused: object = 0, *, unit: str = "张", verb: 
     return f"{verb} {total} {unit}" + (f"（复用素材池 {reused_n}）" if reused_n else "")
 
 
+def _frame_summary(result: dict, fps: object, *, ingested: int) -> List[str]:
+    """抽帧结果说人话：抽出多少、按什么口径抽、吃掉多少、为什么少。
+
+    ``抽出 256 帧 → 入库 48 帧`` 只说明少了 208 帧，不说是被近似去重吃掉还是被
+    「最多帧数」截断——这两件事的补救办法（换去重档位 / 调大上限）差得很远。
+    """
+    from .video import sampling_rule
+
+    mode = str(result.get("mode") or "fps")
+    rule = "" if mode == "scene" else sampling_rule(fps)
+    line = (f"抽出 {int(result.get('extracted') or 0)} 帧（{mode}"
+            + (f"，{rule}" if rule else "") + f"）→ 入库 {int(ingested)} 帧")
+    skips = []
+    if result.get("skipped_exact"):
+        skips.append(f"内容相同 {result['skipped_exact']}")
+    if result.get("skipped_similar"):
+        skips.append(f"近似去重 {result['skipped_similar']}")
+    if skips:
+        line += f"（跳过 {' · '.join(skips)}）"
+    if result.get("reused"):
+        line += f"（复用素材池 {result['reused']}）"
+    return [line] + [str(row) for row in [result.get("note")] if row]
+
+
 def cmd_video(args: argparse.Namespace) -> int:
     from .video import extract_frames
 
@@ -169,14 +193,14 @@ def cmd_video(args: argparse.Namespace) -> int:
                  lib=args.lib)
     finish_batch(args.dataset, batch["id"], "done",
                  _import_note(result["imported"], result.get("reused"), unit="帧", verb="抽帧导入"))
-    print(f"[ok] 视频抽帧：抽出 {result['extracted']} 帧（模式 {result['mode']}）→ "
-          f"导入 {result['imported']} 帧，复用素材池 {result.get('reused', 0)} 帧，"
-          f"重复跳过 {result['skipped_exact']}/相似 {result['skipped_similar']}"
-          f"（入库到 {lib_name(args.lib)}）")
+    summary = _frame_summary(result, args.fps, ingested=len(result["imported_files"]))
+    print(f"[ok] 视频抽帧：{summary[0]}（入库到 {lib_name(args.lib)}）")
     info = result.get("video_info", {})
     if info.get("duration"):
         print(f"     视频时长 {info['duration']:.1f}s · {info.get('width')}x{info.get('height')} · "
               f"{info.get('fps') and round(info['fps'], 2)} fps")
+    for extra in summary[1:]:
+        print(f"     [提示] {extra}")
     print(f"     批次 {batch['id']}（用 batches 命令或复核界面「批次管理」可整批删除）")
     return 0
 
@@ -515,8 +539,10 @@ def cmd_auto(args: argparse.Namespace) -> int:
                                     max_side=args.max_side, dedupe=args.video_dedupe,
                                     subdir=args.subdir, lib=lib)
             imported.extend(rel for _src, rel in result["imported_files"])
-            print(f"[1/4] 视频 {os.path.basename(video)}：抽出 {result['extracted']} 帧 → "
-                  f"入库 {len(result['imported_files'])} 帧（近似重复跳过 {result['skipped_similar']}）")
+            summary = _frame_summary(result, args.fps, ingested=len(result["imported_files"]))
+            print(f"[1/4] 视频 {os.path.basename(video)}：{summary[0]}")
+            for extra in summary[1:]:
+                print(f"      [提示] {extra}")
     if stills:
         stats = import_images(root, stills, recursive=not args.no_recursive, max_side=args.max_side,
                               jpeg_quality=args.jpeg_quality, dedupe=args.dedupe, subdir=args.subdir,
@@ -1822,7 +1848,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--start", type=_non_negative_float, default=0.0, help="起始秒")
     p.add_argument("--duration", type=_positive_float, help="截取时长（秒）")
     p.add_argument("--max-side", type=_positive_int, default=1600)
-    p.add_argument("--dedupe", choices=["none", "exact", "perceptual"], default="perceptual")
+    p.add_argument("--dedupe", "--video-dedupe", dest="dedupe",
+                   choices=["none", "exact", "perceptual"], default="exact",
+                   help="抽帧去重方式，默认只跳过完全相同的帧。--video-dedupe 是同一个参数，"
+                        "与 auto 里那档同名同义")
     p.add_argument("--subdir", default="")
     p.add_argument("--batch-name", help="批次名称，用于「批次管理」分组显示")
     add_lib(p)
@@ -1971,8 +2000,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-side", type=_positive_int, default=1600)
     p.add_argument("--jpeg-quality", type=_quality, default=95)
     p.add_argument("--dedupe", choices=["none", "exact", "perceptual"], default="exact", help="图片去重方式")
-    p.add_argument("--video-dedupe", choices=["none", "exact", "perceptual"], default="perceptual",
-                   help="视频帧去重方式，默认感知去重以剔除近重复帧")
+    p.add_argument("--video-dedupe", choices=["none", "exact", "perceptual"], default="exact",
+                   help="视频帧去重方式。默认只跳过完全相同的帧：抽出来的帧本来就是按时间"
+                        "挑过的，感知去重会把同场景的多条录像互相当成同一帧丢掉")
     p.add_argument("--subdir", default="", help="导入到 images/ 下的子目录")
     p.add_argument("--fps", type=_positive_float, default=0.5, help="视频采样帧率，0.5 = 每 2 秒 1 帧")
     p.add_argument("--max-frames", type=_positive_int, default=600)

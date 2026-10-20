@@ -1003,7 +1003,9 @@ async function startUpload() {
     fps: readNumber("up-fps", 0.5),
     max_frames: Math.round(readNumber("up-max-frames", 600)),
     label: $("up-label").checked,
-    video_dedupe: $("up-keep-similar").checked ? "none" : "perceptual",
+    // 默认只跳过完全相同的帧：抽出来的帧本来就是挑过的，近似去重会把同场景的
+    // 录像互相吃掉（5 条一起导 264 帧只剩 46 张），要省张数由用户自己选。
+    video_dedupe: readSelect("up-video-dedupe", "exact"),
   };
   upLog(`开始上传 ${files.length} 个文件…`);
   const stored = { image: [], video: [] };

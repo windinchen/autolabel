@@ -192,6 +192,45 @@ def _usable_fps(value: object) -> Optional[float]:
     return fps if 0.0 < fps < 1000.0 else None
 
 
+def _sample_interval(src_fps: float, fps: float) -> float:
+    """相邻两帧之间要跨过多少个源帧——跨距保留小数，别四舍五入成整数。
+
+    整数步长是「抽出来的张数对不上」的源头之一：25 fps 的录像要「每秒 2 帧」，
+    ``round(25 / 2)`` 得 12，实际间隔变成 0.48 秒，一条 21.5 秒的录像就多抽 2 帧，
+    用户照 ``21.5 × 2 = 43`` 数就对不上。跨距留小数后取样点落在 0 / 0.5 / 1.0 秒，
+    张数正好是 ``floor(时长 × fps) + 1``，和 ffmpeg 的 ``fps`` 滤镜同一个口径。
+    """
+    return max(1.0, float(src_fps) / max(MIN_SAMPLE_FPS, float(fps) or 0.5))
+
+
+def planned_frames(duration: float, fps: float) -> int:
+    """按「时长 × 频率」这段视频本来该抽几帧（第 0 秒那帧算在内）；时长未知返回 0。
+
+    完成消息拿它来判断「是不是被最多帧数截断了」，用户也能自己乘一遍核对——
+    21.5 秒按每秒 2 帧就是 43 帧，抽出来 20 帧又不说原因，就像软件在丢素材。
+    """
+    span = max(0.0, float(duration or 0.0))
+    rate = max(MIN_SAMPLE_FPS, float(fps or 0.0) or 0.5)
+    return int(span * rate) + 1 if span > 0 else 0
+
+
+def sampling_rule(fps: object) -> str:
+    """抽帧频率说人话：``0.5`` → 「每 2 秒 1 帧」，``2`` → 「每秒 2 帧」；不像数字就返回空。
+
+    消息里只写「抽出 43 帧」，用户还得去翻设置才知道按什么频率抽的；把口径跟数字
+    一起报出来，他拿视频时长乘一下就知道这个数对不对。
+    以前「镜头切换取样不可用」的提示写作「每 0.5 秒取 1 帧」——0.5 是**频率**不是
+    间隔，读起来正好把倍数说反了。
+    """
+    try:
+        rate = float(fps)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    if not rate > 0:
+        return ""
+    return f"每 {1.0 / rate:g} 秒 1 帧" if rate <= 1 else f"每秒 {rate:g} 帧"
+
+
 # --------------------------------------------------------------------------- //
 # 抽帧
 # --------------------------------------------------------------------------- //
@@ -204,7 +243,7 @@ def extract_frames(
     start: float = 0.0,
     duration: Optional[float] = None,
     max_side: int = 1600,
-    dedupe: str = "perceptual",
+    dedupe: str = "exact",
     subdir: str = "",
     keep_temp: bool = False,
     lib: str = "pose",
@@ -217,6 +256,9 @@ def extract_frames(
         只有 ffmpeg 认这个参数，用 OpenCV 兜底时自动退回按 ``fps`` 定时取样
     :param start: 从第几秒开始
     :param duration: 只处理这么长的片段；不给就按元信息里的时长（读不到就取到结尾）
+    :param dedupe: 默认 ``exact``——只跳过字节完全相同的帧。抽出来的帧本来就是挑过的，
+        而且几乎不会字节相同；按 ``perceptual`` 去重会把画面相近的帧当成同一帧丢掉，
+        几条同场景的录像一起导，264 帧能只剩 46 帧，看着就像抽帧在丢素材
     :param lib: 目标标注库（``pose`` / ``objects``），素材仍落在共享池里
     :param register: ``False`` 表示抽出来的帧只进素材池，不进标注库索引
     """
@@ -229,16 +271,24 @@ def extract_frames(
     # 只有显式要求的片段长度才交给解码器当停止条件：OpenCV 报的帧数不可靠，
     # 拿它反推的时长去截断会悄悄少抽后半段，宁可多解到 max_frames 为止。
     clip = max(0.0, float(duration)) if duration else 0.0
+    cap = max(1, int(max_frames))
     stem = _safe_stem(video)
     tmp = tempfile.mkdtemp(prefix="autolabel_frames_")
     try:
         prepared, extracted, backend, note = decode_frames(
-            video, tmp, stem, fps, scene, float(start or 0.0), clip, max_side, max_frames, info)
+            video, tmp, stem, fps, scene, float(start or 0.0), clip, max_side, cap, info)
         result = import_prepared(dataset_root, prepared, dedupe=dedupe, max_side=max_side,
                                  subdir=subdir, lib=lib, register=register)
     finally:
         if not keep_temp:
             shutil.rmtree(tmp, ignore_errors=True)
+    # 「最多帧数」截断要自己说一声：用户按 时长 × 频率 乘出来的数总比实际大，
+    # 少了一批又没一句解释，看起来就像抽帧在丢帧。
+    span = clip or max(0.0, float(info.get("duration") or 0.0) - max(0.0, float(start or 0.0)))
+    planned = 0 if (scene and backend == "ffmpeg") else planned_frames(span, fps)
+    if planned > cap and extracted >= cap:
+        note = (note + "；" if note else "") + (
+            f"整段该抽 {planned} 帧，已按「最多帧数」截到 {cap} 帧（要全抽就调大上限）")
     result.update({"video": video, "video_info": info, "extracted": extracted,
                    "mode": "scene" if (scene and backend == "ffmpeg") else "fps",
                    "backend": backend, "note": note, "sampled": len(prepared)})
@@ -261,7 +311,7 @@ def decode_frames(
     if has_opencv():
         note = ""
         if scene:
-            note = f"没有 ffmpeg，按镜头切换取样用不了，已改成每 {fps} 秒取 1 帧"
+            note = f"没有 ffmpeg，按镜头切换取样用不了，已改成{sampling_rule(fps) or f'每秒取 {fps} 帧'}"
         prepared, extracted, timed_out = _run_opencv(video, tmp, stem, fps, start,
                                                      duration, max_side, max_frames, info)
         if timed_out:
@@ -344,9 +394,12 @@ def _sample_opencv(cv2, cap, tmp: str, fps: float, start: float, duration: float
     逐帧 ``read()`` 会把每一帧都转成数组，长视频上慢得没法用；``grab()`` 只推进
     解码器不取像素，省掉的就是那部分转换。超时不报错而是收尾返回已抽到的帧——
     半截帧比整次失败有用得多，说明写在返回的 note 里。
+
+    取样点按 :func:`_sample_interval` 的跨距排在 0 / 0.5 / 1.0 秒这样的整格上，
+    「每秒 2 帧、21.5 秒」就是不多不少 43 帧，用户自己乘一遍就能核对。
     """
     src_fps = _usable_fps(info.get("fps")) or _usable_fps(cap.get(cv2.CAP_PROP_FPS)) or FALLBACK_FPS
-    step = max(1, int(round(src_fps / max(MIN_SAMPLE_FPS, float(fps) or 0.5))))
+    interval = _sample_interval(src_fps, fps)
     first = max(0, int(round(max(0.0, float(start or 0.0)) * src_fps)))
     if first and not cap.set(cv2.CAP_PROP_POS_FRAMES, first):
         first = 0  # 这个容器不支持定位，老实从头解
@@ -355,6 +408,7 @@ def _sample_opencv(cv2, cap, tmp: str, fps: float, start: float, duration: float
     picked: List[Tuple[float, str]] = []
     timed_out = False
     seen = 0
+    want = float(first)  # 下一个该留的源帧号：起点 + 已留帧数 × 跨距
     while len(picked) < max(1, int(max_frames)):
         if not cap.grab():
             break
@@ -365,7 +419,7 @@ def _sample_opencv(cv2, cap, tmp: str, fps: float, start: float, duration: float
         seen += 1
         if limit and seen > limit:
             break
-        if (seen - 1) % step:
+        if pos + 0.5 < want:
             continue
         ok, frame = cap.retrieve()
         if not ok or frame is None:
@@ -373,6 +427,7 @@ def _sample_opencv(cv2, cap, tmp: str, fps: float, start: float, duration: float
         name = f"{len(picked):06d}.jpg"
         _write_jpeg(cv2, frame, os.path.join(tmp, name), max_side)
         picked.append((pos / src_fps, name))
+        want = first + interval * len(picked)
         if time.monotonic() > deadline:
             timed_out = True
             break
@@ -470,4 +525,4 @@ def _parse_showinfo_times(stderr: str) -> List[float]:
 
 
 __all__ = ["decode_frames", "decode_timeout", "decoder", "extract_frames", "ffmpeg_bin",
-           "ffmpeg_timeout", "has_opencv", "probe_video"]
+           "ffmpeg_timeout", "has_opencv", "planned_frames", "probe_video", "sampling_rule"]

@@ -248,8 +248,13 @@
         </select>
       </label>
       <label class="muted small">最多帧数 <input type="number" id="up-max-frames" value="600" min="1" max="5000"></label>
-      <label class="muted small" title="默认按画面相似度丢掉近重复帧；动作很快、差异很小的视频可以勾上">
-        <input type="checkbox" id="up-keep-similar"> 保留近重复帧
+      <label class="muted small" title="抽出来的帧默认只跳过完全相同的帧。「近似去重」会把画面相近的帧当成同一帧丢掉：几条同场景的录像一起导，常十成只剩两三成">
+        帧去重
+        <select id="up-video-dedupe">
+          <option value="exact" selected>只跳过完全相同的帧</option>
+          <option value="perceptual">近似去重（画面相近只留 1 张）</option>
+          <option value="none">全部保留</option>
+        </select>
       </label>
     </div>
     <div class="set-note small" data-decoder-note hidden></div>

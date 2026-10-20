@@ -58,13 +58,18 @@ def test_opencv_fallback_admits_that_scene_sampling_is_lost(monkeypatch):
 # --------------------------------------------------------------------------- //
 # 抽帧分派
 # --------------------------------------------------------------------------- //
-def _fake_run_opencv(box):
+def _fake_run_opencv(box, count: int = 1):
     def run(clip, tmp, stem, fps, start, duration, max_side, max_frames, info):
         box.update({"fps": fps, "start": start, "duration": duration,
                     "max_frames": max_frames, "max_side": max_side})
-        Image.new("RGB", (32, 24)).save(os.path.join(tmp, "000000.jpg"))
-        return [(os.path.join(tmp, "000000.jpg"), f"{stem}_t500",
-                 {"video": clip, "time_sec": 0.5, "frame_index": 0, "video_fps": 25.0})], 1, False
+        entries = []
+        for i in range(count):
+            name = f"{i:06d}.jpg"
+            Image.new("RGB", (32, 24)).save(os.path.join(tmp, name))
+            entries.append((os.path.join(tmp, name), f"{stem}_t{i * 1000}",
+                            {"video": clip, "time_sec": float(i), "frame_index": i,
+                             "video_fps": 25.0}))
+        return entries, count, False
     return run
 
 
@@ -78,7 +83,8 @@ def test_scene_sampling_without_ffmpeg_degrades_instead_of_failing(tmp_path, mon
     prepared, extracted, backend, note = video.decode_frames(
         str(clip), str(tmp_path), "clip", 0.5, 0.3, 0.0, 0.0, 1600, 600, {"fps": 25.0})
     assert backend == "opencv" and extracted == 1 and len(prepared) == 1
-    assert "按镜头切换取样用不了" in note and "每 0.5 秒" in note
+    # 0.5 是**频率**不是间隔，以前提示写成「每 0.5 秒取 1 帧」，倍数正好说反
+    assert "按镜头切换取样用不了" in note and "每 2 秒 1 帧" in note
 
 
 def test_decode_without_any_backend_names_both_install_paths(tmp_path, monkeypatch):
@@ -113,6 +119,8 @@ def test_extract_frames_result_carries_the_backend_used(tmp_path, monkeypatch):
     assert result["backend"] == "opencv" and result["extracted"] == 1
     assert result["mode"] == "fps" and result["register"] is False
     assert captured["kwargs"]["register"] is False and captured["count"] == 1
+    # 抽出来的帧本来就是挑过的，默认不能再来一次近似去重
+    assert captured["kwargs"]["dedupe"] == "exact"
 
 
 # --------------------------------------------------------------------------- //
@@ -182,7 +190,7 @@ def test_real_extract_frames_land_in_the_pool(clip, tmp_path):
     for item in catalog["items"].values():
         assert item.get("video") == "现场录像.mp4", "临时上传名不该出现在界面上"
         assert item.get("batch") == job.batch_id
-    assert job.ingest_note() == "（视频 1 个抽出 3 帧、进池 3 帧）"
+    assert job.ingest_note() == "（视频 1 个抽出 3 帧、进池 3 帧，取样每 2 秒 1 帧）"
 
 
 def test_windows_gets_an_ascii_link_when_the_path_is_chinese(tmp_path, monkeypatch):
@@ -295,7 +303,12 @@ def test_videos_only_upload_does_not_touch_the_image_importer(monkeypatch, tmp_p
                         lambda *a, **k: pytest.fail("纯视频任务不该再走图片导入器"))
     job = upload_module.Job(id="onlyvideo", kind="pool", files=[stored["stored"]], params={})
     assert upload_module.JobStore(root)._ingest(job) == 0
+    # 没填频率就没有口径可报，但抽了几帧还得说
     assert job.ingest_note() == "（视频 1 个抽出 0 帧、进池 0 帧）"
+
+    rated = upload_module.Job(id="rated", kind="pool", files=[], params={"fps": 3.0})
+    rated.videos = [{"video": "a.mp4", "extracted": 0, "imported": 0, "note": ""}]
+    assert "取样每秒 3 帧" in rated.ingest_note()
 
 
 def test_library_index_records_the_readable_video_name(monkeypatch, tmp_path):
@@ -340,3 +353,177 @@ def test_upload_dialog_warns_before_a_video_is_wasted(page):
     assert 'data-decoder-note' in html, page
     common = read_static("common.js")
     assert "paintDecoderNotices" in common and "loadDecoderInfo" in common
+
+
+# --------------------------------------------------------------------------- //
+# 张数要能自证：取样口径、最多帧数截断、去重吃掉多少
+# --------------------------------------------------------------------------- //
+def test_sampling_lands_on_the_requested_grid(clip, monkeypatch):
+    """「每秒 2 帧」就得到 时长 × 2 帧，用户自己乘一遍就能核对。
+
+    以前步长取整数：25 fps 的视频 ``round(25/2) = 12``，实际间隔变成 0.48 秒，
+    6 秒的片子出 13 帧而不是 12 帧——多抽的没人抱怨，少抽的才被发现，
+    但根子是同一个：取样点没落在请求的格子上。
+    """
+    monkeypatch.setattr(video.shutil, "which", lambda name: None)
+    tmp = os.path.join(os.path.dirname(clip), "grid")
+    os.makedirs(tmp, exist_ok=True)
+
+    entries, extracted, _timed_out = video._run_opencv(
+        clip, tmp, "busy", 2.0, 0.0, 0.0, 1600, 600, video.probe_video(clip))
+    stamps = [row[2]["time_sec"] for row in entries]
+    assert extracted == 12, f"6 秒 × 每秒 2 帧该是 12 帧，实际 {extracted} 帧"
+    assert stamps[0] == 0.0
+    gaps = [round(b - a, 2) for a, b in zip(stamps, stamps[1:])]
+    assert set(gaps) <= {0.48, 0.52}, f"取样点没排在 0.5 秒的格子上：{gaps}"
+
+
+def test_a_capped_run_says_the_uncapped_number(tmp_path, monkeypatch):
+    """被「最多帧数」截断要报出整段本来该抽几帧：否则用户乘出来的数永远比实际大。"""
+    monkeypatch.setattr(video.shutil, "which", lambda name: None)
+    monkeypatch.setattr(video, "has_opencv", lambda: True)
+    monkeypatch.setattr(video, "_run_opencv", _fake_run_opencv({}, count=5))
+    monkeypatch.setattr(video, "probe_video",
+                        lambda path: {"duration": 60.0, "fps": 25.0, "backend": "opencv"})
+    root = str(tmp_path / "ds")
+    init_dataset(root)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00" * 8)
+
+    result = video.extract_frames(str(clip), root, fps=1.0, max_frames=5)
+    assert result["extracted"] == 5
+    assert "整段该抽 61 帧" in result["note"], result["note"]
+    assert "截到 5 帧" in result["note"], result["note"]
+
+
+def test_an_uncapped_run_does_not_claim_a_truncation(tmp_path, monkeypatch):
+    """没到上限就别硬说「已截断」：说错一次的解释比不解释更让人怀疑别的数字。"""
+    monkeypatch.setattr(video.shutil, "which", lambda name: None)
+    monkeypatch.setattr(video, "has_opencv", lambda: True)
+    monkeypatch.setattr(video, "_run_opencv", _fake_run_opencv({}, count=3))
+    monkeypatch.setattr(video, "probe_video",
+                        lambda path: {"duration": 8.0, "fps": 25.0, "backend": "opencv"})
+    root = str(tmp_path / "ds")
+    init_dataset(root)
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"\x00" * 8)
+
+    result = video.extract_frames(str(clip), root, fps=0.5, max_frames=600)
+    assert "最多帧数" not in result["note"], result["note"]
+
+
+def test_video_frames_are_not_deduped_by_sight_anymore(monkeypatch, tmp_path):
+    """抽帧默认只跳过完全相同的帧：画面相近就丢，同场景的录像会互相吃掉。
+
+    实测 5 条同机位录像抽出 264 帧，按旧的「近似去重」只剩 46 帧，
+    而提示写成「与已有素材内容相同」——用户知道自己没重传文件，只当软件在编理由。
+    """
+    root = str(tmp_path / "ds")
+    init_dataset(root)
+    stored = upload_module.save_upload(root, "a.mp4", b"\x00" * 16)
+    seen = {}
+
+    def fake_extract(path, dataset_root, **kwargs):
+        seen["dedupe"] = kwargs.get("dedupe")
+        return {"imported": 1, "reused": 0, "skipped_exact": 0, "skipped_similar": 0,
+                "failed": 0, "extracted": 1, "backend": "opencv", "note": "",
+                "imported_files": [(path, "帧_0.jpg")]}
+
+    monkeypatch.setattr(video, "extract_frames", fake_extract)
+    store = upload_module.JobStore(root)
+
+    store._ingest(upload_module.Job(id="plain", kind="pool",
+                                    files=[stored["stored"]], params={}))
+    assert seen["dedupe"] == "exact", seen
+
+    store._ingest(upload_module.Job(id="asked", kind="pool", files=[stored["stored"]],
+                                    params={"video_dedupe": "perceptual"}))
+    assert seen["dedupe"] == "perceptual", "用户真要省张数时还得能选近似去重"
+
+    junk = upload_module.Job(id="junk", kind="pool", files=[stored["stored"]],
+                             params={"video_dedupe": "looks-like"})
+    with pytest.raises(ValueError) as err:
+        store._ingest(junk)
+    assert "视频抽帧去重方式" in str(err.value)
+
+
+def test_the_note_names_the_rule_and_calls_similar_frames_what_they_are():
+    """完成消息：抽出多少、按什么抽、少了的为什么少，一句话里说完。"""
+    job = upload_module.Job(id="note", kind="pool", files=[], params={"fps": 2.0})
+    job.videos = [{"video": "现场.mp4", "extracted": 264, "imported": 46, "note": ""}]
+    job.counts = {"similar": 218}
+
+    note = job.ingest_note()
+    assert "视频 1 个抽出 264 帧、进池 46 帧" in note, note
+    assert "取样每秒 2 帧" in note, note
+    assert "218 张画面与已有素材接近" in note and "近似去重" in note, note
+    assert "内容相同" not in note, "近似去重不该说成内容相同"
+
+
+@pytest.mark.parametrize("page", ["pool.html", "review.html", "objects.html", "detect.html"])
+def test_dedupe_choice_is_three_way_and_safe_by_default(page):
+    """去重要摊开成三档、默认「只跳过完全相同的帧」：一个勾选框把吃帧藏在默认里。"""
+    html = read_static(page)
+    assert 'id="up-video-dedupe"' in html, page
+    assert '<option value="exact" selected>' in html, page
+    assert '<option value="perceptual">' in html, page
+    assert '<option value="none">' in html, page
+    assert "up-keep-similar" not in html, f"{page} 还留着旧的「保留近重复帧」勾选"
+
+
+@pytest.mark.parametrize("script", ["app.js", "pool.js", "objects.js"])
+def test_upload_scripts_send_the_chosen_dedupe(script):
+    assert 'readSelect("up-video-dedupe", "exact")' in read_static(script), script
+
+
+# --------------------------------------------------------------------------- //
+# 命令行：抽了多少、按什么口径、少掉的谁吃掉的
+# --------------------------------------------------------------------------- //
+def test_video_command_accepts_the_flag_name_auto_uses():
+    """`auto` 里的抽帧去重叫 `--video-dedupe`，`video` 里以前只认 `--dedupe`——
+    文档里那句 `--fps 2 --video-dedupe none` 照抄进 `video` 会被 argparse 拒成退出码 2。
+    同一个参数得两个写法都认，`--dedupe` 留着不破坏老脚本。"""
+    from autolabel.cli import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args(["video", "ds", "clip.mp4"]).dedupe == "exact"
+    assert parser.parse_args(
+        ["video", "ds", "clip.mp4", "--video-dedupe", "perceptual"]).dedupe == "perceptual"
+    assert parser.parse_args(["video", "ds", "clip.mp4", "--dedupe", "none"]).dedupe == "none"
+
+
+def test_frame_summary_names_the_rule_and_splits_the_two_skips():
+    """少掉的帧要说清是谁吃掉的：近似去重和「最多帧数」截断，补救办法完全不同。"""
+    from autolabel.cli import _frame_summary
+
+    lines = _frame_summary({"extracted": 43, "mode": "fps", "skipped_exact": 2,
+                            "skipped_similar": 7, "reused": 3,
+                            "note": "整段该抽 61 帧，已按「最多帧数」截到 43 帧（要全抽就调大上限）"},
+                           2.0, ingested=36)
+    assert lines[0].startswith("抽出 43 帧（fps，每秒 2 帧）→ 入库 36 帧"), lines[0]
+    assert "近似去重 7" in lines[0] and "内容相同 2" in lines[0]
+    assert "复用素材池 3" in lines[0]
+    assert lines[1].startswith("整段该抽 61 帧"), lines
+
+    scene = _frame_summary({"extracted": 9, "mode": "scene"}, 0.5, ingested=9)
+    assert scene == ["抽出 9 帧（scene）→ 入库 9 帧"], "按镜头切点取样没有固定频率可报"
+
+
+def test_video_command_prints_the_cap_that_ate_the_frames(tmp_path, monkeypatch, capsys):
+    """截断提示以前只待在 ``result["note"]`` 里，命令行用户永远看不到——
+    他只看到「抽出 5 帧」，跟视频时长乘频率乘出来的 44 帧对不上。"""
+    from autolabel.cli import main
+
+    root = str(tmp_path / "ds")
+    init_dataset(root)
+    monkeypatch.setattr(video, "extract_frames", lambda *a, **kw: {
+        "imported": 5, "reused": 0, "skipped_exact": 0, "skipped_similar": 0, "failed": 0,
+        "imported_files": [(None, f"images/f{i}.jpg") for i in range(5)],
+        "extracted": 5, "mode": "fps", "backend": "opencv",
+        "video_info": {"duration": 21.5, "width": 2560, "height": 1440, "fps": 25.0},
+        "note": "整段该抽 44 帧，已按「最多帧数」截到 5 帧（要全抽就调大上限）"})
+
+    assert main(["video", root, str(tmp_path / "clip.mp4"), "--fps", "2", "--max-frames", "5"]) == 0
+    out = capsys.readouterr().out
+    assert "每秒 2 帧" in out, out
+    assert "整段该抽 44 帧" in out, out

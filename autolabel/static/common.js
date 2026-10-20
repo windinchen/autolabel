@@ -15,6 +15,11 @@ const readNumber = (id, fallback) => {
   const raw = node ? parseFloat(node.value) : NaN;
   return Number.isFinite(raw) ? raw : fallback;
 };
+// 下拉框取当前选项值：控件不在（老页面缓存、部分页面没这块面板）就回落默认值。
+const readSelect = (id, fallback) => {
+  const node = $(id);
+  return node && node.value ? String(node.value) : fallback;
+};
 
 // 导出训练集时留作验证集的比例。三个导出入口（门户面板 / 姿态页菜单 / 两个库的面板）
 // 共用这一个默认，只有门户面板上有输入框可改；写死三遍迟早有三个数。

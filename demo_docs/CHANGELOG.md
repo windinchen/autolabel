@@ -1,5 +1,53 @@
 # 变更记录
 
+## 2026-10-20 13:40 — v1.4.21：视频拆帧不再"看着像就丢"，张数能自己乘出来
+
+用户反馈"视频帧拆分成图，感觉数量不对"。用自己那批素材复算：5 条同机位录像（21~32 秒、
+25fps）每秒抽 2 帧共抽出 256 帧，实际进池只有 **48 帧**——差的 208 帧是抽出来之后被
+"近似去重"当重复帧扔掉的，而提示写的是"与已有素材内容相同"。
+
+### 一、默认去重档位
+
+- 抽帧入库默认 `perceptual` → **`exact`**：只跳过字节完全相同的帧，画面相近的帧留着。
+- 四个上传弹层的「保留近重复帧」勾选框 → 三档下拉 `up-video-dedupe`：
+  只跳过完全相同的帧（默认）/ 近似去重（画面相近只留 1 张）/ 全部保留，
+  `app.js` / `pool.js` / `objects.js` 改读 `readSelect("up-video-dedupe", "exact")`。
+- `upload.duplicate_note()` 分开措辞：**内容完全相同** 与 **画面接近（近似去重）**；
+  `JobStore._tally()` 把 `skipped_similar` 单记成 `counts["similar"]`，不再混进"内容相同"。
+
+### 二、取样格子
+
+- `video._sample_interval()` 跨距保留小数（25fps 要每秒 2 帧就是 12.5 帧一跨），
+  `_sample_opencv()` 按 `want = first + interval × 已留帧数` 取最近的一帧：
+  张数 = `floor(时长 × 频率) + 1`，与 ffmpeg `fps` 滤镜同口径（旧实现每 0.48 秒一帧）。
+- `video.planned_frames()` 算出整段本来该抽几帧；被「最多帧数」截断时把它写进 note：
+  「整段该抽 61 帧，已按「最多帧数」截到 5 帧（要全抽就调大上限）」。
+
+### 三、消息与校验
+
+- `Job.ingest_note()` 加取样口径：「视频 5 个抽出 256 帧、进池 256 帧，取样每秒 2 帧」。
+- `upload.dedupe_mode()` 白名单 `none` / `exact` / `perceptual`，填错报中文错；
+  `ReviewHandler._dedupe_mode()` 在提示词标注与目标检测标注两个入口调用它。
+- 缺 ffmpeg 退回定时取样的提示不再把频率说成间隔：「每 0.5 秒取 1 帧」→「每 2 秒 1 帧」
+  （`video.sampling_rule()` 统一这一处措辞）。
+
+### 四、命令行与文档
+
+- `video` 的 `--dedupe` 加上别名 `--video-dedupe`（同一个 dest，与 `auto` 同名同义）：
+  文档里 `--fps 2 --video-dedupe none` 那句喂给 `video` 会被 argparse 拒成退出码 2。
+- `cli._frame_summary()`：`video` 与 `auto` 的终端输出带上取样口径、
+  按 kind 拆开的跳过数、以及原先只待在 `result["note"]` 里的截断/兜底提示。
+- `demo_docs/02-命令行参考.md` 24 段 `--help` 按当前代码重生成，修掉十几处漂移
+  （`--device` 少了 `cuda:0/cuda:1`、`settings` 少 `--reset/--json`、`launch` 少 `--wait`）。
+
+### 验证
+
+- 全量 **1340 通过 / 8 跳过**（新增 15 项，全在 `tests/test_video_import.py`）。
+- 同一批录像同一命令：旧默认进池 48 帧，新默认进池 256 帧。
+- 真实录像走命令行：`--fps 2 --video-dedupe exact` 一条 21.5 秒录像出 44 帧全部入库
+  （`floor(21.5×2)+1 = 44`）；换 `--max-frames 5 --video-dedupe perceptual` 出
+  「抽出 5 帧 → 入库 1 帧（跳过 近似去重 4）」并补一句「整段该抽 44 帧…」。
+
 ## 2026-10-20 12:43 — v1.4.20：进度条一份口径、弹层一个关闭键、素材池四种显示方式、版本一键更新
 
 五条来自实际使用的抱怨：进度条停在 60% 装死、弹窗找不到关闭键、素材库没法管理、

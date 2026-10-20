@@ -942,7 +942,7 @@ async function startUpload() {
     category: readImportCategory("up-category"),
     fps: readNumber("up-fps", 0.5),
     max_frames: Math.round(readNumber("up-max-frames", 600)),
-    video_dedupe: $("up-keep-similar").checked ? "none" : "perceptual",
+    video_dedupe: readSelect("up-video-dedupe", "exact"),
   };
   for (const kind of ["video", "image"]) {
     if (!stored[kind].length) { continue; }

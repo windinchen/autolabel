@@ -50,13 +50,37 @@ def duplicate_note(counts: dict) -> str:
 
     以前完成消息里的"已进池 255 张"把被去重跳过的张数也算进去了，界面上看着一张没少，
     池里却只有 169 个文件——少了东西又不说少了什么，比少进更让人不信任。
+
+    「内容完全相同」和「画面近似」必须分开说：抽出来的视频帧几乎不会字节相同，
+    它们是被**近似去重**吃掉的。把它们说成「内容相同」，而用户手上那 255 个文件
+    确实一个都不重样，读到的就是「软件在编理由」。
     """
     parts = []
     if counts.get("duplicates"):
         parts.append(f"{counts['duplicates']} 张与已有素材内容相同，没有重复入库")
+    if counts.get("similar"):
+        parts.append(f"{counts['similar']} 张画面与已有素材接近，"
+                     f"按「近似去重」每个画面只留 1 张")
     if counts.get("failed"):
         parts.append(f"{counts['failed']} 个文件读不出图片")
     return f"（{'，'.join(parts)}）" if parts else ""
+
+
+DEDUPE_MODES = ("none", "exact", "perceptual")
+
+
+def dedupe_mode(value: object, name: str = "去重方式", default: str = "exact") -> str:
+    """把界面递交的去重方式收成 ``none`` / ``exact`` / ``perceptual`` 三种之一。
+
+    这个值决定抽出来的帧会被吃掉多少：``perceptual`` 把画面相近的帧当成同一帧丢掉，
+    视频帧几乎全中招——5 条录像抽出 264 帧只剩 46 张就是这么来的。所以默认走
+    ``exact``（只跳过字节完全相同的帧），而且传进来一个不认识的词要报错：以前它会
+    被下游当成「不去重」或「近似去重」默默改掉行为，比直接失败难查得多。
+    """
+    mode = str(value if value is not None else "").strip().lower() or default
+    if mode not in DEDUPE_MODES:
+        raise ValueError(f"{name}只能是 {' / '.join(DEDUPE_MODES)}，现在是 {mode}")
+    return mode
 
 
 def prune_stale_uploads(root: str, max_age_hours: float = STALE_UPLOAD_HOURS) -> dict:
@@ -282,6 +306,11 @@ class Job:
             got = sum(int(row.get("extracted") or 0) for row in self.videos)
             kept = sum(int(row.get("imported") or 0) for row in self.videos)
             parts.append(f"视频 {len(self.videos)} 个抽出 {got} 帧、进池 {kept} 帧")
+            from .video import sampling_rule
+
+            rule = sampling_rule(self.params.get("fps"))
+            if rule:
+                parts.append(f"取样{rule}")
             parts.extend(sorted({str(row.get("note") or "") for row in self.videos if row.get("note")}))
         return f"（{'，'.join(parts)}）" if parts else ""
 
@@ -605,7 +634,7 @@ class JobStore:
             imported += self._extract(job, videos, register=register, lib=lib)
         if stills:
             stats = import_images(self.root, stills, max_side=max_side,
-                                  dedupe=str(job.params.get("dedupe", "exact")),
+                                  dedupe=dedupe_mode(job.params.get("dedupe"), "图片去重方式"),
                                   lib=lib, register=register)
             self._tally(job, stats)
             job.ingested.extend(rel for _src, rel in stats.get("imported_files", []))
@@ -631,7 +660,8 @@ class JobStore:
                                     start=float(job.params.get("start") or 0.0),
                                     duration=job.params.get("duration"),
                                     max_side=int(job.params.get("max_side", 1600)),
-                                    dedupe=str(job.params.get("video_dedupe", "perceptual")),
+                                    dedupe=dedupe_mode(job.params.get("video_dedupe"),
+                                                       "视频抽帧去重方式"),
                                     lib=lib, register=register)
             imported += int(result["imported"]) + int(result.get("reused") or 0)
             self._tally(job, result)
@@ -670,10 +700,16 @@ class JobStore:
 
     @staticmethod
     def _tally(job: Job, stats: dict) -> None:
-        """把去重跳过 / 读取失败的分项累加到任务上，供完成消息原样报出来。"""
+        """把去重跳过 / 读取失败的分项累加到任务上，供完成消息原样报出来。
+
+        「完全相同」和「画面近似」分开记：前者是用户真的重传了同一个文件，后者
+        多半是同一场戏的相邻帧。混成一句「内容相同」，用户明明没重传，只能认为
+        软件在找借口。
+        """
         job.counts["duplicates"] = (int(job.counts.get("duplicates") or 0)
-                                    + int(stats.get("skipped_exact") or 0)
-                                    + int(stats.get("skipped_similar") or 0))
+                                    + int(stats.get("skipped_exact") or 0))
+        job.counts["similar"] = (int(job.counts.get("similar") or 0)
+                                + int(stats.get("skipped_similar") or 0))
         job.counts["failed"] = int(job.counts.get("failed") or 0) + int(stats.get("failed") or 0)
 
     def _label(self, job: Job) -> dict:
