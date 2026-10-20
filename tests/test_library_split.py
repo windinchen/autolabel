@@ -446,7 +446,6 @@ def test_reading_a_library_backfills_the_index_the_old_dataset_never_had(dataset
 
 def test_a_directory_that_is_not_a_dataset_still_says_init(tmp_path):
     """补齐只救"老数据集缺本新账本"，不能把随便一个目录认成数据集。"""
-    import pytest
 
     from autolabel.library import index_path
 
