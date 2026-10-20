@@ -1132,7 +1132,10 @@ button.catalog-refresh svg { width: 14px; height: 14px; fill: none; stroke: curr
 #pool-grid .tree-caret svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.8; }
 #pool-grid .tree-name { font-weight: 600; font-size: calc(12.5px * var(--fs));
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-#pool-grid .tree-nums { flex: 0 0 auto; white-space: nowrap; font-variant-numeric: tabular-nums; }
+#pool-grid .tree-nums { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-variant-numeric: tabular-nums; }
+#pool-grid .tree-time { color: var(--ink-3); }
+.pool-card-when { display: block; white-space: nowrap; color: var(--ink-3); }
 #pool-grid .tree-pick { flex: 0 0 auto; margin-left: auto; padding: 3px 10px;
   font-size: calc(11.5px * var(--fs)); }
 #pool-grid .pool-row.lv2 { padding-left: 58px; }

@@ -122,8 +122,10 @@ function renderPoolStats() {
     el.querySelector(".stat-hint").textContent = cell.hint;
     box.append(el);
   }
+  const latest = poolTimeRange(POOL.rows);
   $("pool-note-brief").textContent = `共 ${files} 个素材 · ${kb(stats.bytes || 0)}`
-    + ` · 还没入库 ${unassigned} 个`;
+    + ` · 还没入库 ${unassigned} 个`
+    + (latest.max ? ` · 最新添加 ${latest.max.slice(0, 16)}` : "");
 }
 
 /** 分类条：全部 + 每个分类 + 未分类。张数直接取后端算好的，页面自己不凑数。 */
@@ -266,6 +268,14 @@ function poolCard(row) {
   const sub = document.createElement("div");
   sub.className = "muted small";
   sub.textContent = bits.join(" · ");
+  // 添加时间单独一行：卡片窄，跟着体积挤一行会把「534 KB」从中间劈开
+  if (row.imported_at) {
+    const when = document.createElement("span");
+    when.className = "pool-card-when";
+    when.textContent = String(row.imported_at).slice(0, 16);
+    when.title = "添加时间 " + row.imported_at;
+    sub.append(when);
+  }
   const chips = document.createElement("div");
   chips.className = "pool-card-chips";
   chips.append(chipRow(row));
@@ -341,6 +351,29 @@ function poolRow(row, level) {
   return line;
 }
 
+/** 一组素材的添加时间：取最早和最晚两条。一条时间都没有就返回空，界面上不写「时间未知」占位。 */
+function poolTimeRange(rows) {
+  let min = "";
+  let max = "";
+  for (const row of rows) {
+    const at = String(row.imported_at || "");
+    if (!at) { continue; }
+    if (!min || at < min) { min = at; }
+    if (!max || at > max) { max = at; }
+  }
+  return { min, max };
+}
+
+/** 时间文案：同一分钟只写一个点，同一天省掉重复日期，跨天写成「月日时分 ~ 月日时分」。 */
+function poolTimeText(range) {
+  if (!range || !range.min) { return ""; }
+  if (range.min.slice(0, 16) === range.max.slice(0, 16)) { return "添加于 " + range.min.slice(0, 16); }
+  if (range.min.slice(0, 10) === range.max.slice(0, 10)) {
+    return `添加于 ${range.min.slice(0, 10)} ${range.min.slice(11, 16)}~${range.max.slice(11, 16)}`;
+  }
+  return `添加于 ${range.min.slice(5, 16)} ~ ${range.max.slice(5, 16)}`;
+}
+
 /** 目录树：分类 → 来源批次 → 素材。素材一多、又混着好几批导入时，按层级清库存比翻网格快。 */
 function renderPoolTree(box, rows) {
   const tree = new Map();
@@ -371,6 +404,7 @@ function renderPoolTree(box, rows) {
     box.append(treeHead({
       key, level: 0, closed: POOL.collapsed.has(key), label: cat.name,
       count: cat.count, bytes: cat.bytes,
+      time: poolTimeRange([...cat.batches.values()].flatMap((b) => b.rows)),
       extra: cat.batches.size > 1 ? `${cat.batches.size} 个来处` : "",
     }));
     if (POOL.collapsed.has(key)) { continue; }
@@ -382,6 +416,7 @@ function renderPoolTree(box, rows) {
         box.append(treeHead({
           key: bkey, level: 1, closed: POOL.collapsed.has(bkey), label: batch.name,
           count: batch.rows.length, bytes: batch.bytes,
+          time: poolTimeRange(batch.rows),
         }));
         if (POOL.collapsed.has(bkey)) { continue; }
       }
@@ -402,8 +437,19 @@ function treeHead(opts) {
   name.textContent = opts.label;
   const nums = document.createElement("span");
   nums.className = "tree-nums muted small";
-  nums.textContent = `${opts.count} 个 · ${kb(opts.bytes || 0)}`
+  const sum = document.createElement("span");
+  sum.textContent = `${opts.count} 个 · ${kb(opts.bytes || 0)}`
     + (opts.extra ? " · " + opts.extra : "");
+  nums.append(sum);
+  // 体积后面紧跟添加时间：几百张混着好几批时，靠时间才分得清哪批是刚灌进来的
+  const timeText = poolTimeText(opts.time);
+  if (timeText) {
+    const time = document.createElement("span");
+    time.className = "tree-time";
+    time.textContent = " · " + timeText;
+    time.title = `最早 ${opts.time.min} · 最新 ${opts.time.max}`;
+    nums.append(time);
+  }
   const pick = document.createElement("button");
   pick.type = "button";
   pick.className = "peek tree-pick";

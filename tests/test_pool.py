@@ -818,3 +818,29 @@ def test_broken_pool_ledger_is_kept_before_being_rewritten(dataset):
     pool_catalog.save_category(dataset, "重新建的一类")
     assert any(row["name"] == "重新建的一类"
                for row in pool_catalog.load_catalog(dataset)["categories"])
+
+
+def test_pool_api_rows_carry_the_import_time(server, dataset):
+    """界面上每一处「添加时间」都直接取后端给的 imported_at，前端不猜：
+    清单里少这个字段，树和卡片就只能空着或显示「时间未知」。"""
+    status, _headers, body = call(server[0], "/api/pool")
+    assert status == 200, body
+    rows = json.loads(body)["files"]
+    assert rows, "fixture 里至少该有素材"
+    for row in rows:
+        assert row.get("imported_at"), f"{row['image']} 没带添加时间"
+
+
+def test_pool_tree_and_cards_show_when_each_batch_was_added():
+    """体积后面要跟上添加时间：池子里几百张又混着好几批导入时，
+    只有「255 个 · 141.0 MB」根本分不清哪批是刚灌进来的。"""
+    js = read_static("pool.js")
+    assert "function poolTimeRange" in js and "function poolTimeText" in js, "没有算一组添加时间的统一算法"
+    assert "time: poolTimeRange([...cat.batches.values()].flatMap((b) => b.rows))" in js, "分类头没带时间"
+    assert "time: poolTimeRange(batch.rows)" in js, "批次头没带时间"
+    assert 'time.className = "tree-time"' in js, "时间没进树头那一行"
+    assert 'when.className = "pool-card-when"' in js, "卡片副标题没带时间"
+    assert 'String(row.imported_at).slice(0, 16)' in js, "卡片时间没截到分钟"
+    assert ".pool-card-when { display: block; white-space: nowrap;" in read_static("app.css"), \
+        "卡片时间没独占一行，会把体积那行折断"
+    assert "最新添加" in js, "顶栏概要没写最近一次添加"
