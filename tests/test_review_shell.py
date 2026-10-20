@@ -588,3 +588,26 @@ def test_every_page_carries_exactly_one_tab_icon():
     """每页只留一枚品牌图标：老页面上那两枚绿色旧图标和标签页上的品牌对不上。"""
     for page in SIX_PAGES:
         assert read(page).count('rel="icon"') == 1, f"{page} 的标签页图标不止一枚"
+
+
+def test_annotation_pages_agree_on_which_button_is_the_next_step():
+    """三个标注页的主次必须一致：批量标注才是这个模块的下一步（琥珀实心），导入素材退一档。
+
+    姿态页以前正好反了——导入素材是实心琥珀、批量标注是灰的，同一个动作在三个页面上
+    指着不同的颜色，用户换页就得重新判断该点哪个。素材池反过来：那页的下一步就是导入。
+    """
+    def button_class(html, btn_id):
+        for tag in re.findall(r"<button[^>]*>", html):
+            if f'id="{btn_id}"' in tag:
+                found = re.search(r'class="([^"]*)"', tag)
+                return found.group(1) if found else ""
+        raise AssertionError(f"页面上找不到 #{btn_id}")
+
+    for page in ("review.html", "objects.html", "detect.html"):
+        html = read(page)
+        assert "primary" in button_class(html, "btn-run"), \
+            f"{page} 的「批量标注」没当主操作，和另外两个标注页不一致"
+        assert "primary" not in button_class(html, "btn-upload"), \
+            f"{page} 的「导入素材」抢了主操作的位置，和另外两个标注页不一致"
+    assert "primary" in button_class(read("pool.html"), "btn-upload"), \
+        "素材池那页的下一步就是导入，必须是主操作"
