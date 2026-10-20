@@ -201,12 +201,21 @@ class_id cx cy w h  x1 y1 v1  x2 y2 v2 ... x17 y17 v17
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/pool.png" width="404" alt="素材池页：素材归池、标注归库，按分类与批次管理，删错了能捞回">
+  <img src="docs/screenshots/pool.png" width="404" alt="素材池页：素材归池、标注归库，每张下面写着尺寸与添加时间，按分类与批次管理，删错了能捞回">
   <img src="docs/screenshots/models.png" width="404" alt="模型管理页：模型目录、任务筛选、搜索框、本机模型列表与各模块默认模型">
 </p>
 
 <p align="center">
-  <sub>左：素材池（<code>/pool</code>）—— 三个库共用的素材只落盘一份，分类与来处章跟着素材走<br>右：模型管理（<code>/models</code>）—— 中文说明、体积、参数量、自带类别表，下载与默认模型都在这一处</sub>
+  <sub>左：素材池（<code>/pool</code>）—— 三个库共用的素材只落盘一份，每张的尺寸与<b>添加时间</b>都写在卡片上<br>右：模型管理（<code>/models</code>）—— 中文说明、体积、参数量、自带类别表，下载与默认模型都在这一处</sub>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/pool-add.png" width="700" alt="从素材池添加：分类 / 批次 / 文件名三条筛选，已勾的换筛选不丢，右下角可顺手归类">
+</p>
+
+<p align="center">
+  <sub><b>从素材池添加</b> —— 四个库共用这一个挑选弹层：按<b>分类</b>、按<b>来处批次</b>、按<b>文件名</b>三条「且」筛选，
+  已勾的换筛选不丢，筛到空时提示里直接给「清空筛选」；每行底下还写着它属于哪个分类、哪一批</sub>
 </p>
 
 <p align="center">
