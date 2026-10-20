@@ -533,3 +533,58 @@ def test_pose_page_got_the_batch_panel_the_other_two_already_had():
     assert 'postJson("/api/pose/run"' in source and "function initRun()" in source
     assert 'case "g": case "G": openRun(true)' in source
     assert "initRun();" in source, "面板没接线的话按 G 只会静悄悄什么也不做"
+
+
+# --------------------------------------------------------------------------- //
+# 外观适配：白天主题与「特大」字号下最容易露馅的三处
+# --------------------------------------------------------------------------- //
+FIRST_PAINT = re.compile(r"<script>\s*/\* 首屏先把主题与字号定好.*?</script>", re.S)
+SIX_PAGES = ("portal.html", "review.html", "objects.html", "detect.html", "pool.html", "models.html")
+
+
+def test_first_paint_scripts_are_byte_identical():
+    """六页首屏定主题的脚本必须逐字节一致，否则切到那一页会先闪一下默认主题再纠正。"""
+    blocks = set()
+    for page in SIX_PAGES:
+        found = FIRST_PAINT.findall(read(page))
+        assert len(found) == 1, f"{page} 的首屏外观脚本应该恰好一段，实到 {len(found)} 段"
+        blocks.add(found[0])
+    assert len(blocks) == 1, "有一页的首屏脚本和别人不一样，切过去会闪一下默认主题"
+
+
+def test_url_can_pin_the_appearance():
+    """地址栏 ?theme=&fs= 能钉住外观：分享链接、截图核对、固定某个主题都靠它。"""
+    block = FIRST_PAINT.findall(read("portal.html"))[0]
+    assert "location.search" in block and 'pick("theme"' in block and 'pick("fs"' in block
+
+
+def test_document_page_cards_have_a_surface_of_their_own():
+    """三个文档页共用的卡片壳必须有底色：只描边的话白天会和纸底同色，等于卡片没画。"""
+    css = read("app.css")
+    block = re.search(r"\.model-section \{([^}]*)\}", css)
+    assert block and "var(--surface)" in block.group(1), ".model-section 没有底色，白天会沉进页面背景"
+
+
+def test_chips_grow_instead_of_clipping_the_text():
+    """胶囊/徽标/顶底栏不许写死高度：字号开到「特大」时字比盒子高，下半截会被削掉。"""
+    css = read("app.css")
+    for sel in (r"header \{", r"footer \{", r"\.capsule \{", r"\.vchip \{",
+                r"\.searchbtn \{", r"\.cat-chip \{"):
+        block = re.search(r"(?m)^" + sel + r"[^}]*\}", css)
+        assert block, f"找不到 {sel} 的样式块"
+        body = block.group(0)
+        assert "min-height" in body, f"{sel} 写死了高度，特大字号下会被削字"
+        assert not re.search(r"(?<![-\w])height:", body), f"{sel} 还留着固定 height"
+
+
+def test_the_command_entry_never_wraps_onto_two_lines():
+    """命令入口窄窗口下折成两行会把顶栏撑歪：宽度让它自己缩，文字禁止换行。"""
+    css = read("app.css")
+    body = re.search(r"\.searchbtn \{[^}]*\}", css).group(0)
+    assert "white-space: nowrap" in body and "min-width: 0" in body
+
+
+def test_every_page_carries_exactly_one_tab_icon():
+    """每页只留一枚品牌图标：老页面上那两枚绿色旧图标和标签页上的品牌对不上。"""
+    for page in SIX_PAGES:
+        assert read(page).count('rel="icon"') == 1, f"{page} 的标签页图标不止一枚"

@@ -4,23 +4,34 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>提示词标注</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23141a22'/%3E%3Cg fill='none' stroke='%2343b581' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M16 12v8M16 14l-5 3M16 14l5 3M16 20l-4 6M16 20l4 6'/%3E%3C/g%3E%3Ccircle cx='16' cy='8' r='3.2' fill='%2343b581'/%3E%3C/svg%3E">
 
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='2.2' y='3.4' width='11.6' height='9.2' rx='1.6' fill='none' stroke='%234ade80' stroke-width='1.3'/%3E%3Ccircle cx='11.4' cy='5.9' r='1.3' fill='%234ade80'/%3E%3Cpath d='M4.4 10.6 L6.6 7.6 L8.4 9.8 L10.2 7.2 L11.8 10.6' stroke='%234ade80' stroke-width='1.2' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230A0D0F'/%3E%3Cg fill='none' stroke='%23FFB224' stroke-width='2.2' stroke-linecap='round'%3E%3Cpath d='M16 12v8M16 14l-5 3M16 14l5 3M16 20l-4 6M16 20l4 6'/%3E%3C/g%3E%3Ccircle cx='16' cy='8' r='3.2' fill='%23FFB224'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/app.css">
 <script>
-/* 首屏先把主题与字号定好，免得先黑后白闪一下；选择存在这台浏览器，四个页面共用 */
+/* 首屏先把主题与字号定好，免得先黑后白闪一下；选择存在这台浏览器，六个页面共用。
+   地址栏 ?theme=light|dark&fs=0~3 可临时钉住外观（分享链接、截图核对用），钉住即写回本地，翻页不丢。 */
 (function () {
-  try {
-    var a = JSON.parse(localStorage.getItem("autolabel.appearance") || "{}") || {};
-    var pref = ["light", "dark"].indexOf(a.theme) >= 0 ? a.theme : "auto";
-    var light = pref === "light" ||
-      (pref === "auto" && window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
-    var r = document.documentElement;
-    r.dataset.theme = light ? "light" : "dark";
-    r.dataset.themePref = pref;
-    r.dataset.fs = ["0", "2", "3"].indexOf(String(a.fs)) >= 0 ? String(a.fs) : "1";
-  } catch (e) { /* 读不到就用默认：跟随系统 + 标准字号 */ }
+  var q = {};
+  try { new URLSearchParams(location.search).forEach(function (v, k) { q[k] = v; }); } catch (e) { q = {}; }
+  var a = {};
+  try { a = JSON.parse(localStorage.getItem("autolabel.appearance") || "{}") || {}; } catch (e) { a = {}; }
+  var pick = function (name, order, fallback) {
+    if (order.indexOf(String(q[name])) >= 0) { return String(q[name]); }
+    if (order.indexOf(String(a[name])) >= 0) { return String(a[name]); }
+    return fallback;
+  };
+  var pref = pick("theme", ["light", "dark"], "auto");
+  var fs = pick("fs", ["0", "2", "3"], "1");
+  var light = pref === "light" ||
+    (pref === "auto" && window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches);
+  var r = document.documentElement;
+  r.dataset.theme = light ? "light" : "dark";
+  r.dataset.themePref = pref;
+  r.dataset.fs = fs;
+  if (q.theme || q.fs) {
+    try { localStorage.setItem("autolabel.appearance", JSON.stringify({ theme: pref, fs: fs })); }
+    catch (e) { /* 无痕模式忽略 */ }
+  }
 })();
 </script>
 </head>

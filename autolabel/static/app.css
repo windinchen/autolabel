@@ -6,26 +6,37 @@
    旧变量名（--bg/--fg/--accent…）全部保留并映射到新令牌，避免历史页面掉色。
    ========================================================================== */
 :root {
-  --base: #0E1113;          /* 画布与最底层 */
-  --surface: #15191C;       /* 面板 */
-  --surface-2: #1B2024;     /* 控件底 / 悬停 */
-  --surface-3: #22282D;     /* 选中底 */
-  --well: #0A0C0E;          /* 内凹：日志、输入 */
-  --ink: #F1EFEA;           /* 主文（骨白） */
-  --ink-2: #A3AAAF;         /* 次文 */
-  --ink-3: #6E767C;         /* 弱文 / 占位 */
-  --hairline: color-mix(in srgb, var(--ink) 8.5%, transparent);
-  --hairline-2: color-mix(in srgb, var(--ink) 5%, transparent);
-  --amber: #F5A524;         /* 唯一强调色：下一步、主操作、焦点队列 */
-  --jade: #46D39A;          /* 已接受 / 完成 */
-  --coral: #FF6B57;         /* 可疑 / 驳回 */
-  --sky: #79B8FF;           /* 选中对象 */
-  --violet: #C9A6FF;        /* 提示词模块标识 */
-  --violet-ink: #C9A6FF;    /* 紫底上的字 */
-  --coral-ink: #FF9382;     /* 珊瑚红用在文字上时提亮 */
-  --on-accent: #14171A;     /* 实色块上的字（比如红色编号牌） */
+  --base: #0A0D0F;          /* 画布与最底层 */
+  --surface: #151B20;       /* 面板 */
+  --surface-2: #1E262D;     /* 控件底 / 悬停 */
+  --surface-3: #2A343C;     /* 选中底 */
+  --well: #06090B;          /* 内凹：日志、输入 */
+  --ink: #F3F1EC;           /* 主文（骨白） */
+  --ink-2: #B2BAC0;         /* 次文 */
+  --ink-3: #8B949B;         /* 弱文 / 占位：压在面板上仍有 5.5:1，别再用它写正文 */
+  --hairline: color-mix(in srgb, var(--ink) 13%, transparent);
+  --hairline-2: color-mix(in srgb, var(--ink) 7%, transparent);
+  --amber: #FFB224;         /* 唯一强调色：下一步、主操作、焦点队列 */
+  --jade: #3FDCA0;          /* 已接受 / 完成 */
+  --coral: #FF7A63;         /* 可疑 / 驳回 */
+  --sky: #66B8FF;           /* 选中对象 */
+  --violet: #C7A3FF;        /* 提示词模块标识 */
+  --violet-ink: #C7A3FF;    /* 紫底上的字 */
+  --coral-ink: #FFA292;     /* 珊瑚红用在文字上时提亮 */
+  --on-accent: #0A0D0F;     /* 实色块上的字（比如红色编号牌） */
   --shadow: #000;           /* 阴影与深色渐隐的基准 */
-  --inset-hi: rgba(255, 255, 255, .03);
+  --inset-hi: rgba(255, 255, 255, .04);
+  /* 实心色块：主操作与「你在这」用整块颜色，别再用 12% 淡底 + 淡字（像禁用态）。
+     名字后缀式命名是刻意的：--sky-fill 里含 --sky，选择器断言才不会误判。 */
+  --amber-fill: #FFB224;
+  --jade-fill: #35D89B;
+  --coral-fill: #FF7057;
+  --sky-fill: #66B8FF;
+  --fill-ink: #0A0D0F;      /* 玉/珊瑚/天蓝实色块上的字 */
+  --amber-fill-ink: #0A0D0F;/* 琥珀实色块上的字（白天要换成深棕） */
+  --caret: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.8 4.6 6 7.8l3.2-3.2' fill='none' stroke='%238B949B' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --e-up: 0 -12px 26px color-mix(in srgb, var(--shadow) 48%, transparent);
+  color-scheme: dark;
   --scrim: color-mix(in srgb, var(--base) 74%, transparent);
   --canvas-veil: rgba(10, 12, 14, .82);   /* 压在图片上的 HUD，两种主题都保持深 */
   /* 历史别名：老页面只认这些名字 */
@@ -50,6 +61,8 @@
 }
 
 * { box-sizing: border-box; }
+/* 滚动条也归设计系统管：轨道透明、滑块走 --surface-3，白天夜里都只比面板亮/暗一档 */
+*, *::before, *::after { scrollbar-width: thin; scrollbar-color: var(--surface-3) transparent; }
 body {
   margin: 0; background: var(--base); color: var(--ink);
   font: calc(13.5px * var(--fs))/1.5 var(--ui); height: 100vh; overflow: hidden;
@@ -71,10 +84,10 @@ kbd, .kbd {
 }
 
 /* -------------------------------------------------------------------------- */
-/* 应用壳：顶栏（≤52px）· 品牌 · 模块切换 · 数据集胶囊 · 命令入口 · 溢出菜单 */
+/* 应用壳：顶栏（默认 52px，字号开大时自己撑高）· 品牌 · 模块切换 · 数据集胶囊 · 命令入口 · 溢出菜单 */
 /* -------------------------------------------------------------------------- */
 header {
-  display: flex; align-items: center; gap: var(--s3); height: 52px; padding: 0 var(--s3);
+  display: flex; align-items: center; gap: var(--s3); min-height: 52px; padding: 0 var(--s3);
   background: var(--surface); border-bottom: 1px solid var(--hairline); flex: 0 0 auto;
 }
 header .brand {
@@ -87,7 +100,7 @@ header .brand:hover { color: var(--amber); }
   max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 @media (max-width: 1280px) { #ds-name { display: none; } }
 .capsule {
-  display: inline-flex; align-items: center; gap: 7px; height: 26px; padding: 0 11px;
+  display: inline-flex; align-items: center; gap: 7px; min-height: 26px; padding: 2px 11px;
   border: 1px solid var(--hairline); border-radius: var(--r-pill); background: var(--surface-2);
   font-size:  calc(12px * var(--fs)); color: var(--ink-2); white-space: nowrap;
 }
@@ -105,10 +118,10 @@ header .brand:hover { color: var(--amber); }
 .nav-module:hover { color: var(--ink); background: var(--surface-2); }
 /* 当前模块要一眼认出来：原来只是把底色调深一档，白天主题下和页面底色差不到哪儿去 */
 .nav-module.active {
-  color: var(--sky); background: color-mix(in srgb, var(--sky) 16%, transparent);
-  font-weight: 600; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sky) 45%, transparent);
+  color: var(--fill-ink); background: var(--sky-fill);
+  font-weight: 600; box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sky) 55%, var(--sky-fill));
 }
-.nav-module.active:hover { background: color-mix(in srgb, var(--sky) 22%, transparent); }
+.nav-module.active:hover { background: color-mix(in srgb, var(--sky) 88%, var(--ink)); color: var(--fill-ink); }
 
 header .controls { display: flex; gap: var(--s2); align-items: center; margin-left: auto; }
 header .btn, header button { flex: 0 0 auto; min-height: 28px; padding: 0 11px; font-size:  calc(12.5px * var(--fs)); }
@@ -116,7 +129,7 @@ header .btn, header button { flex: 0 0 auto; min-height: 28px; padding: 0 11px; 
 
 /* 版本徽标 + 更新提示条：版本号一律由后端 autolabel.version 给，前端不写死任何数字 */
 .vchip {
-  display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 9px; flex: 0 0 auto;
+  display: inline-flex; align-items: center; gap: 5px; min-height: 26px; padding: 2px 9px; flex: 0 0 auto;
   border: 1px solid var(--hairline); border-radius: var(--r-pill); background: var(--surface-2);
   font-family: var(--mono); font-size:  calc(11.5px * var(--fs)); color: var(--ink-3);
   text-decoration: none; white-space: nowrap; transition: color var(--t1), border-color var(--t1);
@@ -136,7 +149,7 @@ header .btn, header button { flex: 0 0 auto; min-height: 28px; padding: 0 11px; 
 .update-bar a, .update-bar button {
   display: inline-flex; align-items: center; flex: 0 0 auto; min-height: 24px; padding: 0 10px;
   font-size:  calc(11.5px * var(--fs)); text-decoration: none; color: var(--amber);
-  border: 1px solid color-mix(in srgb, var(--amber) 40%, transparent); border-radius: var(--r4);
+  border: 1px solid color-mix(in srgb, var(--amber) 58%, transparent); border-radius: var(--r4);
   background: color-mix(in srgb, var(--amber) 12%, transparent);
 }
 .update-bar a:hover, .update-bar button:hover { background: color-mix(in srgb, var(--amber) 20%, transparent); }
@@ -152,9 +165,11 @@ header .btn, header button { flex: 0 0 auto; min-height: 28px; padding: 0 11px; 
 .iconbtn:hover { color: var(--ink); background: var(--surface-2); border-color: transparent; }
 /* 开关开着（比如焦点队列摊开了）：琥珀底 + 同色描边，28px 的小方块里光换个底色根本看不见 */
 .iconbtn.on {
-  color: var(--amber); border-color: color-mix(in srgb, var(--amber) 42%, transparent);
-  background: color-mix(in srgb, var(--amber) 16%, transparent);
+  color: var(--amber-fill-ink); border-color: color-mix(in srgb, var(--amber) 60%, var(--amber-fill));
+  background: var(--amber-fill);
 }
+.iconbtn.on:hover { background: color-mix(in srgb, var(--amber-fill) 88%, var(--ink));
+  color: var(--amber-fill-ink); }
 .iconbtn svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5;
   stroke-linecap: round; stroke-linejoin: round; }
 .btn svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 1.5;
@@ -165,8 +180,9 @@ header .btn, header button { flex: 0 0 auto; min-height: 28px; padding: 0 11px; 
 
 /* 命令入口：看着像输入框，点开是命令面板 */
 .searchbtn {
-  display: flex; align-items: center; gap: var(--s2); width: 208px; height: 28px; padding: 0 9px;
-  flex: 0 0 auto; border: 1px solid var(--hairline); border-radius: var(--r7); background: var(--base);
+  display: flex; align-items: center; gap: var(--s2); width: auto; min-width: 0; max-width: 224px;
+  min-height: 28px; padding: 2px 9px; flex: 0 1 auto; overflow: hidden; white-space: nowrap;
+  border: 1px solid var(--hairline); border-radius: var(--r7); background: var(--base);
   color: var(--ink-3); font-size:  calc(12.5px * var(--fs)); transition: border-color var(--t1), color var(--t1);
 }
 .searchbtn:hover { border-color: color-mix(in srgb, var(--amber) 45%, transparent); color: var(--ink-2); }
@@ -279,6 +295,7 @@ main { flex: 1; display: flex; min-height: 0; }
   position: absolute; left: var(--s3); bottom: var(--s3); display: flex; align-items: center;
   gap: 10px; padding: 6px 10px; border: 1px solid var(--veil-hairline); border-radius: var(--r7);
   background: var(--canvas-veil); backdrop-filter: blur(6px); font-size:  calc(11.5px * var(--fs)); color: var(--veil-ink-2);
+  max-width: calc(100% - var(--s3) * 2); flex-wrap: wrap;
 }
 #hud .segs { display: flex; gap: 3px; }
 #hud .segs i { width: 8px; height: 12px; border-radius: var(--r2); background: color-mix(in srgb, var(--veil-ink) 20%, transparent); }
@@ -301,6 +318,7 @@ main { flex: 1; display: flex; min-height: 0; }
   padding: 6px 8px 6px 12px; border: 1px solid color-mix(in srgb, var(--amber) 35%, transparent); border-radius: var(--r7);
   background: color-mix(in srgb, var(--surface) 97%, transparent); box-shadow: var(--e2); font-size:  calc(12.5px * var(--fs)); color: var(--ink);
   opacity: 0; transform: translate(-50%, 10px); pointer-events: none; transition: opacity var(--t2), transform var(--t2);
+  max-width: calc(100% - var(--s4) * 2); flex-wrap: wrap;
 }
 #undo-bar.on { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
 #undo-bar .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--amber); }
@@ -318,7 +336,7 @@ aside#panel {
 .panel-block { padding: 10px var(--s3); border-bottom: 1px solid var(--hairline-2); flex: 0 0 auto; }
 .panel-block.actions {
   flex: 0 0 auto; background: var(--surface); border-top: 1px solid var(--hairline);
-  border-bottom: none; box-shadow: 0 -10px 18px color-mix(in srgb, var(--shadow) 35%, transparent);
+  border-bottom: none;
 }
 .panel-title {
   display: flex; align-items: baseline; gap: var(--s2); margin-bottom: 7px;
@@ -382,7 +400,7 @@ aside#panel {
   font-size:  calc(12px * var(--fs)); padding: 2px 5px; border-radius: var(--r4); cursor: pointer;
 }
 .kpt-row:hover { background: color-mix(in srgb, var(--ink) 4.5%, transparent); }
-.kpt-row.selected { background: color-mix(in srgb, var(--sky) 13%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sky) 40%, transparent); }
+.kpt-row.selected { background: color-mix(in srgb, var(--sky) 13%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--sky) 58%, transparent); }
 
 /* -------------------------------------------------------------------------- */
 /* 控件：按钮 / 下拉 / 输入 / 进度 / 徽标 / 色点 */
@@ -394,10 +412,16 @@ button {
 }
 button:hover { border-color: color-mix(in srgb, var(--ink) 20%, transparent); }
 button:active { transform: translateY(.5px); }
-button.primary { background: color-mix(in srgb, var(--amber) 14%, transparent); border-color: color-mix(in srgb, var(--amber) 48%, transparent); color: var(--amber); }
-button.danger { background: color-mix(in srgb, var(--coral) 10%, transparent); border-color: color-mix(in srgb, var(--coral) 40%, transparent); color: var(--coral-ink); }
-button.active { border-color: color-mix(in srgb, var(--amber) 55%, transparent); color: var(--amber); background: color-mix(in srgb, var(--amber) 10%, transparent); }
-button:disabled, .btn.disabled { opacity: .4; cursor: not-allowed; }
+button.primary { background: var(--amber-fill); border-color: color-mix(in srgb, var(--amber-fill) 72%, var(--ink));
+  color: var(--amber-fill-ink); font-weight: 600; }
+button.primary:hover { background: color-mix(in srgb, var(--amber-fill) 88%, var(--ink));
+  border-color: color-mix(in srgb, var(--amber-fill) 80%, var(--ink)); color: var(--amber-fill-ink); }
+button.danger { background: var(--coral-fill); border-color: color-mix(in srgb, var(--coral-fill) 72%, var(--ink));
+  color: var(--fill-ink); font-weight: 600; }
+button.danger:hover { background: color-mix(in srgb, var(--coral-fill) 88%, var(--ink));
+  border-color: color-mix(in srgb, var(--coral-fill) 80%, var(--ink)); color: var(--fill-ink); }
+button.active { border-color: var(--amber-fill); color: var(--amber-fill-ink); background: var(--amber-fill); font-weight: 600; }
+button:disabled, .btn.disabled { opacity: .45; cursor: not-allowed; }
 button:disabled:hover { border-color: var(--hairline); }
 
 .btn {
@@ -407,15 +431,27 @@ button:disabled:hover { border-color: var(--hairline); }
   transition: background var(--t1), border-color var(--t1), color var(--t1);
 }
 .btn:hover { border-color: color-mix(in srgb, var(--ink) 20%, transparent); }
-.btn.primary { background: color-mix(in srgb, var(--amber) 14%, transparent); border-color: color-mix(in srgb, var(--amber) 48%, transparent); color: var(--amber); }
+.btn.primary { background: var(--amber-fill); color: var(--amber-fill-ink); font-weight: 600;
+  border-color: color-mix(in srgb, var(--amber-fill) 72%, var(--ink)); }
+.btn.primary:hover { background: color-mix(in srgb, var(--amber-fill) 88%, var(--ink));
+  border-color: color-mix(in srgb, var(--amber-fill) 80%, var(--ink)); color: var(--amber-fill-ink); }
+.btn.danger { background: var(--coral-fill); color: var(--fill-ink); font-weight: 600;
+  border-color: color-mix(in srgb, var(--coral-fill) 72%, var(--ink)); }
+.btn.danger:hover { background: color-mix(in srgb, var(--coral-fill) 88%, var(--ink));
+  border-color: color-mix(in srgb, var(--coral-fill) 80%, var(--ink)); color: var(--fill-ink); }
 .btn-row { display: flex; gap: 6px; margin-bottom: 6px; }
 .btn-row button { flex: 1; }
 
 select {
-  background: var(--base); color: var(--ink); border: 1px solid var(--hairline);
-  border-radius: var(--r7); padding: 3px 7px; font: inherit; font-size:  calc(12px * var(--fs));
+  appearance: none; -webkit-appearance: none;
+  background-color: var(--base); color: var(--ink); border: 1px solid var(--hairline);
+  border-radius: var(--r7); padding: 3px 24px 3px 8px; font: inherit; font-size:  calc(12px * var(--fs));
+  background-image: var(--caret); background-repeat: no-repeat;
+  background-position: right 7px center; background-size: 12px 12px;
+  transition: border-color var(--t1), background-color var(--t1);
 }
-select:hover { border-color: color-mix(in srgb, var(--ink) 20%, transparent); }
+select:hover { border-color: color-mix(in srgb, var(--ink) 26%, transparent); }
+select:focus { outline: none; border-color: color-mix(in srgb, var(--amber) 55%, transparent); }
 select.wide { width: 100%; }
 input[type=checkbox], input[type=radio] { accent-color: var(--amber); }
 input[type=text], input[type=number], input[type=password], textarea {
@@ -434,10 +470,10 @@ input[type=text]:focus, input[type=number]:focus, input[type=password]:focus, te
   background: var(--surface-3); color: var(--ink-2); border: 1px solid var(--hairline);
   white-space: nowrap;
 }
-.chip.warn { background: color-mix(in srgb, var(--amber) 13%, transparent); color: var(--amber); border-color: color-mix(in srgb, var(--amber) 40%, transparent); }
-.chip.bad { background: color-mix(in srgb, var(--coral) 12%, transparent); color: var(--coral); border-color: color-mix(in srgb, var(--coral) 40%, transparent); }
-.chip.ok { background: color-mix(in srgb, var(--jade) 12%, transparent); color: var(--jade); border-color: color-mix(in srgb, var(--jade) 40%, transparent); }
-.chip.sky { background: color-mix(in srgb, var(--sky) 12%, transparent); color: var(--sky); border-color: color-mix(in srgb, var(--sky) 40%, transparent); }
+.chip.warn { background: color-mix(in srgb, var(--amber) 18%, transparent); color: var(--amber); border-color: color-mix(in srgb, var(--amber) 58%, transparent); }
+.chip.bad { background: color-mix(in srgb, var(--coral) 17%, transparent); color: var(--coral); border-color: color-mix(in srgb, var(--coral) 58%, transparent); }
+.chip.ok { background: color-mix(in srgb, var(--jade) 12%, transparent); color: var(--jade); border-color: color-mix(in srgb, var(--jade) 58%, transparent); }
+.chip.sky { background: color-mix(in srgb, var(--sky) 18%, transparent); color: var(--sky); border-color: color-mix(in srgb, var(--sky) 58%, transparent); }
 .vbtn { text-align: center; border-radius: var(--r4); font-family: var(--mono); font-weight: 600;
   cursor: pointer; user-select: none; font-size:  calc(11.5px * var(--fs)); }
 .v0 { background: color-mix(in srgb, var(--coral) 18%, transparent); color: var(--coral-ink); }
@@ -448,20 +484,20 @@ input[type=text]:focus, input[type=number]:focus, input[type=password]:focus, te
   flex: 0 0 auto; padding: 1px 8px; border-radius: var(--r-pill); font-size:  calc(11px * var(--fs));
   background: var(--surface-2); color: var(--ink-2); border: 1px solid var(--hairline);
 }
-.badge.done { background: color-mix(in srgb, var(--jade) 13%, transparent); color: var(--jade); border-color: color-mix(in srgb, var(--jade) 40%, transparent); }
-.badge.running { background: color-mix(in srgb, var(--amber) 13%, transparent); color: var(--amber); border-color: color-mix(in srgb, var(--amber) 40%, transparent); }
-.badge.failed, .badge.cancelled { background: color-mix(in srgb, var(--coral) 12%, transparent); color: var(--coral-ink); border-color: color-mix(in srgb, var(--coral) 38%, transparent); }
+.badge.done { background: color-mix(in srgb, var(--jade) 18%, transparent); color: var(--jade); border-color: color-mix(in srgb, var(--jade) 58%, transparent); }
+.badge.running { background: color-mix(in srgb, var(--amber) 18%, transparent); color: var(--amber); border-color: color-mix(in srgb, var(--amber) 58%, transparent); }
+.badge.failed, .badge.cancelled { background: color-mix(in srgb, var(--coral) 17%, transparent); color: var(--coral-ink); border-color: color-mix(in srgb, var(--coral) 56%, transparent); }
 .badge.module { background: var(--surface-2); color: var(--ink-2); border-color: var(--hairline); }
-.badge.module.pose { background: color-mix(in srgb, var(--sky) 12%, transparent); color: var(--sky); border-color: color-mix(in srgb, var(--sky) 38%, transparent); }
-.badge.module.objects, .badge.module.prompt { background: color-mix(in srgb, var(--violet) 12%, transparent); color: var(--violet-ink); border-color: color-mix(in srgb, var(--violet) 38%, transparent); }
-.badge.module.detect { background: color-mix(in srgb, var(--jade) 12%, transparent); color: var(--jade); border-color: color-mix(in srgb, var(--jade) 38%, transparent); }
+.badge.module.pose { background: color-mix(in srgb, var(--sky) 18%, transparent); color: var(--sky); border-color: color-mix(in srgb, var(--sky) 56%, transparent); }
+.badge.module.objects, .badge.module.prompt { background: color-mix(in srgb, var(--violet) 18%, transparent); color: var(--violet-ink); border-color: color-mix(in srgb, var(--violet) 56%, transparent); }
+.badge.module.detect { background: color-mix(in srgb, var(--jade) 12%, transparent); color: var(--jade); border-color: color-mix(in srgb, var(--jade) 56%, transparent); }
 
 .kbd-help { margin-top: var(--s2); font-size:  calc(11px * var(--fs)); color: var(--ink-3); }
 .kbd-help div { display: flex; justify-content: space-between; gap: var(--s2); padding: 1.5px 0; }
 .kbd-help div span:first-child { font-family: var(--mono); color: var(--ink-2); }
 
 footer {
-  display: flex; align-items: center; gap: var(--s3); height: 30px; padding: 0 var(--s3);
+  display: flex; align-items: center; gap: var(--s3); min-height: 30px; padding: 2px var(--s3);
   background: var(--surface); border-top: 1px solid var(--hairline); font-size:  calc(11.5px * var(--fs)); flex: 0 0 auto;
 }
 footer #hint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -544,7 +580,7 @@ footer #hint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; whi
   white-space: pre-wrap; color: var(--ink-2);
 }
 #vlm-log:empty { display: none; }
-#vlm-log.err { color: var(--coral-ink); border-color: color-mix(in srgb, var(--coral) 38%, transparent); }
+#vlm-log.err { color: var(--coral-ink); border-color: color-mix(in srgb, var(--coral) 56%, transparent); }
 
 #batch-modal .modal-card { width: min(900px, 94vw); }
 #batch-tools { display: flex; align-items: center; gap: 10px; margin-bottom: var(--s2); }
@@ -604,7 +640,8 @@ footer #hint { margin-left: auto; overflow: hidden; text-overflow: ellipsis; whi
   background: color-mix(in srgb, var(--ink) 2%, transparent); margin: var(--s2) 0;
 }
 .pool-list .file-row { background: color-mix(in srgb, var(--ink) 3%, transparent); }
-.model-section { border: 1px solid var(--hairline); border-radius: var(--r7); padding: 10px var(--s3); margin-bottom: 10px; }
+.model-section { background: var(--surface); border: 1px solid var(--hairline);
+  border-radius: var(--r7); padding: 10px var(--s3); margin-bottom: 10px; }
 .model-section-head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
 .model-section-head .panel-title { margin-bottom: 0; }
 .model-section-head input[type=number] { width: 62px; }
@@ -634,7 +671,7 @@ button.catalog-refresh svg { width: 14px; height: 14px; fill: none; stroke: curr
   border-color: color-mix(in srgb, var(--jade) 45%, transparent); }
 .module-defaults button.mod-default.on { color: var(--jade); cursor: default;
   background: color-mix(in srgb, var(--jade) 12%, transparent);
-  border-color: color-mix(in srgb, var(--jade) 40%, transparent); }
+  border-color: color-mix(in srgb, var(--jade) 58%, transparent); }
 .model-note-row { display: flex; gap: 6px; margin-top: 5px; }
 .model-note-row input.note { flex: 1; min-width: 0; font-size:  calc(12px * var(--fs)); }
 .model-note-row button { flex: 0 0 auto; }
@@ -714,9 +751,9 @@ button.catalog-refresh svg { width: 14px; height: 14px; fill: none; stroke: curr
 #cls-count { white-space: nowrap; }
 /* 导入结果：新增多少 / 复用多少 / 这副权重认不出多少，一眼看到 */
 #cls-result:not(:empty) { margin-top: var(--s2); padding: 6px 10px; border-radius: var(--r7);
-  border: 1px solid color-mix(in srgb, var(--jade) 38%, transparent);
+  border: 1px solid color-mix(in srgb, var(--jade) 56%, transparent);
   background: color-mix(in srgb, var(--jade) 8%, transparent); color: var(--jade); }
-#cls-result.err { border-color: color-mix(in srgb, var(--coral) 40%, transparent);
+#cls-result.err { border-color: color-mix(in srgb, var(--coral) 58%, transparent);
   background: color-mix(in srgb, var(--coral) 8%, transparent); color: var(--coral-ink); }
 #cls-model-note:not(:empty), #run-model-note:not(:empty), #up-model-note:not(:empty) {
   margin-top: var(--s1); color: var(--ink-3); line-height: 1.6; }
@@ -737,10 +774,10 @@ button.catalog-refresh svg { width: 14px; height: 14px; fill: none; stroke: curr
 .probe-advice { grid-column: 1 / -1; line-height: 1.55; }
 #probe-result:not(.muted) { color: var(--ink-2); }
 #lib-note a { color: var(--amber); text-decoration: none; white-space: nowrap;
-  border-bottom: 1px solid color-mix(in srgb, var(--amber) 40%, transparent); }
+  border-bottom: 1px solid color-mix(in srgb, var(--amber) 58%, transparent); }
 #lib-note a:hover { border-bottom-color: var(--amber); }
 #recovery-note.notice {
-  border: 1px solid color-mix(in srgb, var(--amber) 40%, transparent); background: color-mix(in srgb, var(--amber) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--amber) 58%, transparent); background: color-mix(in srgb, var(--amber) 8%, transparent);
   color: var(--amber); border-radius: var(--r7); padding: 10px 14px; margin-bottom: 14px;
   font-size:  calc(12.5px * var(--fs)); line-height: 1.6;
 }
@@ -806,26 +843,26 @@ button.catalog-refresh svg { width: 14px; height: 14px; fill: none; stroke: curr
 /* 暗色底 + 字号基准：界面用 data-theme / data-fs 两个属性驱动，首屏由内联脚本先定好 */
 :root {
   --fs: 1;
-  --stage: #080A0B;         /* 图片周围的留白底 */
-  --raised: #171C20;        /* 浮在面板上的一层：菜单、气泡 */
+  --stage: #04070A;         /* 图片周围的留白底：比面板更深一档，照片才浮得起来 */
+  --raised: #1D252C;        /* 浮在面板上的一层：菜单、气泡 */
   /* 画布专用：压在照片上的字与描边，两种主题都要和照片分得开 */
   --c-canvas-veil: rgba(10, 12, 14, .78);
   --c-ring-idle: rgba(8, 10, 11, .85);
   --c-key-hidden: rgba(163, 170, 175, .5);
   /* 压在照片上的深色底板两种主题都是深的：里面的字与色块走这套「亮墨」。
      白天模式的强调色是压深的（读浅色面板用），直接搬到底板上就成深字压深底。 */
-  --veil-ink: #F1EFEA;
-  --veil-ink-2: #AEB5B9;
-  --veil-ink-3: #7E868C;
-  --veil-hairline: rgba(255, 255, 255, .10);
-  --veil-amber: #F5A524;
-  --veil-jade: #46D39A;
-  --veil-coral: #FF8A78;
-  --veil-sky: #79B8FF;
+  --veil-ink: #F5F3EE;
+  --veil-ink-2: #C2C9CE;
+  --veil-ink-3: #909AA1;
+  --veil-hairline: rgba(255, 255, 255, .14);
+  --veil-amber: #FFB224;
+  --veil-jade: #3FDCA0;
+  --veil-coral: #FF8A72;
+  --veil-sky: #66B8FF;
   /* 画布标签底色上的字：照片内容不可控，叠加层两种主题都用亮色才压得住 */
-  --c-photo-amber: #F5A524;
-  --c-photo-sky: #79B8FF;
-  --c-photo-coral: #FF8A78;
+  --c-photo-amber: #FFB224;
+  --c-photo-sky: #66B8FF;
+  --c-photo-coral: #FF8A72;
   --c-field-fallback: #8B94A5;
 }
 :root[data-fs="0"] { --fs: .92; }   /* 小 */
@@ -835,27 +872,36 @@ button.catalog-refresh svg { width: 14px; height: 14px; fill: none; stroke: curr
 
 /* 白天：暖纸白，强调色一律加深到浅色底也能读；发丝线与暗角自动跟着 --ink / --shadow 反色 */
 :root[data-theme="light"] {
-  --base: #E7E4DC;
-  --surface: #F7F6F2;
-  --surface-2: #EDEBE4;
-  --surface-3: #E0DDD3;
-  --well: #EFEEE7;
-  --ink: #16191B;
-  --ink-2: #575F65;
-  --ink-3: #8A9197;
-  --amber: #94600A;
-  --jade: #0E8559;
-  --coral: #C8442A;
-  --sky: #1B66D6;
-  --violet: #6A3DC0;
-  --violet-ink: #59319F;
-  --coral-ink: #A93A22;
-  --on-accent: #FFF7F4;
+  --base: #D9D4C6;      /* 纸底压深一档：白卡片才有 1.48 的分离度，不再糊成一张灰纸 */
+  --surface: #FFFFFF;
+  --surface-2: #F2F0E9;
+  --surface-3: #E6E2D7;
+  --well: #F7F5EF;
+  --ink: #14171A;
+  --ink-2: #4C555C;
+  --ink-3: #6C757D;     /* 弱文在白卡片上有 4.7:1，之前 2.9:1 等于没写 */
+  --amber: #8A5605;     /* 面板上的琥珀字：6.2:1 */
+  --jade: #0B7A4E;
+  --coral: #C1421F;
+  --sky: #0B62C4;
+  --violet: #5B34B8;
+  --violet-ink: #5B34B8;
+  --coral-ink: #AE3415;
+  --on-accent: #FFFFFF;
   --shadow: #3B3527;
   --inset-hi: rgba(22, 25, 27, .05);
-  --scrim: color-mix(in srgb, #2A2620 40%, transparent);
-  --stage: #D8D4CA;
-  --raised: #FCFBF8;
+  --scrim: color-mix(in srgb, #2A2620 50%, transparent);   /* 白天压得比原来重一档，弹层才不像浮在纸上 */
+  --amber-fill: #F2A11B;    /* 实心按钮要鲜艳：配深棕字 6.6:1 */
+  --jade-fill: #0B7A4E;
+  --coral-fill: #C24E12;
+  --sky-fill: #1568D8;
+  --fill-ink: #FFFFFF;
+  --amber-fill-ink: #3D2700;
+  --caret: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Cpath d='M2.8 4.6 6 7.8l3.2-3.2' fill='none' stroke='%236C757D' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --e-up: 0 -10px 22px color-mix(in srgb, var(--shadow) 13%, transparent);
+  --stage: #C2BCAD;     /* 画布底比纸底深两档，照片边界一眼分得开 */
+  --raised: #FFFFFF;
+  color-scheme: light;
   --c-canvas-veil: rgba(24, 26, 28, .80);
   --c-ring-idle: rgba(255, 255, 255, .92);
   --c-key-hidden: rgba(74, 82, 88, .92);
@@ -920,7 +966,7 @@ button.catalog-refresh svg { width: 14px; height: 14px; fill: none; stroke: curr
 
 /* 开关（半精度）：只有一位可拨，状态同时写在 aria-checked 上给读屏用 */
 .switch { flex: 0 0 auto; width: 38px; height: 22px; padding: 0; border-radius: 999px;
-  background: var(--well); border: 1px solid var(--hairline); cursor: pointer; position: relative; }
+  background: var(--surface-3); border: 1px solid var(--hairline); cursor: pointer; position: relative; }
 .switch span { position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
   background: var(--ink-3); transition: transform var(--t1), background var(--t1); }
 .switch.on { background: color-mix(in srgb, var(--amber) 22%, transparent);
@@ -934,7 +980,7 @@ button.catalog-refresh svg { width: 14px; height: 14px; fill: none; stroke: curr
 /* -------------------------------------------------------------------------- */
 .cat-strip { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: var(--s2); }
 .cat-chip {
-  display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 10px;
+  display: inline-flex; align-items: center; gap: 6px; min-height: 26px; padding: 2px 10px;
   border: 1px solid var(--hairline); border-radius: var(--r-pill); background: var(--surface-2);
   color: var(--ink-2); font-size: calc(12px * var(--fs)); cursor: pointer;
   transition: color var(--t1), border-color var(--t1), background var(--t1);
@@ -943,7 +989,7 @@ button.catalog-refresh svg { width: 14px; height: 14px; fill: none; stroke: curr
 .cat-chip svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 1.6;
   stroke-linecap: round; stroke-linejoin: round; flex: 0 0 auto; }
 .cat-chip.on { color: var(--sky); border-color: color-mix(in srgb, var(--sky) 48%, transparent);
-  background: color-mix(in srgb, var(--sky) 12%, transparent); }
+  background: color-mix(in srgb, var(--sky) 18%, transparent); }
 .cat-n { font-family: var(--mono); font-size: calc(11px * var(--fs)); color: var(--ink-3);
   font-variant-numeric: tabular-nums; }
 .cat-chip.on .cat-n { color: var(--sky); }
@@ -983,7 +1029,7 @@ button.catalog-refresh svg { width: 14px; height: 14px; fill: none; stroke: curr
 .pool-bar {
   position: sticky; bottom: 0; z-index: 2; display: flex; align-items: center; gap: var(--s2);
   flex-wrap: wrap; margin-top: 10px; padding: 8px 10px; background: var(--surface-2);
-  border: 1px solid var(--hairline); border-radius: var(--r7);
+  border: 1px solid var(--hairline); border-radius: var(--r7); box-shadow: var(--e-up);
 }
 .pool-bar label { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .pool-bar select { font-size: calc(12px * var(--fs)); }
